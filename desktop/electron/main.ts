@@ -86,6 +86,7 @@ import { getAdvisorYoutubeBackgroundRunner, getDefaultAdvisorYoutubeChannelConfi
 import { detectAiProtocol, fetchModelsForAiSource, testAiSourceConnection } from './core/aiSourceService';
 import { loadOfficialFeatureModule } from './officialFeatureBridge';
 import { getMemoryMaintenanceService } from './core/memoryMaintenanceService';
+import { generateAdvisorPersonaDocument } from './core/advisorPersonaGenerator';
 
 if (typeof (globalThis as any).Blob === 'undefined' && typeof NodeBlob !== 'undefined') {
   (globalThis as any).Blob = NodeBlob;
@@ -194,10 +195,6 @@ const ADVISOR_OPTIMIZE_DEEP_SYSTEM_PROMPT = loadPrompt(
 const ADVISOR_OPTIMIZE_DEEP_USER_TEMPLATE = loadPrompt(
   'runtime/advisors/optimize_deep_user.txt',
   '名称: {{name}}\n描述: {{personality}}\n当前设定: {{current_prompt}}\n搜索: {{search_summary}}\n知识: {{knowledge_summary}}'
-);
-const ADVISOR_GENERATE_PERSONA_USER_TEMPLATE = loadPrompt(
-  'runtime/advisors/generate_persona_user.txt',
-  '请根据频道信息生成完整系统提示词：{{channel_name}}'
 );
 const SIX_HAT_PROMPTS = {
   white: loadPrompt('runtime/six_hats/white.txt', '你是六顶思考帽中的白帽。'),
@@ -3114,57 +3111,53 @@ ipcMain.handle('advisors:optimize-prompt-deep', async (_, {
 
 // AI Persona Generation (for YouTube import)
 ipcMain.handle('advisors:generate-persona', async (_, {
+  advisorId,
   channelName,
   channelDescription,
   videoTitles
 }: {
+  advisorId?: string;
   channelName: string;
   channelDescription: string;
   videoTitles: string[]
 }) => {
-  const OpenAI = require('openai').default;
-  const { searchWeb } = await import('./core/bingSearch');
-  const settings = getSettings() as { api_endpoint?: string; api_key?: string; model_name?: string } | undefined;
+  const settings = getSettings() as {
+    api_endpoint?: string;
+    api_key?: string;
+    model_name?: string;
+    model_name_knowledge?: string;
+  } | undefined;
 
   if (!settings?.api_endpoint || !settings?.api_key || !settings?.model_name) {
     return { success: false, error: '请先在设置中配置 API' };
   }
 
   try {
-    // Step 1: Search for information about the YouTuber
-    console.log(`[generate-persona] Searching for: ${channelName}`);
-    const searchResults = await searchWeb(`${channelName} YouTuber 博主 介绍`, 5);
-    const searchSummary = searchResults.length > 0
-      ? searchResults.map(r => `- ${r.title}: ${r.snippet}`).join('\n')
-      : '(未找到搜索结果)';
+    const model = resolveScopedModelName((settings || {}) as Record<string, unknown>, 'knowledge', 'gpt-4o');
+    console.log('[generate-persona] start', {
+      advisorId: advisorId || null,
+      channelName,
+      model,
+    });
 
-    console.log(`[generate-persona] Found ${searchResults.length} search results`);
-
-    // Step 2: Generate persona using LLM
-    const client = new OpenAI({
+    const result = await generateAdvisorPersonaDocument({
+      advisorId,
+      channelName,
+      channelDescription,
+      videoTitles,
       apiKey: settings.api_key,
       baseURL: normalizeApiBaseUrl(settings.api_endpoint, 'https://api.openai.com/v1'),
+      model,
     });
 
-    const prompt = renderPrompt(ADVISOR_GENERATE_PERSONA_USER_TEMPLATE, {
-      channel_name: channelName,
-      channel_description: channelDescription || '(无描述)',
-      video_titles: videoTitles.slice(0, 10).map(t => `- ${t}`).join('\n') || '(无视频信息)',
-      search_summary: searchSummary,
+    console.log('[generate-persona] completed', {
+      advisorId: advisorId || null,
+      promptLength: result.prompt.length,
+      personalityLength: result.personality.length,
+      searchResultCount: result.searchResults.length,
     });
 
-    const response = await client.chat.completions.create({
-      model: settings.model_name,
-      messages: [
-        { role: 'user', content: prompt }
-      ],
-      temperature: 0.7
-    });
-
-    const generatedPrompt = response.choices[0]?.message?.content || '';
-    console.log(`[generate-persona] Generated prompt (${generatedPrompt.length} chars)`);
-
-    return { success: true, prompt: generatedPrompt, searchResults };
+    return { success: true, prompt: result.prompt, personality: result.personality, searchResults: result.searchResults, research: result.research };
   } catch (error) {
     console.error('Failed to generate persona:', error);
     return { success: false, error: String(error) };

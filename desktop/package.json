@@ -31,6 +31,7 @@
     "files": [
       "dist-electron/**",
       "dist/**",
+      "electron/system-skills/**",
       ".private-runtime/**",
       "package.json",
       "redbox.png",

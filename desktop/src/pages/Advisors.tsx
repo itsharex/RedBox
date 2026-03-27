@@ -1066,17 +1066,21 @@ function AdvisorModal({
         setIsOptimizing(true);
         try {
             const result = await window.ipcRenderer.invoke('advisors:generate-persona', {
+                advisorId: advisor?.id,
                 channelName: youtubeInfo.channelName,
                 channelDescription: youtubeInfo.channelDescription || '',
                 videoTitles: youtubeInfo.recentVideos?.map((v: { title: string }) => v.title) || []
-            }) as { success: boolean; prompt?: string; error?: string };
+            }) as { success: boolean; prompt?: string; personality?: string; error?: string };
 
             if (result.success && result.prompt) {
                 setSystemPrompt(result.prompt);
-                // Auto-generate personality from first line of prompt
-                const firstSentence = result.prompt.split(/[。\n]/)[0];
-                if (firstSentence && firstSentence.length < 100) {
-                    setPersonality(firstSentence);
+                if (result.personality) {
+                    setPersonality(result.personality);
+                } else {
+                    const firstSentence = result.prompt.split(/[。\n]/)[0];
+                    if (firstSentence && firstSentence.length < 100) {
+                        setPersonality(firstSentence);
+                    }
                 }
             } else {
                 alert('生成失败: ' + (result.error || '未知错误'));

@@ -1,0 +1,31 @@
+请基于以下研究结果，输出最终智囊团角色文档。
+
+## 目标对象
+频道名称: {{channel_name}}
+
+## 研究 JSON
+{{research_json}}
+
+## 外部搜索结果
+{{search_summary}}
+
+## 智囊团知识文件
+{{advisor_knowledge_corpus}}
+
+## 关联稿件证据
+{{manuscript_corpus}}
+
+要求：
+1. 角色要像一个真正长期可用的“智囊团成员”，而不是临时 prompt。
+2. 文档要非常详细，尤其强化：
+   - Identity & Memory
+   - Core Mission
+   - Critical Rules
+   - Technical Deliverables
+   - Workflow Process
+   - Communication Style
+   - Learning & Memory
+   - Success Metrics
+   - Advanced Capabilities
+3. 要体现对原博主内容风格、价值观、内容结构的学习，但不能伪装成真人。
+4. 明确这是基于其公开内容与知识材料抽象出来的 AI Advisor。
