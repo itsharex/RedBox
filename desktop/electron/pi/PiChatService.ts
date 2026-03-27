@@ -5,6 +5,8 @@
  */
 
 import { BrowserWindow } from 'electron';
+import fs from 'node:fs';
+import path from 'node:path';
 import {
   Agent,
   type AgentEvent,
@@ -132,7 +134,7 @@ const TOOL_RESULT_MAX_DISPLAY_CHARS = 26000;
 const TOOL_RESULT_MAX_ERROR_CHARS = 4000;
 const PI_CHAT_SYSTEM_BASE_TEMPLATE = loadPrompt(
   'runtime/pi/system_base.txt',
-  '# 工作环境\n工作目录: {{workspace}}\n平台: {{platform}}'
+  'You are an expert coding assistant operating inside pi.\nCurrent date: {{current_date}}\nCurrent working directory: {{current_working_directory}}'
 );
 
 interface ToolGuardState {
@@ -2197,6 +2199,97 @@ export class PiChatService {
     return `${text.slice(0, maxLength)}\n\n[内容过长，已截断]`;
   }
 
+  private buildAvailableToolsSummary(): string {
+    const tools = this.toolRegistry.getAllTools();
+    if (!tools.length) {
+      return '- (no tools registered)';
+    }
+    return tools
+      .slice(0, 120)
+      .map((tool) => `- ${tool.name}: ${String(tool.description || '').trim() || 'No description'}`)
+      .join('\n');
+  }
+
+  private buildPiDocumentationSection(
+    workspacePaths: ReturnType<typeof getWorkspacePaths>,
+    redClawProfileBundle?: RedClawProfilePromptBundle | null,
+  ): string {
+    const memoryPath = path.join(workspacePaths.base, 'memory', 'MEMORY.md');
+    const profileRoot = redClawProfileBundle?.profileRoot || path.join(workspacePaths.redclaw, 'profile');
+    const agentPath = path.join(profileRoot, 'Agent.md');
+    const soulPath = path.join(profileRoot, 'Soul.md');
+    const identityPath = path.join(profileRoot, 'identity.md');
+    const userPath = path.join(profileRoot, 'user.md');
+    const appCliPath = path.join(process.cwd(), 'desktop', 'electron', 'core', 'tools', 'appCliTool.ts');
+    const promptsLibraryPath = path.join(process.cwd(), 'desktop', 'electron', 'prompts', 'library');
+
+    return [
+      `- Main documentation: app_cli tool usage (${appCliPath})`,
+      `- Additional docs: prompt library (${promptsLibraryPath})`,
+      '- Examples: use `app_cli(command="...")` with concrete subcommands',
+      `- Memory document: ${memoryPath}`,
+      `- Agent document: ${agentPath}`,
+      `- Soul document: ${soulPath}`,
+      `- Identity document: ${identityPath}`,
+      `- User profile document: ${userPath}`,
+    ].join('\n');
+  }
+
+  private buildProjectContextSection(workspacePaths: ReturnType<typeof getWorkspacePaths>): string {
+    const candidateDirs = new Set<string>([
+      workspacePaths.base,
+      workspacePaths.workspaceRoot,
+      process.cwd(),
+    ]);
+
+    let currentDir = workspacePaths.base;
+    for (let i = 0; i < 5; i += 1) {
+      candidateDirs.add(currentDir);
+      const parent = path.dirname(currentDir);
+      if (parent === currentDir) break;
+      currentDir = parent;
+    }
+
+    const blocks: string[] = [];
+    const seen = new Set<string>();
+    for (const dir of candidateDirs) {
+      const agentsPath = path.join(dir, 'AGENTS.md');
+      if (seen.has(agentsPath)) continue;
+      seen.add(agentsPath);
+      if (!fs.existsSync(agentsPath)) continue;
+      try {
+        const content = fs.readFileSync(agentsPath, 'utf-8').trim();
+        if (!content) continue;
+        blocks.push(`## ${agentsPath}\n${this.truncate(content, 5000)}`);
+      } catch (error) {
+        blocks.push(`## ${agentsPath}\n(读取失败: ${String(error)})`);
+      }
+    }
+
+    if (!blocks.length) {
+      return '## (No AGENTS.md found in current workspace scope)\nUse default repo and system instructions.';
+    }
+    return blocks.join('\n\n');
+  }
+
+  private buildSkillsSection(skillsXml: string, activeSkillContents: string[]): string {
+    const parts: string[] = [];
+    if (skillsXml) {
+      parts.push('## Available Skills (XML)');
+      parts.push(skillsXml);
+    }
+    if (activeSkillContents.length > 0) {
+      parts.push('## Active Skill Instructions');
+      for (const skillContent of activeSkillContents) {
+        parts.push(skillContent);
+      }
+    }
+    if (!parts.length) {
+      parts.push('(No skill metadata available)');
+    }
+    return parts.join('\n\n');
+  }
+
   private async loadLongTermMemoryContext(): Promise<string> {
     try {
       return await getLongTermMemoryPrompt(40);
@@ -2230,6 +2323,12 @@ export class PiChatService {
 
     const promptParts: string[] = [
       renderPrompt(PI_CHAT_SYSTEM_BASE_TEMPLATE, {
+        available_tools: this.buildAvailableToolsSummary(),
+        pi_documentation: this.buildPiDocumentationSection(workspacePaths, redClawProfileBundle),
+        project_context: this.buildProjectContextSection(workspacePaths),
+        skills_section: this.buildSkillsSection(skillsXml, activeSkillContents),
+        current_date: new Date().toISOString(),
+        current_working_directory: workspace,
         workspace,
         platform: process.platform,
         workspace_root: workspacePaths.workspaceRoot,
@@ -2349,6 +2448,11 @@ export class PiChatService {
     }
 
     if (metadata.compactSummary) {
+      console.log('[PiChatService] compact-memory-injected', {
+        sessionId: this.sessionId,
+        compactRounds: metadata.compactRounds || 1,
+        compactUpdatedAt: metadata.compactUpdatedAt || '',
+      });
       promptParts.push(
         '',
         '## 对话压缩记忆（自动维护）',
@@ -2368,17 +2472,6 @@ export class PiChatService {
         this.truncate(redClawProjectContext, 8000),
         '</redclaw_projects>',
       );
-    }
-
-    if (skillsXml) {
-      promptParts.push('', '## 可用技能', skillsXml);
-    }
-
-    if (activeSkillContents.length > 0) {
-      promptParts.push('', '## 已激活技能（必须遵循）');
-      for (const skillContent of activeSkillContents) {
-        promptParts.push(skillContent);
-      }
     }
 
     return promptParts.join('\n');
