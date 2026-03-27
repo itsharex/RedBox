@@ -15,6 +15,7 @@ export { CalculatorTool } from './calculatorTool';
 export { ListDirTool } from './listDirTool'; // Legacy list
 export { ExploreWorkspaceTool } from './exploreWorkspaceTool';
 export { SaveMemoryTool } from './memoryTool';
+export { RedClawUpdateProfileDocTool, RedClawUpdateCreatorProfileTool } from './creatorProfileTool';
 export {
     RedClawCreateProjectTool,
     RedClawSaveCopyPackTool,
@@ -35,6 +36,7 @@ import { CalculatorTool } from './calculatorTool';
 import { ListDirTool } from './listDirTool';
 import { ExploreWorkspaceTool } from './exploreWorkspaceTool';
 import { SaveMemoryTool } from './memoryTool';
+import { RedClawUpdateCreatorProfileTool, RedClawUpdateProfileDocTool } from './creatorProfileTool';
 import {
     RedClawCreateProjectTool,
     RedClawSaveCopyPackTool,
@@ -71,6 +73,8 @@ export function createBuiltinTools(chatService?: any): ToolDefinition<unknown, T
         // 辅助工具
         new CalculatorTool(),
         new SaveMemoryTool(),
+        new RedClawUpdateProfileDocTool(),
+        new RedClawUpdateCreatorProfileTool(),
         new RedClawCreateProjectTool(),
         new RedClawSaveCopyPackTool(),
         new RedClawSaveImagePackTool(),
@@ -107,6 +111,8 @@ export const BUILTIN_TOOL_NAMES = [
     'list_dir',
     'calculator',
     'save_memory',
+    'redclaw_update_profile_doc',
+    'redclaw_update_creator_profile',
     'redclaw_create_project',
     'redclaw_save_copy_pack',
     'redclaw_save_image_pack',

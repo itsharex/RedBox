@@ -27,9 +27,12 @@ export interface RedClawProfilePromptBundle {
     soul: string;
     identity: string;
     user: string;
+    creatorProfile: string;
     bootstrap: string;
   };
 }
+
+export type RedClawProfileDocType = 'agent' | 'soul' | 'user' | 'creator_profile';
 
 export interface RedClawOnboardingTurnResult {
   handled: boolean;
@@ -43,6 +46,7 @@ const AGENT_FILE = 'Agent.md';
 const SOUL_FILE = 'Soul.md';
 const IDENTITY_FILE = 'identity.md';
 const USER_FILE = 'user.md';
+const CREATOR_PROFILE_FILE = 'CreatorProfile.md';
 const BOOTSTRAP_FILE = 'BOOTSTRAP.md';
 
 const ONBOARDING_STEPS: OnboardingStep[] = [
@@ -104,8 +108,9 @@ function buildDefaultAgentTemplate(): string {
     '## 启动顺序（每次会话）',
     '1. 读取 Soul.md（你的行为风格）',
     '2. 读取 user.md（用户画像和创作目标）',
-    '3. 读取 identity.md（你的身份设定）',
-    '4. 读取 memory/MEMORY.md（长期记忆摘要）',
+    '3. 读取 CreatorProfile.md（用户长期自媒体定位与策略档案）',
+    '4. 读取 identity.md（你的身份设定）',
+    '5. 读取 memory/MEMORY.md（长期记忆摘要）',
     '',
     '## RedClaw 规则',
     '- 先执行再解释，优先给出可落地动作。',
@@ -113,6 +118,12 @@ function buildDefaultAgentTemplate(): string {
     '- 文件操作严格限制在 currentSpaceRoot。',
     '- 对文件数量/列表/状态类事实，必须先工具验证。',
     '- 用户给出长期偏好和约束时，及时写入长期记忆。',
+    '',
+    '## 核心档案职责',
+    '- Soul.md：维护 RedClaw 的协作语气、反馈方式、执行风格。',
+    '- user.md：维护用户的稳定画像与长期事实。',
+    '- CreatorProfile.md：维护用户的长期自媒体定位、目标群体、风格、商业目标与运营边界。',
+    '- Agent.md：维护 RedClaw 的工作契约、流程和规则，不为一次性任务随意改写。',
     '',
     '## 创作流程',
     '目标 -> 选题 -> 文案 -> 配图 -> 发布计划 -> 数据复盘 -> 下一轮假设',
@@ -132,6 +143,10 @@ function buildDefaultSoulTemplate(): string {
     '- 默认中文。',
     '- 先结论后细节。',
     '- 优先给 checklist、步骤和可执行命令。',
+    '',
+    '## 什么时候更新本文件',
+    '- 用户明确要求 RedClaw 改变沟通方式、反馈力度、协作氛围时更新。',
+    '- 临时任务中的一句话语气要求，不默认升格为长期人格设定。',
   ].join('\n');
 }
 
@@ -162,6 +177,40 @@ function buildDefaultUserTemplate(): string {
     '',
     '## 备注',
     '- 本文件用于长期个性化，不存放敏感密钥。',
+    '- 当用户长期目标、受众、节奏、赛道等稳定信息变化时更新本文件。',
+  ].join('\n');
+}
+
+function buildDefaultCreatorProfileTemplate(): string {
+  return [
+    '# CreatorProfile.md',
+    '',
+    '## 定位总览',
+    '- 自媒体定位: （待填写）',
+    '- 核心目标: （待填写）',
+    '- 商业目标: （待填写）',
+    '',
+    '## 目标群体',
+    '- 核心受众: （待填写）',
+    '- 主要痛点: （待填写）',
+    '- 愿意付费的原因: （待填写）',
+    '',
+    '## 内容风格',
+    '- 内容赛道: （待填写）',
+    '- 结构偏好: （待填写）',
+    '- 文案风格: （待填写）',
+    '- 封面/视觉倾向: （待填写）',
+    '',
+    '## 运营策略',
+    '- 发布节奏: （待填写）',
+    '- 成功指标: （待填写）',
+    '- 禁区与边界: （待填写）',
+    '',
+    '## 维护规则',
+    '- 本文档是用户长期自媒体策略档案，每次 RedClaw 会话都应优先参考。',
+    '- 当用户明确给出新的定位、目标群体、风格、边界、商业目标时，应更新本文件。',
+    '- 临时任务要求不直接改写长期定位，除非用户明确表示要长期变更。',
+    '- 不记录 API Key、Token、账号密码等敏感信息。',
   ].join('\n');
 }
 
@@ -175,9 +224,20 @@ function buildDefaultBootstrapTemplate(): string {
     '- identity.md',
     '- user.md',
     '- Soul.md',
+    '- CreatorProfile.md',
     '',
     '完成后删除 BOOTSTRAP.md。',
   ].join('\n');
+}
+
+function normalizeProfileDocMarkdown(fileTitle: string, markdown: string): string {
+  const normalized = String(markdown || '').trim();
+  if (!normalized) {
+    throw new Error(`${fileTitle} 文档不能为空`);
+  }
+  return normalized.startsWith('#')
+    ? normalized
+    : [`# ${fileTitle}`, '', normalized].join('\n');
 }
 
 async function readJson<T>(filePath: string, fallback: T): Promise<T> {
@@ -298,10 +358,38 @@ async function finalizeOnboarding(state: RedClawOnboardingState): Promise<void> 
     '- 不臆测文件状态；先工具验证再回答。',
   ].join('\n');
 
+  const creatorProfile = [
+    '# CreatorProfile.md',
+    '',
+    '## 定位总览',
+    '- 自媒体定位: 小红书创作与增长',
+    `- 核心目标: ${goal}`,
+    '- 商业目标: 建立可信个人品牌并逐步提升转化',
+    '',
+    '## 目标群体',
+    `- 核心受众: ${audience}`,
+    '- 主要痛点: 需要明确选题、结构化内容与持续更新节奏',
+    '- 愿意付费的原因: 需要可执行的方法、模板和复盘体系',
+    '',
+    '## 内容风格',
+    `- 内容赛道: ${lane}`,
+    `- 文案风格: ${style}`,
+    `- 执行边界: ${constraints}`,
+    '- 封面/视觉倾向: 优先真实、清晰、可点击，不做廉价夸张风',
+    '',
+    '## 运营策略',
+    '- 发布节奏: 以后续用户明确更新为准',
+    '- 成功指标: 以收藏率、互动率、私信转化等业务指标为准',
+    '- 禁区与边界: 不夸大、不虚假承诺、不违反平台合规',
+    '',
+    `- UpdatedAt: ${nowIso()}`,
+  ].join('\n');
+
   await Promise.all([
     fs.writeFile(getFilePath(IDENTITY_FILE), identity, 'utf-8'),
     fs.writeFile(getFilePath(USER_FILE), user, 'utf-8'),
     fs.writeFile(getFilePath(SOUL_FILE), soul, 'utf-8'),
+    fs.writeFile(getFilePath(CREATOR_PROFILE_FILE), creatorProfile, 'utf-8'),
   ]);
 
   try {
@@ -333,6 +421,7 @@ export async function ensureRedClawProfileFiles(): Promise<void> {
     ensureFile(getFilePath(SOUL_FILE), buildDefaultSoulTemplate()),
     ensureFile(getFilePath(IDENTITY_FILE), buildDefaultIdentityTemplate()),
     ensureFile(getFilePath(USER_FILE), buildDefaultUserTemplate()),
+    ensureFile(getFilePath(CREATOR_PROFILE_FILE), buildDefaultCreatorProfileTemplate()),
   ]);
 
   const onboardingPath = getFilePath(ONBOARDING_STATE_FILE);
@@ -362,9 +451,42 @@ export async function loadRedClawProfilePromptBundle(): Promise<RedClawProfilePr
       soul: await readText(getFilePath(SOUL_FILE)),
       identity: await readText(getFilePath(IDENTITY_FILE)),
       user: await readText(getFilePath(USER_FILE)),
+      creatorProfile: await readText(getFilePath(CREATOR_PROFILE_FILE)),
       bootstrap: await readText(getFilePath(BOOTSTRAP_FILE)),
     },
   };
+}
+
+export async function updateRedClawCreatorProfile(markdown: string): Promise<{ path: string; content: string }> {
+  await ensureRedClawProfileFiles();
+  const nextContent = normalizeProfileDocMarkdown('CreatorProfile.md', markdown);
+  const filePath = getFilePath(CREATOR_PROFILE_FILE);
+  await fs.writeFile(filePath, nextContent, 'utf-8');
+  return { path: filePath, content: nextContent };
+}
+
+export async function updateRedClawProfileDocument(
+  docType: RedClawProfileDocType,
+  markdown: string,
+): Promise<{ path: string; content: string; docType: RedClawProfileDocType }> {
+  await ensureRedClawProfileFiles();
+
+  const mapping: Record<RedClawProfileDocType, { fileName: string; title: string }> = {
+    agent: { fileName: AGENT_FILE, title: 'Agent.md' },
+    soul: { fileName: SOUL_FILE, title: 'Soul.md' },
+    user: { fileName: USER_FILE, title: 'user.md' },
+    creator_profile: { fileName: CREATOR_PROFILE_FILE, title: 'CreatorProfile.md' },
+  };
+
+  const target = mapping[docType];
+  if (!target) {
+    throw new Error(`Unsupported profile doc type: ${String(docType)}`);
+  }
+
+  const nextContent = normalizeProfileDocMarkdown(target.title, markdown);
+  const filePath = getFilePath(target.fileName);
+  await fs.writeFile(filePath, nextContent, 'utf-8');
+  return { path: filePath, content: nextContent, docType };
 }
 
 export async function handleRedClawOnboardingTurn(userInput: string): Promise<RedClawOnboardingTurnResult> {

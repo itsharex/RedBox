@@ -2220,6 +2220,7 @@ export class PiChatService {
     const soulPath = path.join(profileRoot, 'Soul.md');
     const identityPath = path.join(profileRoot, 'identity.md');
     const userPath = path.join(profileRoot, 'user.md');
+    const creatorProfilePath = path.join(profileRoot, 'CreatorProfile.md');
     const appCliPath = path.join(process.cwd(), 'desktop', 'electron', 'core', 'tools', 'appCliTool.ts');
     const promptsLibraryPath = path.join(process.cwd(), 'desktop', 'electron', 'prompts', 'library');
 
@@ -2232,6 +2233,7 @@ export class PiChatService {
       `- Soul document: ${soulPath}`,
       `- Identity document: ${identityPath}`,
       `- User profile document: ${userPath}`,
+      `- Creator strategy document: ${creatorProfilePath}`,
     ].join('\n');
   }
 
@@ -2376,7 +2378,7 @@ export class PiChatService {
         '',
         '## RedClaw 个性化档案（空间隔离）',
         `- ProfileRoot: ${redClawProfileBundle.profileRoot}`,
-        '- 档案文件: Agent.md / Soul.md / identity.md / user.md',
+        '- 档案文件: Agent.md / Soul.md / identity.md / user.md / CreatorProfile.md',
         '<redclaw_agent_md>',
         this.truncate(redClawProfileBundle.files.agent || '', 6000),
         '</redclaw_agent_md>',
@@ -2389,6 +2391,16 @@ export class PiChatService {
         '<redclaw_user_md>',
         this.truncate(redClawProfileBundle.files.user || '', 8000),
         '</redclaw_user_md>',
+        '<redclaw_creator_profile_md>',
+        this.truncate(redClawProfileBundle.files.creatorProfile || '', 10000),
+        '</redclaw_creator_profile_md>',
+        '文档职责与更新规则：',
+        '- Agent.md：RedClaw 的工作契约、执行规则、标准流程。只有当用户明确要求修改 RedClaw 的工作方式、流程、约束、职责边界时才更新，避免为临时任务改写。',
+        '- Soul.md：RedClaw 的协作语气、反馈风格、人格倾向。用户明确调整沟通风格、批判力度、表达方式时更新。',
+        '- user.md：用户稳定画像与长期事实，例如目标、受众、内容赛道、发布节奏、成功指标。用户明确给出新的长期事实时更新。',
+        '- CreatorProfile.md：用户长期自媒体定位与策略主档案，包括定位、目标群体、内容风格、商业目标、运营边界。用户明确给出这类长期变化时更新。',
+        '- 如果只是一次性任务要求、单篇稿件偏好或临时实验，不要改这些长期文档；优先体现在当前任务执行里，必要时写入普通长期记忆。',
+        '- 更新这些文档时，优先使用 `redclaw_update_profile_doc`；若只改 CreatorProfile.md，也可使用 `redclaw_update_creator_profile`。',
       );
 
       if (!redClawProfileBundle.onboardingState.completedAt && redClawProfileBundle.files.bootstrap) {
