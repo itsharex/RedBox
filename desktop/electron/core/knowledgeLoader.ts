@@ -22,10 +22,11 @@ export async function getAllKnowledgeItems(): Promise<WanderItem[]> {
     const redbookDir = paths.knowledgeRedbook;
     // Check if directory exists
     try {
-        await fs.access(redbookDir);
+      await fs.access(redbookDir);
     } catch {
-        // Directory doesn't exist, skip
-        return items;
+      // Directory doesn't exist, skip this source
+      console.log('[wander:get-random] redbook directory missing, skipped');
+      throw new Error('__RED_BOOK_DIR_MISSING__');
     }
 
     const dirs = await fs.readdir(redbookDir, { withFileTypes: true });
@@ -53,23 +54,26 @@ export async function getAllKnowledgeItems(): Promise<WanderItem[]> {
           title: meta.title || 'Untitled Note',
           content: meta.content || '',
           cover,
-          meta
+          meta,
         });
-      } catch (e) {
+      } catch {
         // Ignore invalid notes
       }
     }
   } catch (e) {
-    console.error('Error loading Redbook notes:', e);
+    if (!(e instanceof Error && e.message === '__RED_BOOK_DIR_MISSING__')) {
+      console.error('Error loading Redbook notes:', e);
+    }
   }
 
   // 2. YouTube Videos
   try {
     const youtubeDir = paths.knowledgeYoutube;
     try {
-        await fs.access(youtubeDir);
+      await fs.access(youtubeDir);
     } catch {
-        return items;
+      console.log('[wander:get-random] youtube directory missing, skipped');
+      throw new Error('__YOUTUBE_DIR_MISSING__');
     }
 
     const dirs = await fs.readdir(youtubeDir, { withFileTypes: true });
@@ -105,14 +109,16 @@ export async function getAllKnowledgeItems(): Promise<WanderItem[]> {
           title: meta.title || 'Untitled Video',
           content: content,
           cover,
-          meta
+          meta,
         });
-      } catch (e) {
+      } catch {
         // Ignore invalid videos
       }
     }
   } catch (e) {
-    console.error('Error loading YouTube videos:', e);
+    if (!(e instanceof Error && e.message === '__YOUTUBE_DIR_MISSING__')) {
+      console.error('Error loading YouTube videos:', e);
+    }
   }
 
   // 3. Document Knowledge (copied files/folders + Obsidian vault)
