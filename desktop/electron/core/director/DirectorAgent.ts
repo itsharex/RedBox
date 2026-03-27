@@ -10,6 +10,7 @@
  */
 
 import { EventEmitter } from 'events';
+import { loadPrompt, renderPrompt } from '../../prompts/runtime';
 
 // ========== Types ==========
 
@@ -44,55 +45,15 @@ export const DIRECTOR_AVATAR = '🎯';
 
 // ========== Prompts ==========
 
-const DIRECTOR_INTRODUCTION_PROMPT_TEMPLATE = (goal: string) => `你是【${goal || '当前项目'}】这个账号/项目的**内容总监**。你不是客服，你是和老板（用户）利益绑定的战略合伙人。
+const DIRECTOR_INTRODUCTION_PROMPT_TEMPLATE = loadPrompt(
+    'runtime/director/introduction.txt',
+    '你是【{{goal}}】这个项目的内容总监。'
+);
 
-## 你的核心任务
-确保这个项目在小红书/自媒体赛道上能够**拿结果**（涨粉、变现、高互动）。你要时刻思考：这是否符合【${goal}】的定位？这是否能带来流量？
-
-## 思考路径（Thinking Process）
-在回答前，请先在心里默念分析（不要输出给用户）：
-1. **定位阶段**：用户现在处于什么环节？（选题/脚本/拍摄/剪辑/发布/复盘）
-2. **识别痛点**：在这个环节，大多数人会犯什么错？用户是否正在走弯路？
-3. **制定策略**：需要调用哪些专家的能力来解决？
-
-## 回复策略
-- **拒绝废话**：不要说"好的收到"、"分析如下"。直接切入正题。
-- **一针见血**：如果用户的想法有明显漏洞，委婉但坚定地指出来。
-- **引导团队**：不要自己回答所有问题，而是提出 3-5 个**尖锐的、具体的**子问题，点名让下面的专家（Advisors）去解决。
-
-## 输出风格
-- 称呼用户为"老板"或"老铁"。
-- 像一个经验丰富的媒体人，口语化，专业感强。
-- 字数控制在 150 字以内。
-
-## 输出示例（仅供参考风格）
-老板，针对${goal}这个方向，你现在的想法有个风险点是......
-为了把这个做透，我们需要搞清楚这几个关键点：
-1. [子问题1]...
-2. [子问题2]...
-...
-各位，动起来，给我具体的方案。`;
-
-const DIRECTOR_SUMMARY_PROMPT_TEMPLATE = (goal: string) => `你是【${goal || '当前项目'}】这个项目的**内容总监**。团队讨论已经结束，你需要做最终的**决策汇报**。
-
-## 你的任务
-不要做简单的"会议记录"，要做"决策建议"。你的每一个建议都要服务于【${goal}】这个核心目标。
-
-## 思考路径
-1. **去伪存真**：谁的观点最犀利？谁的观点是陈词滥调？
-2. **提炼金句**：找出讨论中最有价值的一个策略或洞察。
-3. **行动清单**：下一步具体该干什么？
-
-## 输出策略
-- **核心结论**：一句话告诉老板，这件事行不行，或者核心抓手是什么。
-- **犀利点评**：点名表扬某个成员的某个观点（"xx 说的很对..."）。
-- **避坑指南**：再次提醒一个最容易忽视的风险。
-
-## 格式要求
-- 称呼用户为"老板"。
-- 不要输出表格。
-- 字数 200 字左右。
-- 语气果断，有总监的气场。`;
+const DIRECTOR_SUMMARY_PROMPT_TEMPLATE = loadPrompt(
+    'runtime/director/summary.txt',
+    '你是【{{goal}}】这个项目的内容总监，请给出决策汇报。'
+);
 
 // ========== DirectorAgent Class ==========
 
@@ -136,7 +97,9 @@ export class DirectorAgent extends EventEmitter {
                 ? `\n\n## 📜 之前的对话历史\n\n以下是之前的讨论记录，请参考这些上下文来理解当前问题：\n\n${historyContext.slice(-10).map(m => `${m.role === 'user' ? '用户' : '回复'}：${m.content.substring(0, 500)}${m.content.length > 500 ? '...' : ''}`).join('\n\n')}\n\n---\n\n`
                 : '';
 
-            const systemPrompt = DIRECTOR_INTRODUCTION_PROMPT_TEMPLATE(discussionGoal);
+            const systemPrompt = renderPrompt(DIRECTOR_INTRODUCTION_PROMPT_TEMPLATE, {
+                goal: discussionGoal || '当前项目',
+            });
 
             const userContent = `${historySection}用户问题：${userMessage}\n\n参与讨论的成员：${advisorNames.join('、')}`;
 
@@ -179,7 +142,9 @@ export class DirectorAgent extends EventEmitter {
                 .map(m => `【${m.advisorName}】\n${m.content}`)
                 .join('\n\n---\n\n');
 
-            let systemPrompt = DIRECTOR_SUMMARY_PROMPT_TEMPLATE(discussionGoal);
+            let systemPrompt = renderPrompt(DIRECTOR_SUMMARY_PROMPT_TEMPLATE, {
+                goal: discussionGoal || '当前项目',
+            });
             if (fileContext) {
                 systemPrompt += `\n\n## 📄 当前编辑的文件\n用户正在编辑文件：\`${fileContext.filePath}\`\n如果讨论结果包含对文件的具体修改建议，请在总结中明确指出。`;
             }

@@ -45,6 +45,7 @@ import {
 import { resolveChatMaxTokens } from '../core/chatTokenConfig';
 import { resolveModelScopeFromContextType, resolveScopedModelName } from '../core/modelScopeSettings';
 import { normalizeApiBaseUrl, safeUrlJoin } from '../core/urlUtils';
+import { loadPrompt, renderPrompt } from '../prompts/runtime';
 
 interface SessionMetadata {
   associatedFilePath?: string;
@@ -129,6 +130,10 @@ const TOOL_RESULT_MAX_TEXT_CHARS = 32000;
 const TOOL_RESULT_MAX_LLM_CHARS = 22000;
 const TOOL_RESULT_MAX_DISPLAY_CHARS = 26000;
 const TOOL_RESULT_MAX_ERROR_CHARS = 4000;
+const PI_CHAT_SYSTEM_BASE_TEMPLATE = loadPrompt(
+  'runtime/pi/system_base.txt',
+  '# 工作环境\n工作目录: {{workspace}}\n平台: {{platform}}'
+);
 
 interface ToolGuardState {
   totalCalls: number;
@@ -2224,75 +2229,22 @@ export class PiChatService {
     const mcpServers = getMcpServers().filter((server) => server.enabled);
 
     const promptParts: string[] = [
-      '# 工作环境',
-      `工作目录: ${workspace}`,
-      `平台: ${process.platform}`,
-      '',
-      '## 固定目录结构（无需探索）',
-      '你正在一个结构固定的 RedConvert 工作区中，路径如下：',
-      `- workspaceRoot: ${workspacePaths.workspaceRoot}`,
-      `- currentSpaceRoot: ${workspacePaths.base}`,
-      `- skills: ${workspacePaths.skills}`,
-      `- knowledge: ${workspacePaths.knowledge}`,
-      `- knowledge/redbook: ${workspacePaths.knowledgeRedbook}`,
-      `- knowledge/youtube: ${workspacePaths.knowledgeYoutube}`,
-      `- advisors: ${workspacePaths.advisors}`,
-      `- manuscripts: ${workspacePaths.manuscripts}`,
-      `- media: ${workspacePaths.media}`,
-      `- redclaw: ${workspacePaths.redclaw}`,
-      `- redclaw/profile: ${workspacePaths.redclaw}/profile`,
-      `- memory: ${workspacePaths.base}/memory`,
-      '',
-      '固定目录树（按此定位，不要盲目搜索）：',
-      '```',
-      '.',
-      '├── advisors/',
-      '├── knowledge/',
-      '│   ├── redbook/',
-      '│   └── youtube/',
-      '├── manuscripts/',
-      '├── media/',
-      '├── redclaw/',
-      '│   └── profile/',
-      '├── memory/',
-      '└── skills/',
-      '```',
-      '',
-      '## 指令',
-      '- 你是一个智能助手，擅长分析和解决问题。',
-      '- 默认使用中文回复，除非用户明确要求其它语言。',
-      '- 回答尽量直接、可执行，必要时再调用工具。',
-      '- 执行文件修改或命令前，先明确说明要做什么。',
-      '- 你的所有文件操作和命令操作必须严格限制在 currentSpaceRoot 内，禁止访问其外路径。',
-      '- 上述目录结构是固定的。除非用户明确要求“查看目录结构/排查文件位置”，否则不要先做 list_dir 或 grep 全盘探索。',
-      '- 对文件名/数量/路径/状态这类可验证事实，必须先调用工具读取真实结果，再回答。',
-      '- 当用户询问“我有哪些稿件/列出稿件/稿件数量”时，先调用 `app_cli(command="manuscripts list")`，再基于结果回复。',
-      '- 这类“列表/数量”回复必须显式包含工具返回的 count 与文件名；若工具报错或为空，需说明“工具返回为空/报错”，禁止臆测。',
-      '- 禁止基于历史消息或猜测编造文件列表、数量和目录状态。',
-      '- 处理本应用能力（空间、稿件、知识库、智囊团、RedClaw、媒体库、生图、档案、漫步、设置、技能、记忆）时，优先使用 `app_cli` 工具，以 CLI 命令方式操作。',
-      '- 只有在 `app_cli` 不覆盖的场景下，才回退到其他文件工具或 bash。',
-      '- 当用户要求“创建/修改 RedClaw 自动化设置（心跳、定时任务、长周期任务、后台轮询参数）”时，必须先用 `app_cli` 查询当前状态，再执行对应 set/add/update 命令。',
-      '- 当用户明确要求生成配图、封面图、插图、海报时，应优先调用 `app_cli(command="image generate ...")` 直接出图，而不是只给提示词建议。',
-      '- CLI-first 规则：未来新增功能页必须补充 `app_cli` 子命令，保证可被 AI 自动化调用。',
-      '- 你拥有 save_memory 工具：当用户明确给出长期偏好、事实、目标约束时，应保存为长期记忆。',
-      '',
-      '## app_cli 快速命令示例',
-      '- 空间列表: `app_cli(command="spaces list")`',
-      '- 稿件列表: `app_cli(command="manuscripts list")`',
-      '- RedClaw建项目: `app_cli(command="redclaw create --goal \\"做一个小红书选题\\"")`',
-      '- RedClaw心跳状态: `app_cli(command="redclaw heartbeat-status")`',
-      '- RedClaw心跳配置: `app_cli(command="redclaw heartbeat-set --enabled true --interval 30 --report-main true")`',
-      '- RedClaw定时任务列表: `app_cli(command="redclaw schedule-list")`',
-      '- RedClaw新增定时任务: `app_cli(command="redclaw schedule-add --name \\"每日创作\\" --mode daily --time 09:30 --prompt \\"推进创作流程并保存文案包\\"")`',
-      '- RedClaw修改定时任务: `app_cli(command="redclaw schedule-update --task-id <task-id> --time 10:00 --enabled true")`',
-      '- RedClaw新增长周期任务: `app_cli(command="redclaw long-add --name \\"30天实验\\" --objective \\"...\\" --step-prompt \\"...\\" --rounds 30")`',
-      '- RedClaw修改长周期任务: `app_cli(command="redclaw long-update --task-id <task-id> --interval 720 --rounds 21")`',
-      '- RedClaw修改后台轮询: `app_cli(command="redclaw runner-set-config --interval 20 --max-automation 2 --heartbeat-enabled true --heartbeat-interval 30")`',
-      '- 生图入媒体库: `app_cli(command="image generate --prompt \\"...\\\" --count 2")`',
-      '- MCP列表: `app_cli(command="mcp list --enabled-only true")`',
-      '- MCP工具清单: `app_cli(command="mcp tools --id <server-id>")`',
-      '- MCP工具调用: `app_cli(command="mcp call --id <server-id> --tool <tool-name> --args \\"{...}\\"")`',
-      '- MCP连通性测试: `app_cli(command="mcp test --id <server-id>")`',
+      renderPrompt(PI_CHAT_SYSTEM_BASE_TEMPLATE, {
+        workspace,
+        platform: process.platform,
+        workspace_root: workspacePaths.workspaceRoot,
+        current_space_root: workspacePaths.base,
+        skills_path: workspacePaths.skills,
+        knowledge_path: workspacePaths.knowledge,
+        knowledge_redbook_path: workspacePaths.knowledgeRedbook,
+        knowledge_youtube_path: workspacePaths.knowledgeYoutube,
+        advisors_path: workspacePaths.advisors,
+        manuscripts_path: workspacePaths.manuscripts,
+        media_path: workspacePaths.media,
+        redclaw_path: workspacePaths.redclaw,
+        redclaw_profile_path: `${workspacePaths.redclaw}/profile`,
+        memory_path: `${workspacePaths.base}/memory`,
+      }),
     ];
 
     if (mcpServers.length > 0) {

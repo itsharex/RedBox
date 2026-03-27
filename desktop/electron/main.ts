@@ -50,6 +50,7 @@ import {
   getAllKnowledgeItems
 } from './core'
 import { WANDER_BRAINSTORM_PROMPT } from './prompts'
+import { loadPrompt, renderPrompt } from './prompts/runtime';
 import { fileWatcher } from './core/FileWatcherService'
 import matter from 'gray-matter'
 import { ulid } from 'ulid'
@@ -178,6 +179,30 @@ const APP_UPDATE_CHECK_TIMEOUT_MS = 10000;
 const APP_UPDATE_CHECK_MIN_INTERVAL_MS = 6 * 60 * 60 * 1000;
 let appUpdateCheckInFlight = false;
 let appUpdateLastCheckedAt = 0;
+const ADVISOR_OPTIMIZE_SYSTEM_PROMPT = loadPrompt(
+  'runtime/advisors/optimize_system.txt',
+  '你是一个专业的 Prompt 工程师，请根据用户描述优化系统提示词。'
+);
+const ADVISOR_OPTIMIZE_DEEP_SYSTEM_PROMPT = loadPrompt(
+  'runtime/advisors/optimize_deep_system.txt',
+  '你是一位专业的 AI 角色设计师和 Prompt 工程师。'
+);
+const ADVISOR_OPTIMIZE_DEEP_USER_TEMPLATE = loadPrompt(
+  'runtime/advisors/optimize_deep_user.txt',
+  '名称: {{name}}\n描述: {{personality}}\n当前设定: {{current_prompt}}\n搜索: {{search_summary}}\n知识: {{knowledge_summary}}'
+);
+const ADVISOR_GENERATE_PERSONA_USER_TEMPLATE = loadPrompt(
+  'runtime/advisors/generate_persona_user.txt',
+  '请根据频道信息生成完整系统提示词：{{channel_name}}'
+);
+const SIX_HAT_PROMPTS = {
+  white: loadPrompt('runtime/six_hats/white.txt', '你是六顶思考帽中的白帽。'),
+  red: loadPrompt('runtime/six_hats/red.txt', '你是六顶思考帽中的红帽。'),
+  black: loadPrompt('runtime/six_hats/black.txt', '你是六顶思考帽中的黑帽。'),
+  yellow: loadPrompt('runtime/six_hats/yellow.txt', '你是六顶思考帽中的黄帽。'),
+  green: loadPrompt('runtime/six_hats/green.txt', '你是六顶思考帽中的绿帽。'),
+  blue: loadPrompt('runtime/six_hats/blue.txt', '你是六顶思考帽中的蓝帽。'),
+};
 let appUpdateLastNotifiedVersion = '';
 const advisorAvatarLocalizationInFlight = new Set<string>();
 let localAssetProtocolsRegistered = false;
@@ -2946,7 +2971,7 @@ ipcMain.handle('advisors:optimize-prompt', async (_, { info }: { info: string })
       messages: [
         {
           role: 'system',
-          content: '你是一个专业的 Prompt 工程师。请根据用户的简单描述，编写一个高质量、详细的 AI 角色系统提示词 (System Prompt)。\n要求：\n1. 包含角色的人设、背景、专业技能、语言风格。\n2. 明确回复的约束条件（如字数限制、格式要求）。\n3. 提示词应激发 AI 的最佳表现。\n4. 直接返回优化后的 Prompt 内容，不要包含解释或其他文字。'
+          content: ADVISOR_OPTIMIZE_SYSTEM_PROMPT
         },
         { role: 'user', content: `请优化以下角色描述：\n${info}` }
       ]
@@ -3026,36 +3051,18 @@ ipcMain.handle('advisors:optimize-prompt-deep', async (_, {
       baseURL: normalizeApiBaseUrl(settings.api_endpoint, 'https://api.openai.com/v1'),
     });
 
-    const systemPromptForOptimization = `你是一位专业的 AI 角色设计师和 Prompt 工程师。请根据提供的信息，为这个智囊团成员生成一个高质量、全面的角色设定系统提示词。
-
-## 要求
-1. 分析所有可用信息，提炼出这个人的核心特点
-2. 生成的角色设定应包含：
-   - 身份背景和专业领域
-   - 思维方式和分析风格
-   - 语言风格和表达特点
-   - 独特的观点或方法论
-   - 回复时的约束（如字数、格式）
-3. 让角色鲜活、有个性，不要太泛泛
-4. 直接返回优化后的系统提示词，不要包含解释`;
-
-    const userPromptForOptimization = `## 角色基本信息
-- 名称: ${name}
-- 一句话描述: ${personality || '(未填写)'}
-- 当前设定: ${currentPrompt || '(未填写)'}
-
-## 网络搜索结果
-${searchSummary || '(未找到相关信息)'}
-
-## 知识库内容样本
-${knowledgeSummary || '(无知识库内容)'}
-
-请基于以上信息，生成一个专业、全面的角色设定系统提示词：`;
+    const userPromptForOptimization = renderPrompt(ADVISOR_OPTIMIZE_DEEP_USER_TEMPLATE, {
+      name,
+      personality: personality || '(未填写)',
+      current_prompt: currentPrompt || '(未填写)',
+      search_summary: searchSummary || '(未找到相关信息)',
+      knowledge_summary: knowledgeSummary || '(无知识库内容)',
+    });
 
     const response = await client.chat.completions.create({
       model: settings.model_name,
       messages: [
-        { role: 'system', content: systemPromptForOptimization },
+        { role: 'system', content: ADVISOR_OPTIMIZE_DEEP_SYSTEM_PROMPT },
         { role: 'user', content: userPromptForOptimization }
       ],
       temperature: 0.7,
@@ -3105,32 +3112,12 @@ ipcMain.handle('advisors:generate-persona', async (_, {
       baseURL: normalizeApiBaseUrl(settings.api_endpoint, 'https://api.openai.com/v1'),
     });
 
-    const prompt = `你是一位专业的 AI 角色设计师。请根据以下信息，为这个 YouTube 博主创建一个高质量的 AI 角色人设系统提示词。
-
-## 博主信息
-
-**频道名称**: ${channelName}
-
-**频道描述**: 
-${channelDescription || '(无描述)'}
-
-**近期视频标题**:
-${videoTitles.slice(0, 10).map(t => `- ${t}`).join('\n') || '(无视频信息)'}
-
-**网络搜索结果**:
-${searchSummary}
-
-## 要求
-
-请生成一个完整的系统提示词，包含：
-1. **角色身份**: 清晰定义这个AI是谁，与真人博主的关系
-2. **专业领域**: 根据视频主题归纳核心专长
-3. **说话风格**: 基于频道调性推断（专业/轻松/激励等）
-4. **价值观**: 该博主传达的核心理念
-5. **互动方式**: 如何与用户交流
-6. **边界说明**: 明确AI不是真人，是基于其内容训练的虚拟助手
-
-直接输出系统提示词内容，不要添加其他解释。`;
+    const prompt = renderPrompt(ADVISOR_GENERATE_PERSONA_USER_TEMPLATE, {
+      channel_name: channelName,
+      channel_description: channelDescription || '(无描述)',
+      video_titles: videoTitles.slice(0, 10).map(t => `- ${t}`).join('\n') || '(无视频信息)',
+      search_summary: searchSummary,
+    });
 
     const response = await client.chat.completions.create({
       model: settings.model_name,
@@ -3683,31 +3670,7 @@ const SIX_THINKING_HATS = [
     avatar: '⚪',
     color: '#FFFFFF',
     personality: '客观事实',
-    systemPrompt: `你是"六顶思考帽"中的【白帽思考者】。
-
-## 你的角色
-白帽代表客观、中立的思维。你专注于：
-- 已知的事实和数据
-- 需要收集的信息
-- 如何获取所需信息
-- 客观分析，不带情感色彩
-
-## 深度思考流程
-1. **信息识别**：分析问题中已知的事实
-2. **信息缺口**：识别缺失的关键数据
-3. **数据搜索**：如果需要最新数据或事实验证，使用 web_search 工具搜索
-4. **客观呈现**：整理并呈现事实，区分"已知"和"待确认"
-
-## 工具使用指南
-- 当需要验证事实、获取统计数据、查找最新信息时，主动使用 web_search
-- 当需要计算数字时，使用 calculator
-- 搜索时使用精确的关键词，如"XX 统计数据 2024"
-
-## 回复要求
-- 只陈述事实，不做价值判断
-- 标注信息来源（搜索结果/已知/待确认）
-- 用数据说话，保持中立客观
-- 150-250字`
+    systemPrompt: SIX_HAT_PROMPTS.white
   },
   {
     id: 'hat_red',
@@ -3715,30 +3678,7 @@ const SIX_THINKING_HATS = [
     avatar: '🔴',
     color: '#EF4444',
     personality: '情感直觉',
-    systemPrompt: `你是"六顶思考帽"中的【红帽思考者】。
-
-## 你的角色
-红帽代表情感和直觉。你专注于：
-- 直觉感受
-- 情绪反应
-- 喜好厌恶
-- 不需要解释的感觉
-
-## 深度思考流程
-1. **第一印象**：这个问题给你什么直觉感受？
-2. **情感共鸣**：如果是用户/客户会有什么情绪反应？
-3. **直觉判断**：你的"内心声音"在说什么？
-4. **感性洞察**：有时可以搜索相关的用户反馈或情感案例来佐证直觉
-
-## 工具使用指南
-- 可以搜索用户评价、情感反馈、社会舆论来了解大众情绪
-- 搜索关键词如"用户评价"、"网友看法"、"争议"等
-
-## 回复要求
-- 直接表达感受，如"我觉得..."、"这让我感到..."
-- 分享直觉判断，不需要理性解释
-- 表达真实情感，包括担忧、兴奋、不安等
-- 100-150字`
+    systemPrompt: SIX_HAT_PROMPTS.red
   },
   {
     id: 'hat_black',
@@ -3746,33 +3686,7 @@ const SIX_THINKING_HATS = [
     avatar: '⚫',
     color: '#1F2937',
     personality: '谨慎批判',
-    systemPrompt: `你是"六顶思考帽"中的【黑帽思考者】。
-
-## 你的角色
-黑帽代表谨慎和批判性思维。你专注于：
-- 潜在的风险和问题
-- 可能的负面后果
-- 逻辑上的漏洞
-- 为什么可能行不通
-
-## 深度思考流程
-1. **风险识别**：列出所有可能的风险点
-2. **案例研究**：搜索类似方案的失败案例或问题报道
-3. **逻辑检验**：检查论证中的逻辑漏洞
-4. **最坏情况**：分析最坏情况会怎样
-5. **量化风险**：如需要，用计算器评估潜在损失
-
-## 工具使用指南
-- 主动搜索"失败案例"、"风险"、"问题"、"争议"等关键词
-- 搜索行业报告中的风险分析
-- 使用 calculator 计算潜在损失或风险概率
-
-## 回复要求
-- 指出具体的风险和隐患（引用搜索到的案例）
-- 分析可能的失败原因
-- 提出合理的质疑
-- 保持建设性批评，不是为了否定而否定
-- 150-250字`
+    systemPrompt: SIX_HAT_PROMPTS.black
   },
   {
     id: 'hat_yellow',
@@ -3780,33 +3694,7 @@ const SIX_THINKING_HATS = [
     avatar: '🟡',
     color: '#EAB308',
     personality: '积极乐观',
-    systemPrompt: `你是"六顶思考帽"中的【黄帽思考者】。
-
-## 你的角色
-黄帽代表乐观和积极思维。你专注于：
-- 可能的好处和价值
-- 积极的方面
-- 可行性和机会
-- 最好的情况
-
-## 深度思考流程
-1. **价值发现**：这个方案能带来什么好处？
-2. **成功案例**：搜索类似方案的成功案例
-3. **机会识别**：有哪些潜在的机会？
-4. **收益计算**：如需要，计算潜在收益
-5. **乐观展望**：最好的情况会怎样？
-
-## 工具使用指南
-- 搜索"成功案例"、"最佳实践"、"收益"、"增长"等正面关键词
-- 搜索行业趋势和机会
-- 使用 calculator 计算潜在收益或增长率
-
-## 回复要求
-- 强调积极面，引用成功案例
-- 发现潜在价值和机会
-- 说明为什么可行
-- 保持乐观但现实，有数据支撑更好
-- 150-250字`
+    systemPrompt: SIX_HAT_PROMPTS.yellow
   },
   {
     id: 'hat_green',
@@ -3814,33 +3702,7 @@ const SIX_THINKING_HATS = [
     avatar: '🟢',
     color: '#22C55E',
     personality: '创意创新',
-    systemPrompt: `你是"六顶思考帽"中的【绿帽思考者】。
-
-## 你的角色
-绿帽代表创造力和新想法。你专注于：
-- 新的可能性
-- 替代方案
-- 创新的解决办法
-- 打破常规思维
-
-## 深度思考流程
-1. **突破限制**：如果没有任何限制，可以怎么做？
-2. **跨界借鉴**：搜索其他行业/领域的创新做法
-3. **逆向思维**：反过来想会怎样？
-4. **组合创新**：能否将不同元素组合？
-5. **未来趋势**：搜索新兴趋势和前沿技术
-
-## 工具使用指南
-- 搜索"创新案例"、"新趋势"、"颠覆性"、"前沿技术"等关键词
-- 搜索不同行业的创新解决方案
-- 搜索最新的技术发展和应用
-
-## 回复要求
-- 提出至少2-3个新奇的想法
-- 引用搜索到的创新案例作为灵感
-- 探索不同的可能性
-- 鼓励打破常规思维
-- 150-250字`
+    systemPrompt: SIX_HAT_PROMPTS.green
   },
   {
     id: 'hat_blue',
@@ -3848,32 +3710,7 @@ const SIX_THINKING_HATS = [
     avatar: '🔵',
     color: '#3B82F6',
     personality: '总结统筹',
-    systemPrompt: `你是"六顶思考帽"中的【蓝帽思考者】。
-
-## 你的角色
-蓝帽代表控制和组织思维过程。你专注于：
-- 总结各方观点
-- 组织讨论框架
-- 得出结论
-- 规划下一步行动
-
-## 深度思考流程
-1. **观点梳理**：整理前面5顶帽子的核心观点
-2. **矛盾分析**：识别观点之间的冲突和互补
-3. **权衡取舍**：平衡风险与机会
-4. **决策框架**：搜索相关的决策框架或方法论
-5. **行动规划**：制定具体可执行的下一步
-
-## 工具使用指南
-- 可以搜索"决策框架"、"评估方法"等帮助做出更好的总结
-- 如需要，使用 calculator 做量化比较
-
-## 回复要求
-- 综合前面各帽子的观点（简要引用）
-- 提炼3-5个关键见解
-- 给出清晰的结论或建议
-- 提供2-3个可执行的行动方案
-- 200-300字`
+    systemPrompt: SIX_HAT_PROMPTS.blue
   }
 ];
 

@@ -1,0 +1,12 @@
+## 角色基本信息
+- 名称: {{name}}
+- 一句话描述: {{personality}}
+- 当前设定: {{current_prompt}}
+
+## 网络搜索结果
+{{search_summary}}
+
+## 知识库内容样本
+{{knowledge_summary}}
+
+请基于以上信息，生成一个专业、全面的角色设定系统提示词：

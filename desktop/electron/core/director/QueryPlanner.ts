@@ -54,6 +54,11 @@ export interface SearchQuery {
     weight: number;
 }
 
+const QUERY_PLANNER_SYSTEM_PROMPT_TEMPLATE = loadPrompt(
+    'runtime/director/query_planner.txt',
+    '你是一个智能检索规划器，专门为「{{advisor_name}}」设计检索策略。'
+);
+
 // ========== QueryPlanner Class ==========
 
 export class QueryPlanner {
@@ -113,47 +118,11 @@ export class QueryPlanner {
      * 构建查询规划器的系统提示词
      */
     private buildPlannerPrompt(advisor: AdvisorContext): string {
-        return `你是一个智能检索规划器，专门为「${advisor.name}」设计检索策略。
-
-## 角色背景
-- 名称：${advisor.name}
-- 性格特点：${advisor.personality}
-- 专业领域：${advisor.expertise.join('、')}
-
-## 你的任务
-分析用户的问题，生成一组精准的检索词，帮助${advisor.name}从知识库中找到最有价值的参考信息。
-注意：当前使用的是关键词匹配(Grep)而非向量检索，因此请多生成同义词、近义词以增加召回率。
-
-## 检索词设计原则
-1. **理解意图**：不是直接复制用户的问题，而是理解他们真正想知道什么
-2. **专业视角**：基于${advisor.name}的专业背景，思考需要哪些知识来回答
-3. **关键词优化**：
-   - 包含核心概念的同义词（如："营销" -> "推广", "获客"）
-   - 包含具体的行业术语
-   - 拆解长难句为短语
-4. **多维度覆盖**：
-   - primary（核心）：直接相关的核心知识
-   - background（背景）：理解问题所需的背景知识
-   - contrast（对比）：可用于对比分析的案例
-   - example（示例）：具体的实践案例或模板
-
-## 输出格式（JSON）
-\`\`\`json
-{
-  "queryIntent": "用一句话描述问题的本质",
-  "reasoning": "简要说明你的思考过程",
-  "searchQueries": [
-    {
-      "query": "具体的检索词",
-      "purpose": "primary|background|contrast|example",
-      "expectedContent": "期望找到什么内容",
-      "weight": 0.9
-    }
-  ]
-}
-\`\`\`
-
-请生成 5-8 个检索词，按重要性排序。确保覆盖核心词的不同表达方式。`;
+        return renderPrompt(QUERY_PLANNER_SYSTEM_PROMPT_TEMPLATE, {
+            advisor_name: advisor.name,
+            advisor_personality: advisor.personality,
+            advisor_expertise: advisor.expertise.join('、'),
+        });
     }
 
     /**
@@ -293,3 +262,4 @@ export function createQueryPlanner(config: QueryPlannerConfig): QueryPlanner {
     return new QueryPlanner(config);
 }
 import { normalizeApiBaseUrl, safeUrlJoin } from '../urlUtils';
+import { loadPrompt, renderPrompt } from '../../prompts/runtime';
