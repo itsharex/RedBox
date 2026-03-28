@@ -2,6 +2,8 @@ import { getChatMessages, getChatSessions, getSettings, type ChatMessage, type C
 import { resolveScopedModelName } from './modelScopeSettings';
 import { loadAndRenderPrompt } from '../prompts/runtime';
 import { normalizeApiBaseUrl, safeUrlJoin } from './urlUtils';
+import { getTaskGraphRuntime } from './ai/taskGraphRuntime';
+import type { IntentRoute } from './ai/types';
 import {
   addMemoryMutationListener,
   addUserMemoryToFile,
@@ -30,6 +32,20 @@ const MAX_ACTIONS = 12;
 const MAX_RECENT_SESSION_ITEMS = 5;
 const MAX_RECENT_MESSAGES_PER_SESSION = 12;
 const MAX_MESSAGE_CONTENT_CHARS = 280;
+
+function buildMaintenanceRoute(reason: MaintenanceTriggerReason, pendingMutations: number): IntentRoute {
+  return {
+    intent: 'memory_maintenance',
+    goal: `维护长期记忆（reason=${reason}; pending=${pendingMutations}）`,
+    requiredCapabilities: ['memory-read', 'memory-write', 'profile-doc'],
+    recommendedRole: 'ops-coordinator',
+    requiresLongRunningTask: false,
+    requiresMultiAgent: false,
+    requiresHumanApproval: false,
+    confidence: 0.92,
+    reasoning: `memory-maintenance:${reason}`,
+  };
+}
 
 type MaintenanceTriggerReason = 'init' | 'mutation' | 'periodic' | 'workspace-change' | 'manual';
 
@@ -344,6 +360,7 @@ export class MemoryMaintenanceService {
     this.lastReason = reason;
     this.lastError = null;
     this.nextScheduledAt = null;
+    let taskId: string | null = null;
 
     try {
       const active = await listUserMemoriesFromFile();
@@ -360,6 +377,36 @@ export class MemoryMaintenanceService {
         return;
       }
 
+      const runtime = getTaskGraphRuntime();
+      const task = runtime.createInteractiveTask({
+        runtimeMode: 'background-maintenance',
+        ownerSessionId: 'memory-maintenance',
+        userInput: `memory-maintenance:${reason}`,
+        route: buildMaintenanceRoute(reason, this.pendingMutations),
+        roleId: 'ops-coordinator',
+        metadata: {
+          source: 'memory-maintenance',
+          pendingMutations: this.pendingMutations,
+          activeCount: active.length,
+          archivedCount: archived.length,
+          historyCount: history.length,
+        },
+      });
+      taskId = task.id;
+      runtime.startNode(taskId, 'route', `reason=${reason}`);
+      runtime.completeNode(taskId, 'route', `reason=${reason}`);
+      runtime.startNode(taskId, 'plan', `pendingMutations=${this.pendingMutations}`);
+      runtime.completeNode(taskId, 'plan', `active=${active.length}; archived=${archived.length}; history=${history.length}`);
+      runtime.startNode(taskId, 'execute_tools', '开始执行记忆整理');
+      runtime.addTrace(taskId, 'memory.plan_input', {
+        reason,
+        pendingMutations: this.pendingMutations,
+        activeCount: active.length,
+        archivedCount: archived.length,
+        historyCount: history.length,
+        recentConversationCount: recentConversations.length,
+      }, 'execute_tools');
+
       const settings = (getSettings() || {}) as Record<string, unknown>;
       const apiKey = String(settings.api_key || '').trim();
       const baseURL = normalizeApiBaseUrl(String(settings.api_endpoint || ''), 'https://api.openai.com/v1');
@@ -368,6 +415,9 @@ export class MemoryMaintenanceService {
       if (!apiKey || !baseURL || !model) {
         this.lastError = 'missing-model-config';
         console.warn('[MemoryMaintenance] skipped: model config missing', { hasApiKey: Boolean(apiKey), baseURL, model });
+        if (taskId) {
+          runtime.failTask(taskId, this.lastError, 'execute_tools');
+        }
         return;
       }
 
@@ -386,6 +436,12 @@ export class MemoryMaintenanceService {
         baseURL,
         prompt,
       });
+      if (taskId) {
+        runtime.addTrace(taskId, 'memory.plan_received', {
+          summary: plan.summary || '',
+          actionsCount: Array.isArray(plan.actions) ? plan.actions.length : 0,
+        }, 'execute_tools');
+      }
 
       const actions = Array.isArray(plan.actions)
         ? plan.actions.map(sanitizeAction).filter((item): item is MaintenanceAction => Boolean(item)).slice(0, MAX_ACTIONS)
@@ -399,15 +455,25 @@ export class MemoryMaintenanceService {
 
       for (const action of actions) {
         await this.applyAction(action);
+        if (taskId) {
+          runtime.addTrace(taskId, 'memory.action_applied', action, 'execute_tools');
+        }
       }
 
       this.lastSummary = String(plan.summary || '').trim() || `actions=${actions.length}`;
       this.pendingMutations = 0;
       this.lastRunAt = new Date().toISOString();
+      if (taskId) {
+        runtime.completeNode(taskId, 'execute_tools', this.lastSummary);
+        runtime.completeTask(taskId, this.lastSummary);
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.lastError = message;
       console.error('[MemoryMaintenance] run failed:', error);
+      if (taskId) {
+        getTaskGraphRuntime().failTask(taskId, message, 'execute_tools');
+      }
     } finally {
       this.running = false;
     }

@@ -12,6 +12,8 @@ import {
 } from '../db';
 import { getRedClawProject, listRedClawProjects } from './redclawStore';
 import { PiChatService } from '../pi/PiChatService';
+import { getTaskGraphRuntime } from './ai/taskGraphRuntime';
+import type { IntentRoute, RoleId, RuntimeMode } from './ai/types';
 
 type RunResult = 'success' | 'error' | 'skipped';
 type ScheduleMode = 'interval' | 'daily' | 'weekly' | 'once';
@@ -551,6 +553,50 @@ export class RedClawBackgroundRunner extends EventEmitter {
 
   private emitStatus(): void {
     this.emit('status', this.getStatus());
+  }
+
+  private createRuntimeTask(params: {
+    runtimeMode: RuntimeMode;
+    intent: IntentRoute['intent'];
+    roleId: RoleId;
+    ownerSessionId: string;
+    goal: string;
+    userInput: string;
+    metadata?: Record<string, unknown>;
+  }): string {
+    const route: IntentRoute = {
+      intent: params.intent,
+      goal: params.goal,
+      requiredCapabilities: params.intent === 'automation'
+        ? ['task-graph', 'background-runner', 'artifact-save']
+        : params.intent === 'memory_maintenance'
+          ? ['memory-read', 'memory-write']
+          : ['planning', 'artifact-save'],
+      recommendedRole: params.roleId,
+      requiresLongRunningTask: params.intent === 'automation' || params.intent === 'long_running_task',
+      requiresMultiAgent: false,
+      requiresHumanApproval: false,
+      confidence: 0.9,
+      reasoning: `background-runner:${params.intent}`,
+    };
+    const runtime = getTaskGraphRuntime();
+    const task = runtime.createInteractiveTask({
+      runtimeMode: params.runtimeMode,
+      ownerSessionId: params.ownerSessionId,
+      userInput: params.userInput,
+      route,
+      roleId: params.roleId,
+      metadata: {
+        source: 'redclaw-background-runner',
+        ...params.metadata,
+      },
+    });
+    runtime.startNode(task.id, 'route', route.reasoning);
+    runtime.completeNode(task.id, 'route', route.reasoning);
+    runtime.startNode(task.id, 'plan', params.goal);
+    runtime.completeNode(task.id, 'plan', params.goal);
+    runtime.startNode(task.id, 'execute_tools', '后台执行开始');
+    return task.id;
   }
 
   private normalizeSchedules(nowMs: number): void {
@@ -1259,41 +1305,67 @@ export class RedClawBackgroundRunner extends EventEmitter {
   private async runProject(projectId: string): Promise<void> {
     const projectState = this.config.projectStates[projectId];
     if (!projectState?.enabled) return;
+    const runtime = getTaskGraphRuntime();
 
     const { project, projectDir } = await getRedClawProject(projectId);
-    if (project.status === 'reviewed' && !projectState.prompt) {
-      this.updateProjectRunResult(projectId, 'skipped');
-      return;
-    }
-
-    const hasCopyPack = await exists(path.join(projectDir, 'copy-pack.json'));
-    const hasImagePack = await exists(path.join(projectDir, 'image-pack.json'));
-    const prompt = buildBackgroundPrompt({
-      projectId,
-      goal: project.goal,
-      hasCopyPack,
-      hasImagePack,
-      customPrompt: projectState.prompt,
+    const taskId = this.createRuntimeTask({
+      runtimeMode: 'background-maintenance',
+      intent: 'automation',
+      roleId: 'ops-coordinator',
+      ownerSessionId: `redclaw-bg:${projectId}`,
+      goal: `后台推进项目 ${project.goal}`,
+      userInput: `background project ${projectId}`,
+      metadata: { projectId, projectGoal: project.goal },
     });
+    try {
+      if (project.status === 'reviewed' && !projectState.prompt) {
+        this.updateProjectRunResult(projectId, 'skipped');
+        runtime.skipNode(taskId, 'execute_tools', '项目已 reviewed，且无自定义后台提示词');
+        runtime.completeTask(taskId, '项目无需继续推进');
+        return;
+      }
 
-    if (!prompt.shouldRun) {
-      this.updateProjectRunResult(projectId, 'skipped');
-      return;
+      const hasCopyPack = await exists(path.join(projectDir, 'copy-pack.json'));
+      const hasImagePack = await exists(path.join(projectDir, 'image-pack.json'));
+      const prompt = buildBackgroundPrompt({
+        projectId,
+        goal: project.goal,
+        hasCopyPack,
+        hasImagePack,
+        customPrompt: projectState.prompt,
+      });
+
+      if (!prompt.shouldRun) {
+        this.updateProjectRunResult(projectId, 'skipped');
+        runtime.skipNode(taskId, 'execute_tools', '后台策略判断本轮无需执行');
+        runtime.completeTask(taskId, '本轮后台任务跳过');
+        return;
+      }
+
+      const result = await this.runAgentPrompt({
+        contextId: `redclaw-bg-${projectId}`,
+        title: `RedClaw BG ${project.goal.slice(0, 24)}`,
+        contextContent: [
+          `后台项目: ${projectId}`,
+          `目标: ${project.goal}`,
+          '这是后台自动推进会话，不依赖前台界面。',
+        ].join('\n'),
+        prompt: prompt.message,
+        displayContent: '[后台项目推进]',
+      });
+      runtime.addCheckpoint(taskId, 'execute_tools', '后台会话已执行', {
+        projectId,
+        sessionId: result.sessionId,
+      });
+      runtime.completeNode(taskId, 'execute_tools', '后台项目推进完成');
+      runtime.completeTask(taskId, '后台项目推进完成');
+
+      this.updateProjectRunResult(projectId, 'success');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      runtime.failTask(taskId, message, 'execute_tools');
+      throw error;
     }
-
-    await this.runAgentPrompt({
-      contextId: `redclaw-bg-${projectId}`,
-      title: `RedClaw BG ${project.goal.slice(0, 24)}`,
-      contextContent: [
-        `后台项目: ${projectId}`,
-        `目标: ${project.goal}`,
-        '这是后台自动推进会话，不依赖前台界面。',
-      ].join('\n'),
-      prompt: prompt.message,
-      displayContent: '[后台项目推进]',
-    });
-
-    this.updateProjectRunResult(projectId, 'success');
   }
 
   private async runProjectTick(reason: 'scheduled' | 'manual' | 'init' | 'workspace-change', onlyProjectId?: string): Promise<void> {
@@ -1374,6 +1446,16 @@ export class RedClawBackgroundRunner extends EventEmitter {
   private async executeScheduledTask(taskId: string, reason: 'scheduled' | 'manual'): Promise<void> {
     const task = this.config.scheduledTasks[taskId];
     if (!task) throw new Error('Scheduled task not found');
+    const runtime = getTaskGraphRuntime();
+    const runtimeTaskId = this.createRuntimeTask({
+      runtimeMode: 'background-maintenance',
+      intent: 'automation',
+      roleId: 'ops-coordinator',
+      ownerSessionId: `redclaw-scheduled:${task.id}`,
+      goal: `执行定时任务 ${task.name}`,
+      userInput: task.prompt,
+      metadata: { scheduledTaskId: task.id, reason, projectId: task.projectId || null },
+    });
 
     this.currentAutomationTaskId = task.id;
     this.emitStatus();
@@ -1396,6 +1478,10 @@ export class RedClawBackgroundRunner extends EventEmitter {
         displayContent: `[定时任务:${task.name}]`,
       });
       this.mirrorLatestAssistantToMainSession(result.sessionId, `[定时任务结果:${task.name}]`);
+      runtime.addCheckpoint(runtimeTaskId, 'execute_tools', '定时任务会话完成', {
+        scheduledTaskId: task.id,
+        sessionId: result.sessionId,
+      });
 
       task.lastRunAt = nowIso();
       task.lastResult = 'success';
@@ -1409,6 +1495,8 @@ export class RedClawBackgroundRunner extends EventEmitter {
         task.nextRunAt = computeNextRunForScheduledTask(task, nowMs) || undefined;
       }
       task.updatedAt = nowIso();
+      runtime.completeNode(runtimeTaskId, 'execute_tools', '定时任务执行完成');
+      runtime.completeTask(runtimeTaskId, `scheduled:${task.id}:success`);
       this.emit('log', { level: 'info', message: `Scheduled task completed: ${task.id}`, reason, at: nowIso() });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -1420,6 +1508,7 @@ export class RedClawBackgroundRunner extends EventEmitter {
         task.nextRunAt = computeNextRunForScheduledTask(task, Date.now()) || undefined;
       }
       this.lastError = message;
+      runtime.failTask(runtimeTaskId, message, 'execute_tools');
       this.emit('log', { level: 'error', message: `Scheduled task failed: ${task.id}: ${message}`, reason, at: nowIso() });
     } finally {
       this.currentAutomationTaskId = null;
@@ -1447,6 +1536,16 @@ export class RedClawBackgroundRunner extends EventEmitter {
   private async executeLongCycleTask(taskId: string, reason: 'scheduled' | 'manual'): Promise<void> {
     const task = this.config.longCycleTasks[taskId];
     if (!task) throw new Error('Long cycle task not found');
+    const runtime = getTaskGraphRuntime();
+    const runtimeTaskId = this.createRuntimeTask({
+      runtimeMode: 'background-maintenance',
+      intent: 'long_running_task',
+      roleId: 'ops-coordinator',
+      ownerSessionId: `redclaw-longcycle:${task.id}`,
+      goal: `推进长周期任务 ${task.name}`,
+      userInput: `${task.objective}\n${task.stepPrompt}`,
+      metadata: { longCycleTaskId: task.id, round: `${task.completedRounds}/${task.totalRounds}`, reason },
+    });
 
     this.currentAutomationTaskId = task.id;
     this.emitStatus();
@@ -1479,6 +1578,10 @@ export class RedClawBackgroundRunner extends EventEmitter {
         displayContent: `[长周期任务:${task.name}]`,
       });
       this.mirrorLatestAssistantToMainSession(result.sessionId, `[长周期任务结果:${task.name}]`);
+      runtime.addCheckpoint(runtimeTaskId, 'execute_tools', '长周期任务会话完成', {
+        longCycleTaskId: task.id,
+        sessionId: result.sessionId,
+      });
 
       task.completedRounds += 1;
       task.lastRunAt = nowIso();
@@ -1493,6 +1596,8 @@ export class RedClawBackgroundRunner extends EventEmitter {
         task.nextRunAt = nextIsoFromMinutes(Date.now(), sanitizeIntervalMinutes(task.intervalMinutes));
       }
       task.updatedAt = nowIso();
+      runtime.completeNode(runtimeTaskId, 'execute_tools', `长周期推进完成 ${task.completedRounds}/${task.totalRounds}`);
+      runtime.completeTask(runtimeTaskId, `long-cycle:${task.id}:${task.completedRounds}/${task.totalRounds}`);
       this.emit('log', { level: 'info', message: `Long-cycle task progressed: ${task.id} (${task.completedRounds}/${task.totalRounds})`, reason, at: nowIso() });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -1502,6 +1607,7 @@ export class RedClawBackgroundRunner extends EventEmitter {
       task.nextRunAt = nextIsoFromMinutes(Date.now(), sanitizeIntervalMinutes(task.intervalMinutes));
       task.updatedAt = nowIso();
       this.lastError = message;
+      runtime.failTask(runtimeTaskId, message, 'execute_tools');
       this.emit('log', { level: 'error', message: `Long-cycle task failed: ${task.id}: ${message}`, reason, at: nowIso() });
     } finally {
       this.currentAutomationTaskId = null;
@@ -1583,6 +1689,16 @@ export class RedClawBackgroundRunner extends EventEmitter {
     if (!heartbeat.enabled) {
       return;
     }
+    const runtime = getTaskGraphRuntime();
+    const runtimeTaskId = this.createRuntimeTask({
+      runtimeMode: 'background-maintenance',
+      intent: 'automation',
+      roleId: 'ops-coordinator',
+      ownerSessionId: 'redclaw-heartbeat',
+      goal: '执行 RedClaw 心跳汇报',
+      userInput: 'heartbeat',
+      metadata: { reason },
+    });
 
     const now = nowIso();
     const { summary, digest } = this.buildHeartbeatSummary(now);
@@ -1593,6 +1709,8 @@ export class RedClawBackgroundRunner extends EventEmitter {
 
     if (shouldSuppress) {
       this.emit('log', { level: 'info', message: 'HEARTBEAT_OK', reason, at: now });
+      runtime.skipNode(runtimeTaskId, 'execute_tools', '心跳摘要无变化，按配置抑制输出');
+      runtime.completeTask(runtimeTaskId, 'heartbeat suppressed');
       return;
     }
 
@@ -1617,6 +1735,8 @@ export class RedClawBackgroundRunner extends EventEmitter {
         prompt,
         displayContent: '[后台心跳任务]',
       });
+      runtime.completeNode(runtimeTaskId, 'execute_tools', '心跳 AI 汇报完成');
+      runtime.completeTask(runtimeTaskId, 'heartbeat via ai');
       this.emit('log', { level: 'info', message: 'Heartbeat completed via AI prompt', reason, at: now });
       return;
     }
@@ -1636,8 +1756,15 @@ export class RedClawBackgroundRunner extends EventEmitter {
         source: 'heartbeat',
         at: now,
       });
+      runtime.addArtifact(runtimeTaskId, {
+        type: 'heartbeat-report',
+        label: 'RedClaw 心跳汇报',
+        metadata: { sessionId: session.id, reason },
+      });
     }
 
+    runtime.completeNode(runtimeTaskId, 'execute_tools', '心跳汇报已输出');
+    runtime.completeTask(runtimeTaskId, 'heartbeat emitted');
     this.emit('log', { level: 'info', message: 'Heartbeat report emitted', reason, at: now, summary });
   }
 

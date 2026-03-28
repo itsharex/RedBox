@@ -557,7 +557,7 @@ export class PiChatService {
       redClawProjectContext,
       redClawProfileBundle,
     );
-    const preparedExecution = getAgentRuntime().prepareExecution({
+    const preparedExecution = await getAgentRuntime().prepareExecution({
       runtimeContext: {
         sessionId,
         runtimeMode,
@@ -567,6 +567,11 @@ export class PiChatService {
         currentSpaceRoot: workspacePaths.base,
       },
       baseSystemPrompt,
+      llm: {
+        apiKey,
+        baseURL,
+        model: modelName,
+      },
     });
     this.activeRuntimeExecution = preparedExecution;
     const systemPrompt = preparedExecution.systemPrompt;

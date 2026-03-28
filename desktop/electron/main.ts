@@ -1079,7 +1079,8 @@ ipcMain.handle('tasks:create', async (_event, payload?: {
   const runtimeMode = (payload?.runtimeMode || 'redclaw') as RuntimeMode;
   const sessionId = String(payload?.sessionId || `session_${Date.now()}`);
   const userInput = String(payload?.userInput || '').trim();
-  const prepared = getAgentRuntime().prepareExecution({
+  const settings = (getSettings() || {}) as Record<string, unknown>;
+  const prepared = await getAgentRuntime().prepareExecution({
     runtimeContext: {
       sessionId,
       runtimeMode,
@@ -1087,6 +1088,11 @@ ipcMain.handle('tasks:create', async (_event, payload?: {
       metadata: payload?.metadata || {},
     },
     baseSystemPrompt: '',
+    llm: {
+      apiKey: String(settings.api_key || '').trim(),
+      baseURL: normalizeApiBaseUrl(String(settings.api_endpoint || '').trim()),
+      model: String(resolveScopedModelName(settings, runtimeMode === 'background-maintenance' ? 'redclaw' : runtimeMode as any, String(settings.model_name || 'gpt-4o-mini'))).trim(),
+    },
   });
   return prepared.task;
 });
@@ -2394,8 +2400,8 @@ ipcMain.on('ai:start-chat', async (event, message, modelConfig) => {
     baseURL: normalizeApiBaseUrl((modelConfig?.baseURL || settings.api_endpoint || '') as string),
     model: (modelConfig?.modelName || settings.model_name || '') as string,
     projectRoot: process.cwd(),
-    maxTurns: 20,
-    maxTimeMinutes: 10,
+    maxTurns: 40,
+    maxTimeMinutes: 20,
     temperature: 0.7,
   }
 

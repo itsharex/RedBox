@@ -4,3 +4,4 @@ export * from './roleRegistry';
 export * from './taskGraphRuntime';
 export * from './contextAssembler';
 export * from './agentRuntime';
+export * from './subagentRuntime';

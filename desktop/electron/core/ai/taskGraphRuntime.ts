@@ -22,12 +22,23 @@ const createNode = (type: string, title: string): AgentTaskNodeRecord => ({
   status: 'pending',
 });
 
-const buildGraphForIntent = (intent: string): AgentTaskNodeRecord[] => {
-  switch (intent) {
+const buildGraphForIntent = (params: { intent: string; multiAgent: boolean; longRunning: boolean }): AgentTaskNodeRecord[] => {
+  const basePrefix = [
+    createNode('route', '识别任务意图'),
+    createNode('plan', '生成执行计划'),
+  ];
+  const collaborationPrefix = params.multiAgent
+    ? [
+      createNode('spawn_agents', '调度子角色'),
+      createNode('handoff', '整理角色交接'),
+    ]
+    : [];
+
+  switch (params.intent) {
     case 'manuscript_creation':
       return [
-        createNode('route', '识别任务意图'),
-        createNode('plan', '生成执行计划'),
+        ...basePrefix,
+        ...collaborationPrefix,
         createNode('retrieve', '检索素材'),
         createNode('execute_tools', '调用工具执行'),
         createNode('review', '校验结果'),
@@ -38,25 +49,39 @@ const buildGraphForIntent = (intent: string): AgentTaskNodeRecord[] => {
     case 'cover_generation':
     case 'advisor_persona':
       return [
-        createNode('route', '识别任务意图'),
-        createNode('plan', '生成执行计划'),
+        ...basePrefix,
+        ...collaborationPrefix,
         createNode('retrieve', '检索素材'),
         createNode('execute_tools', '调用工具执行'),
+        createNode('review', '校验结果'),
         createNode('save_artifact', '保存产物'),
         createNode('complete', '完成任务'),
       ];
     case 'knowledge_retrieval':
       return [
-        createNode('route', '识别任务意图'),
+        ...basePrefix,
+        ...collaborationPrefix,
         createNode('retrieve', '检索素材'),
         createNode('execute_tools', '调用工具执行'),
+        createNode('review', '校验结果'),
+        createNode('complete', '完成任务'),
+      ];
+    case 'automation':
+    case 'long_running_task':
+      return [
+        ...basePrefix,
+        ...(params.multiAgent ? collaborationPrefix : [createNode('spawn_agents', '调度后台角色')]),
+        createNode('execute_tools', '推进后台执行'),
+        createNode('review', '检查执行结果'),
+        createNode('handoff', '记录下一步'),
         createNode('complete', '完成任务'),
       ];
     default:
       return [
-        createNode('route', '识别任务意图'),
-        createNode('plan', '生成执行计划'),
+        ...basePrefix,
+        ...collaborationPrefix,
         createNode('execute_tools', '调用工具执行'),
+        ...(params.longRunning ? [createNode('handoff', '记录后续动作')] : []),
         createNode('complete', '完成任务'),
       ];
   }
@@ -98,7 +123,11 @@ export class TaskGraphRuntime {
     metadata?: unknown;
   }): AgentTaskSnapshot {
     const id = `task_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    const graph = buildGraphForIntent(params.route.intent);
+    const graph = buildGraphForIntent({
+      intent: params.route.intent,
+      multiAgent: params.route.requiresMultiAgent,
+      longRunning: params.route.requiresLongRunningTask,
+    });
     const created = createAgentTask({
       id,
       task_type: params.route.intent,

@@ -127,9 +127,9 @@ export class AgentExecutor {
 
             // Agent 循环
             let turnCount = 0;
-            const maxTurns = this.config.maxTurns || 20;
+            const maxTurns = this.config.maxTurns || 40;
             const startTime = Date.now();
-            const maxTimeMs = (this.config.maxTimeMinutes || 10) * 60 * 1000;
+            const maxTimeMs = (this.config.maxTimeMinutes || 20) * 60 * 1000;
 
             while (turnCount < maxTurns) {
                 // 检查超时

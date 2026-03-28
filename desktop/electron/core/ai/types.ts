@@ -101,4 +101,13 @@ export interface PreparedRuntimeExecution {
   role: RoleSpec;
   systemPrompt: string;
   thinkingBudget: ThinkingBudget;
+  orchestration?: {
+    outputs: Array<{
+      roleId: RoleId;
+      summary: string;
+      artifact?: string;
+      handoff?: string;
+      risks?: string[];
+    }>;
+  } | null;
 }

@@ -1,6 +1,7 @@
 import { assembleRuntimeSystemPrompt } from './contextAssembler';
 import { routeIntent } from './intentRouter';
 import { getRoleSpec } from './roleRegistry';
+import { runSubagentOrchestration } from './subagentRuntime';
 import { getTaskGraphRuntime } from './taskGraphRuntime';
 import type {
   PreparedRuntimeExecution,
@@ -18,13 +19,20 @@ const resolveThinkingBudget = (runtimeMode: RuntimeMode, route: ReturnType<typeo
 };
 
 export class AgentRuntime {
-  prepareExecution(params: {
+  async prepareExecution(params: {
     runtimeContext: RuntimeContext;
     baseSystemPrompt: string;
-  }): PreparedRuntimeExecution {
+    llm?: {
+      apiKey: string;
+      baseURL: string;
+      model: string;
+      timeoutMs?: number;
+    };
+  }): Promise<PreparedRuntimeExecution> {
     const route = routeIntent(params.runtimeContext);
     const role = getRoleSpec(route.recommendedRole);
-    const task = getTaskGraphRuntime().createInteractiveTask({
+    const runtime = getTaskGraphRuntime();
+    const task = runtime.createInteractiveTask({
       runtimeMode: params.runtimeContext.runtimeMode,
       ownerSessionId: params.runtimeContext.sessionId,
       userInput: params.runtimeContext.userInput,
@@ -33,12 +41,41 @@ export class AgentRuntime {
       metadata: params.runtimeContext.metadata,
     });
 
-    getTaskGraphRuntime().startNode(task.id, 'route', route.reasoning);
-    getTaskGraphRuntime().completeNode(task.id, 'route', route.reasoning);
-    getTaskGraphRuntime().startNode(task.id, 'plan', `role=${role.roleId}`);
-    getTaskGraphRuntime().completeNode(task.id, 'plan', `role=${role.roleId}; confidence=${route.confidence}`);
-    if (task.graph.some((node) => node.type === 'execute_tools')) {
-      getTaskGraphRuntime().startNode(task.id, 'execute_tools', '准备执行主代理');
+    runtime.startNode(task.id, 'route', route.reasoning);
+    runtime.completeNode(task.id, 'route', route.reasoning);
+    runtime.startNode(task.id, 'plan', `role=${role.roleId}`);
+    runtime.completeNode(task.id, 'plan', `role=${role.roleId}; confidence=${route.confidence}`);
+
+    let orchestration: PreparedRuntimeExecution['orchestration'] = null;
+    let orchestrationSection = '';
+    if ((route.requiresMultiAgent || route.requiresLongRunningTask) && params.llm?.apiKey && params.llm?.baseURL && params.llm?.model) {
+      try {
+        const orchestrationResult = await runSubagentOrchestration({
+          llm: params.llm,
+          route,
+          runtimeMode: params.runtimeContext.runtimeMode,
+          taskId: task.id,
+          userInput: params.runtimeContext.userInput,
+        });
+        if (orchestrationResult) {
+          orchestrationSection = orchestrationResult.promptSection;
+          orchestration = {
+            outputs: orchestrationResult.outputs,
+          };
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        runtime.addTrace(task.id, 'runtime.orchestration_failed', { error: message }, 'spawn_agents');
+      }
+    } else if (task.graph.some((node) => node.type === 'spawn_agents')) {
+      runtime.skipNode(task.id, 'spawn_agents', '当前未配置可用的协作 LLM，上游 orchestration 跳过');
+      if (task.graph.some((node) => node.type === 'handoff')) {
+        runtime.skipNode(task.id, 'handoff', '未生成子角色 handoff');
+      }
+    }
+
+    if (runtime.getTask(task.id)?.graph.some((node) => node.type === 'execute_tools')) {
+      runtime.startNode(task.id, 'execute_tools', '准备执行主代理');
     }
 
     const systemPrompt = assembleRuntimeSystemPrompt({
@@ -49,20 +86,25 @@ export class AgentRuntime {
       task,
     });
 
+    const systemPromptWithOrchestration = orchestrationSection
+      ? `${systemPrompt}\n\n${orchestrationSection}`
+      : systemPrompt;
     const thinkingBudget = resolveThinkingBudget(params.runtimeContext.runtimeMode, route);
-    getTaskGraphRuntime().addTrace(task.id, 'runtime.prepared', {
+    runtime.addTrace(task.id, 'runtime.prepared', {
       route,
       roleId: role.roleId,
       thinkingBudget,
       runtimeMode: params.runtimeContext.runtimeMode,
+      orchestrationRoles: orchestration?.outputs.map((item) => item.roleId) || [],
     });
 
     return {
       task,
       route,
       role,
-      systemPrompt,
+      systemPrompt: systemPromptWithOrchestration,
       thinkingBudget,
+      orchestration,
     };
   }
 
