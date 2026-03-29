@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { RefreshCw, Sparkles, History, X, Trash2, PenLine, Dices, Lightbulb, FileText, Play } from 'lucide-react';
 import { clsx } from 'clsx';
 import { resolveAssetUrl } from '../utils/pathManager';
@@ -57,6 +57,25 @@ export function Wander({ onNavigateToManuscript, onNavigateToRedClaw }: WanderPr
   const [showHistory, setShowHistory] = useState(false);
   const [historyList, setHistoryList] = useState<WanderHistoryRecord[]>([]);
   const [currentHistoryId, setCurrentHistoryId] = useState<string | null>(null);
+  const [liveStatus, setLiveStatus] = useState('');
+  const activeRequestIdRef = useRef('');
+
+  const toStableTwoLineText = (raw: string) => {
+    const normalized = String(raw || '')
+      .replace(/\r\n/g, '\n')
+      .replace(/\r/g, '\n')
+      .trim();
+    if (!normalized) return '';
+    const lines = normalized
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (!lines.length) return '';
+    const picked = lines.slice(0, 2).map((line) => line.length > 120 ? `${line.slice(0, 120)}…` : line);
+    const hasMore = lines.length > 2 || normalized.length > picked.join('\n').length;
+    const joined = picked.join('\n');
+    return hasMore && !joined.endsWith('…') ? `${joined}…` : joined;
+  };
 
   const buildKnowledgeFolderReference = (item: WanderItem) => {
     const meta = (item.meta || {}) as Record<string, unknown>;
@@ -258,6 +277,24 @@ export function Wander({ onNavigateToManuscript, onNavigateToRedClaw }: WanderPr
     })();
   }, []);
 
+  useEffect(() => {
+    const handleWanderProgress = (_event: unknown, payload?: unknown) => {
+      const data = (payload || {}) as Record<string, unknown>;
+      const requestId = String(data.requestId || '').trim();
+      if (activeRequestIdRef.current && requestId && requestId !== activeRequestIdRef.current) {
+        return;
+      }
+      const status = String(data.status || '').trim();
+      if (status) {
+        setLiveStatus(toStableTwoLineText(status));
+      }
+    };
+    window.ipcRenderer.on('wander:progress', handleWanderProgress as (...args: unknown[]) => void);
+    return () => {
+      window.ipcRenderer.off('wander:progress', handleWanderProgress as (...args: unknown[]) => void);
+    };
+  }, []);
+
   const handleToggleDeepThink = async () => {
     if (isSavingMode || loading) return;
     const nextValue = !deepThinkEnabled;
@@ -329,8 +366,11 @@ export function Wander({ onNavigateToManuscript, onNavigateToRedClaw }: WanderPr
   };
 
   const startWander = async () => {
+    const requestId = `wander-ui-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    activeRequestIdRef.current = requestId;
     setPhase('running');
     setLoading(true);
+      setLiveStatus(toStableTwoLineText('正在初始化漫步...'));
     setParsedResult(null);
     setParseError(null);
     setItems([]);
@@ -347,14 +387,17 @@ export function Wander({ onNavigateToManuscript, onNavigateToRedClaw }: WanderPr
       }
       const response = await window.ipcRenderer.invoke('wander:brainstorm', randomItems, {
         deepThink: deepThinkEnabled,
+        requestId,
       }) as { result: string; historyId?: string; error?: string };
       if (response.error) {
         setParsedResult(null);
         setParseError(response.error);
+        setLiveStatus(toStableTwoLineText('漫步失败'));
       } else {
         const parsed = parseJsonPayload<WanderResult>(response.result);
         if (parsed && parsed.topic) {
           setParsedResult(parsed);
+          setLiveStatus(toStableTwoLineText('漫步完成'));
           if (response.historyId) {
             setCurrentHistoryId(response.historyId);
             loadHistoryList();
@@ -370,10 +413,12 @@ export function Wander({ onNavigateToManuscript, onNavigateToRedClaw }: WanderPr
       console.error('Brainstorm failed:', error);
       setParsedResult(null);
       setParseError('调用失败，请稍后重试');
+      setLiveStatus(toStableTwoLineText('漫步失败'));
       setPhase('done');
       setShowFinal(true);
     } finally {
       setLoading(false);
+      activeRequestIdRef.current = '';
     }
   };
 
@@ -475,7 +520,22 @@ export function Wander({ onNavigateToManuscript, onNavigateToRedClaw }: WanderPr
                     <div className="w-12 h-12 rounded-full border-2 border-surface-secondary"></div>
                     <div className="absolute top-0 left-0 w-12 h-12 rounded-full border-2 border-brand-red border-t-transparent animate-spin"></div>
                   </div>
-                  <div className="text-sm text-text-tertiary">正在漫步并寻找灵感...</div>
+                  <div className="w-full max-w-2xl">
+                    <div className="rounded-xl border border-border bg-surface-primary px-4 py-3 shadow-sm">
+                      <div className="text-[11px] text-text-tertiary mb-1">当前进度</div>
+                      <div
+                        className="text-sm text-text-primary whitespace-pre-line"
+                        style={{
+                          display: '-webkit-box',
+                          WebkitLineClamp: 2,
+                          WebkitBoxOrient: 'vertical',
+                          overflow: 'hidden',
+                        }}
+                      >
+                        {liveStatus || '正在漫步并寻找灵感...'}
+                      </div>
+                    </div>
+                  </div>
                 </div>
               )}
 

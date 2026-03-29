@@ -5365,6 +5365,272 @@ Type: ${item.type}
 Content Summary: ${item.content?.slice(0, 500) || ''}...`
 ).join('\n\n');
 
+const readTextFileSnippet = async (filePath: string, maxChars = 1800): Promise<string> => {
+  try {
+    const raw = await fs.readFile(filePath, 'utf-8');
+    return String(raw || '').trim().slice(0, maxChars);
+  } catch {
+    return '';
+  }
+};
+
+const toTwoLinePreview = (raw: string): string => {
+  const normalized = String(raw || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .trim();
+  if (!normalized) return '';
+  const lines = normalized
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (!lines.length) return '';
+  const picked = lines.slice(0, 2).map((line) => line.length > 120 ? `${line.slice(0, 120)}…` : line);
+  const hasMore = lines.length > 2 || picked.some((line) => line.endsWith('…'));
+  const joined = picked.join('\n');
+  return hasMore && !joined.endsWith('…') ? `${joined}…` : joined;
+};
+
+const extractSseDeltaText = (payload: any): string => {
+  const delta = payload?.choices?.[0]?.delta;
+  if (!delta) return '';
+  const content = delta.content;
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === 'string') return part;
+        if (part && typeof part === 'object') {
+          if (typeof part.text === 'string') return part.text;
+          if (typeof part.content === 'string') return part.content;
+        }
+        return '';
+      })
+      .join('');
+  }
+  return '';
+};
+
+const buildWanderLongTermContext = async (): Promise<string> => {
+  const workspacePaths = getWorkspacePaths();
+  const profileRoot = path.join(workspacePaths.redclaw, 'profile');
+  const memoryPath = path.join(workspacePaths.base, 'memory', 'MEMORY.md');
+  const userProfilePath = path.join(profileRoot, 'user.md');
+  const creatorProfilePath = path.join(profileRoot, 'CreatorProfile.md');
+  const soulPath = path.join(profileRoot, 'Soul.md');
+
+  const [
+    memorySnippet,
+    userProfileSnippet,
+    creatorProfileSnippet,
+    soulSnippet,
+  ] = await Promise.all([
+    readTextFileSnippet(memoryPath, 2200),
+    readTextFileSnippet(userProfilePath, 1800),
+    readTextFileSnippet(creatorProfilePath, 2200),
+    readTextFileSnippet(soulPath, 1200),
+  ]);
+
+  const sections: string[] = [];
+  if (userProfileSnippet) {
+    sections.push(`### user.md\n${userProfileSnippet}`);
+  }
+  if (creatorProfileSnippet) {
+    sections.push(`### CreatorProfile.md\n${creatorProfileSnippet}`);
+  }
+  if (memorySnippet) {
+    sections.push(`### MEMORY.md\n${memorySnippet}`);
+  }
+  if (soulSnippet) {
+    sections.push(`### Soul.md\n${soulSnippet}`);
+  }
+  return sections.join('\n\n');
+};
+
+const buildWanderDeepAgentPrompt = (params: {
+  itemsText: string;
+  longTermContextSection: string;
+}): string => {
+  return [
+    '你现在处于 RedBox 的「漫步深度思考」Agent 模式。',
+    '你需要自主完成：分析素材 -> 发散选题 -> 收敛方向 -> 产出最终结构化结果。',
+    '你必须先调用工具补充上下文，再给结论。',
+    '',
+    '工具调用要求（必须满足）：',
+    '1) 至少发起 1 次工具调用；',
+    '2) 优先使用 app_cli 读取素材目录或相关文档；',
+    '3) 如果 app_cli 不可用，可回退 read_file / grep；',
+    '4) 未发生工具调用时，不允许直接输出最终结论。',
+    '',
+    '硬性输出要求：',
+    '1) 仅输出 JSON，不要输出 Markdown、解释、前后缀文本；',
+    '2) JSON 顶层必须包含：content_direction, thinking_process, topic；',
+    '3) topic 必须包含：title, connections（数组，取值只能是 1-3）；',
+    '4) thinking_process 为 3-6 条简洁思考要点；',
+    '5) content_direction 必须是可直接创作的内容方向说明。',
+    '',
+    '你收到的随机素材如下：',
+    params.itemsText,
+    '',
+    params.longTermContextSection ? `补充上下文：\n${params.longTermContextSection}` : '',
+  ].join('\n');
+};
+
+const runWanderDeepThinkWithAgent = async (params: {
+  requestId: string;
+  items: any[];
+  longTermContextSection: string;
+  reportProgress: (status: string) => void;
+}): Promise<string> => {
+  const safeRequestId = params.requestId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64) || `${Date.now()}`;
+  const sessionId = `session_wander_${safeRequestId}`;
+  const contextId = `wander:${safeRequestId}`;
+  const itemsText = buildWanderItemsText(params.items);
+  const prompt = buildWanderDeepAgentPrompt({
+    itemsText,
+    longTermContextSection: params.longTermContextSection,
+  });
+
+  const existingSession = getChatSession(sessionId);
+  const metadata = {
+    contextId,
+    contextType: 'redclaw',
+    contextContent: itemsText,
+    isContextBound: true,
+  };
+  if (!existingSession) {
+    createChatSession(sessionId, 'Wander Deep Think', metadata);
+  } else {
+    updateChatSessionMetadata(sessionId, {
+      ...(existingSession.metadata ? (() => {
+        try {
+          return JSON.parse(existingSession.metadata);
+        } catch {
+          return {};
+        }
+      })() : {}),
+      ...metadata,
+    });
+  }
+
+  const service = new PiChatService();
+  let responseBuffer = '';
+  let lastPreview = '';
+  let lastToolName = '';
+  let upstreamError = '';
+  let sawAnyToolCall = false;
+  let toolCallCount = 0;
+  const startedAt = Date.now();
+  params.reportProgress('深度思考 Agent 已启动...');
+
+  addChatMessage({
+    id: `msg_wander_user_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    session_id: sessionId,
+    role: 'user',
+    content: prompt,
+  });
+
+  const emitPreview = (raw: string) => {
+    const preview = toTwoLinePreview(raw);
+    if (!preview) return;
+    if (preview === lastPreview) return;
+    lastPreview = preview;
+    params.reportProgress(preview);
+  };
+
+  service.setEventSink((channel, payload) => {
+    if (channel === 'chat:thought-delta') {
+      const text = String((payload as { content?: unknown } | null)?.content || '').trim();
+      if (text) {
+        emitPreview(text);
+      }
+      return;
+    }
+    if (channel === 'chat:tool-start') {
+      const toolName = String((payload as { name?: unknown } | null)?.name || '').trim();
+      sawAnyToolCall = true;
+      toolCallCount += 1;
+      lastToolName = toolName;
+      if (toolName) {
+        params.reportProgress(`调用工具：${toolName}`);
+      }
+      return;
+    }
+    if (channel === 'chat:tool-update') {
+      const partial = String((payload as { partial?: unknown } | null)?.partial || '').trim();
+      if (partial) {
+        emitPreview(partial);
+      }
+      return;
+    }
+    if (channel === 'chat:tool-end') {
+      if (lastToolName) {
+        params.reportProgress(`工具完成：${lastToolName}`);
+      }
+      return;
+    }
+    if (channel === 'chat:response-chunk') {
+      const chunk = String((payload as { content?: unknown } | null)?.content || '');
+      if (!chunk) return;
+      responseBuffer += chunk;
+      emitPreview(responseBuffer);
+      return;
+    }
+    if (channel === 'chat:error') {
+      const data = payload as { message?: unknown; hint?: unknown; raw?: unknown } | null;
+      const message = String(data?.message || '').trim();
+      const hint = String(data?.hint || '').trim();
+      const raw = String(data?.raw || '').trim();
+      upstreamError = [message, hint, raw].filter(Boolean).join(' | ').slice(0, 2000);
+      if (upstreamError) {
+        params.reportProgress(upstreamError);
+      }
+    }
+  });
+
+  try {
+    await service.sendMessage(prompt, sessionId);
+    if (!sawAnyToolCall) {
+      const retryPrompt = [
+        '你上一轮没有调用工具，这不符合要求。',
+        '请先调用至少 1 次工具（优先 app_cli）读取素材或文档，再重新输出最终 JSON。',
+        '注意：最终回复仍然只能是 JSON。',
+      ].join('\n');
+      params.reportProgress('检测到未调用工具，正在触发强制工具轮次...');
+      addChatMessage({
+        id: `msg_wander_user_retry_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        session_id: sessionId,
+        role: 'user',
+        content: retryPrompt,
+      });
+      await service.sendMessage(retryPrompt, sessionId);
+    }
+  } finally {
+    service.setEventSink(null);
+  }
+
+  const assistantMessages = getChatMessages(sessionId)
+    .filter((msg) => msg.role === 'assistant' && Number(msg.timestamp || 0) >= startedAt)
+    .map((msg) => String(msg.content || '').trim())
+    .filter(Boolean);
+  const finalContent = assistantMessages.length > 0
+    ? assistantMessages[assistantMessages.length - 1]
+    : String(responseBuffer || '').trim();
+  if (!finalContent) {
+    if (upstreamError) {
+      throw new Error(upstreamError);
+    }
+    throw new Error('深度思考未返回有效内容');
+  }
+  console.log('[wander:brainstorm][agent-mode] completed', {
+    requestId: params.requestId,
+    toolCallCount,
+    sawAnyToolCall,
+    responseLength: finalContent.length,
+  });
+  return finalContent;
+};
+
 const requestWanderCompletion = async ({
   baseURL,
   apiKey,
@@ -5377,6 +5643,8 @@ const requestWanderCompletion = async ({
   timeoutMs = 90000,
   retryOnTimeout = true,
   retryTimeoutMs,
+  streamPreview = false,
+  onProgress,
 }: {
   baseURL: string;
   apiKey: string;
@@ -5389,8 +5657,10 @@ const requestWanderCompletion = async ({
   timeoutMs?: number;
   retryOnTimeout?: boolean;
   retryTimeoutMs?: number;
+  streamPreview?: boolean;
+  onProgress?: (previewText: string) => void;
 }) => {
-  const sendRequest = async (withResponseFormat: boolean, effectiveTimeoutMs: number) => {
+  const sendRequest = async (withResponseFormat: boolean, effectiveTimeoutMs: number, useStream: boolean) => {
     const startedAt = Date.now();
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), effectiveTimeoutMs);
@@ -5401,6 +5671,7 @@ const requestWanderCompletion = async ({
       temperature,
       messages,
       response_format: withResponseFormat ? { type: 'json_object' } : undefined,
+      stream: useStream ? true : undefined,
       // DashScope 的 Qwen3/3.5 混合推理模型默认可能启用思考，这里显式控制。
       enable_thinking: isQwenFamily && typeof enableThinking === 'boolean' ? enableThinking : undefined,
     };
@@ -5444,6 +5715,57 @@ const requestWanderCompletion = async ({
       throw new Error(`OpenAI API error: ${response.status} ${response.statusText}${errorText ? ` - ${errorText}` : ''}`);
     }
 
+    if (useStream) {
+      if (!response.body) {
+        throw new Error('OpenAI API stream response body is empty');
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let buffered = '';
+      let assembled = '';
+      let lastEmitAt = 0;
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffered += decoder.decode(value, { stream: true });
+        const lines = buffered.split('\n');
+        buffered = lines.pop() || '';
+        for (const lineRaw of lines) {
+          const line = lineRaw.trim();
+          if (!line.startsWith('data:')) continue;
+          const chunk = line.slice(5).trim();
+          if (!chunk || chunk === '[DONE]') continue;
+          let parsed: any = null;
+          try {
+            parsed = JSON.parse(chunk);
+          } catch {
+            continue;
+          }
+          const deltaText = extractSseDeltaText(parsed);
+          if (!deltaText) continue;
+          assembled += deltaText;
+          const now = Date.now();
+          if (now - lastEmitAt > 280) {
+            lastEmitAt = now;
+            const preview = toTwoLinePreview(assembled);
+            if (preview && onProgress) {
+              onProgress(preview);
+            }
+          }
+        }
+      }
+      const finalPreview = toTwoLinePreview(assembled);
+      if (finalPreview && onProgress) {
+        onProgress(finalPreview);
+      }
+      console.log('[wander:brainstorm] request-complete', {
+        withResponseFormat,
+        enableThinking: payload.enable_thinking,
+        elapsedMs: Date.now() - startedAt,
+      });
+      return assembled;
+    }
+
     const data = await response.json() as { choices?: { message: { content: string } }[] };
     console.log('[wander:brainstorm] request-complete', {
       withResponseFormat,
@@ -5454,7 +5776,7 @@ const requestWanderCompletion = async ({
   };
 
   try {
-    return await sendRequest(requireJson, timeoutMs);
+    return await sendRequest(requireJson, timeoutMs, streamPreview);
   } catch (error) {
     const errorMessage = String(error || '');
     const isTimeout = /timeout after \d+ms/i.test(errorMessage);
@@ -5469,19 +5791,33 @@ const requestWanderCompletion = async ({
         nextTimeoutMs,
         requireJson,
       });
-      return await sendRequest(requireJson, nextTimeoutMs);
+      return await sendRequest(requireJson, nextTimeoutMs, streamPreview);
     }
     if (requireJson && allowJsonFallback && isResponseFormatUnsupported) {
       // 仅当明确不支持 response_format 时才回退一次，避免普通错误导致额外慢一次
       console.log('[wander:brainstorm] fallback-without-response-format');
-      return await sendRequest(false, timeoutMs);
+      return await sendRequest(false, timeoutMs, streamPreview);
+    }
+    // 某些兼容网关不支持 stream，退回非流式。
+    if (streamPreview && /stream|sse|event-stream|not supported|invalid parameter/i.test(errorMessage)) {
+      console.warn('[wander:brainstorm] fallback-without-stream', { errorMessage });
+      return await sendRequest(requireJson, timeoutMs, false);
     }
     throw error;
   }
 };
 
-ipcMain.handle('wander:brainstorm', async (_, items: any[], options?: { deepThink?: boolean }) => {
+ipcMain.handle('wander:brainstorm', async (event, items: any[], options?: { deepThink?: boolean; requestId?: string }) => {
+  const requestId = String(options?.requestId || '').trim() || `wander-${Date.now()}`;
+  const reportProgress = (status: string) => {
+    event.sender.send('wander:progress', {
+      requestId,
+      status,
+      at: Date.now(),
+    });
+  };
   try {
+    reportProgress('正在初始化漫步任务...');
     const settings = getSettings() as {
       api_key?: string;
       api_endpoint?: string;
@@ -5505,11 +5841,19 @@ ipcMain.handle('wander:brainstorm', async (_, items: any[], options?: { deepThin
       model,
       baseURL,
     });
+    reportProgress(`已准备模型与参数（${model}）`);
 
     const itemsText = buildWanderItemsText(items);
+    reportProgress(`已装载 ${Array.isArray(items) ? items.length : 0} 条随机素材`);
+    reportProgress('正在加载用户档案与长期记忆...');
+    const longTermContext = await buildWanderLongTermContext();
+    const longTermContextSection = longTermContext
+      ? `\n\n## 用户长期上下文（供你参考）\n${longTermContext}\n\n使用要求：\n- 与长期定位保持一致；\n- 若素材与长期定位冲突，优先选择可落地、可执行的方向。`
+      : '';
     let content = '';
 
     if (!deepThink) {
+      reportProgress('正在生成漫步结果...');
       content = await requestWanderCompletion({
         baseURL,
         apiKey: settings.api_key,
@@ -5522,62 +5866,20 @@ ipcMain.handle('wander:brainstorm', async (_, items: any[], options?: { deepThin
         retryOnTimeout: true,
         retryTimeoutMs: 135000,
         messages: [
-          { role: 'system', content: `${WANDER_BRAINSTORM_PROMPT}\n\n补充要求：直接给出最终 JSON，不要进行长时间思考循环或分阶段推演。` },
+          { role: 'system', content: `${WANDER_BRAINSTORM_PROMPT}${longTermContextSection}\n\n补充要求：直接给出最终 JSON，不要进行长时间思考循环或分阶段推演。` },
           { role: 'user', content: `这里是 3 个条目：\n\n${itemsText}` },
         ],
       });
     } else {
-      const analysisPrompt = [
-        '你是小红书选题总监，当前处于深度思考模式。',
-        '请先基于素材做中间分析，不要输出最终 JSON。',
-        '需要完成：',
-        '1) 发散至少 8 个选题角度并说明优劣；',
-        '2) 评估受众、传播潜力与差异化；',
-        '3) 收敛到 1 个最优方向并给出理由。',
-      ].join('\n');
-
-      const deepAnalysis = await requestWanderCompletion({
-        baseURL,
-        apiKey: settings.api_key,
-        model,
-        temperature: 0.95,
-        requireJson: false,
-        enableThinking: true,
-        timeoutMs: 120000,
-        retryOnTimeout: true,
-        retryTimeoutMs: 180000,
-        messages: [
-          { role: 'system', content: analysisPrompt },
-          { role: 'user', content: `这里是 3 个条目：\n\n${itemsText}` },
-        ],
-      });
-
-      const deepFinalizePrompt = [
-        WANDER_BRAINSTORM_PROMPT,
-        '',
-        '你现在在“深度思考模式”的最终收敛阶段。',
-        '请综合中间分析结果，仅输出最终 JSON，不要输出其它文字。',
-      ].join('\n');
-
-      content = await requestWanderCompletion({
-        baseURL,
-        apiKey: settings.api_key,
-        model,
-        temperature: 0.8,
-        requireJson: true,
-        allowJsonFallback: true,
-        enableThinking: true,
-        timeoutMs: 120000,
-        retryOnTimeout: true,
-        retryTimeoutMs: 180000,
-        messages: [
-          { role: 'system', content: deepFinalizePrompt },
-          { role: 'assistant', content: `中间分析（供你收敛）：\n${deepAnalysis}` },
-          { role: 'user', content: `请基于这 3 个条目给出最终结果：\n\n${itemsText}` },
-        ],
+      content = await runWanderDeepThinkWithAgent({
+        requestId,
+        items,
+        longTermContextSection,
+        reportProgress,
       });
     }
 
+    reportProgress('正在解析结果并写入历史...');
     // 解析 JSON 结果
     let result;
     try {
@@ -5590,10 +5892,12 @@ ipcMain.handle('wander:brainstorm', async (_, items: any[], options?: { deepThin
     const { saveWanderHistory } = await import('./db');
     const historyId = `wander-${Date.now()}`;
     saveWanderHistory(historyId, items, result);
+    reportProgress('漫步完成');
 
     return { result: JSON.stringify(result), historyId };
   } catch (error) {
     console.error('Failed to brainstorm:', error);
+    reportProgress('漫步失败');
     return { error: String(error) };
   }
 });

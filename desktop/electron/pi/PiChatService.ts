@@ -158,6 +158,7 @@ interface ChatErrorPayload {
 
 export class PiChatService {
   private window: BrowserWindow | null = null;
+  private eventSink: ((channel: string, data: unknown) => void) | null = null;
   private abortController: AbortController | null = null;
   private sessionId: string;
   private skillManager: SkillManager;
@@ -188,11 +189,23 @@ export class PiChatService {
     this.window = window;
   }
 
+  setEventSink(sink: ((channel: string, data: unknown) => void) | null) {
+    this.eventSink = sink;
+  }
+
   getSkillManager() {
     return this.skillManager;
   }
 
   private sendToUI(channel: string, data: unknown) {
+    if (this.eventSink) {
+      try {
+        this.eventSink(channel, data);
+      } catch (error) {
+        console.error(`[PiChatService] Failed to send sink event: ${channel}`, error);
+      }
+    }
+
     if (!this.window || this.window.isDestroyed()) {
       return;
     }

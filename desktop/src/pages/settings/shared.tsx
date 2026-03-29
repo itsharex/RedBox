@@ -9,6 +9,8 @@ import {
   inferPresetIdByEndpoint,
 } from '../../config/aiSources';
 
+const REDBOX_OFFICIAL_LOGO_URL = new URL('../../../redbox.png', import.meta.url).href;
+
 export interface UserMemory {
   id: string;
   content: string;
@@ -294,8 +296,8 @@ export const isLikelyLocalEndpoint = (baseURL: string): boolean => {
 };
 
 export const AI_PRESET_LOGO_BY_ID: Record<string, string> = {
-  'redbox-official': 'redbox.png',
-  redbox_official_auto: 'redbox.png',
+  'redbox-official': REDBOX_OFFICIAL_LOGO_URL,
+  redbox_official_auto: REDBOX_OFFICIAL_LOGO_URL,
   openai: 'provider-logos/openai.svg',
   anthropic: 'provider-logos/anthropic.svg',
   gemini: 'provider-logos/gemini.svg',
