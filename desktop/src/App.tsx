@@ -12,7 +12,6 @@ const SettingsPage = lazy(async () => ({ default: (await import('./pages/Setting
 const ManuscriptsPage = lazy(async () => ({ default: (await import('./pages/Manuscripts')).Manuscripts }));
 const ArchivesPage = lazy(async () => ({ default: (await import('./pages/Archives')).Archives }));
 const WanderPage = lazy(async () => ({ default: (await import('./pages/Wander')).Wander }));
-const XhsBrowserPage = lazy(async () => ({ default: (await import('./pages/XhsBrowser')).XhsBrowser }));
 const RedClawPage = lazy(async () => ({ default: (await import('./pages/RedClaw')).RedClaw }));
 const MediaLibraryPage = lazy(async () => ({ default: (await import('./pages/MediaLibrary')).MediaLibrary }));
 const CoverStudioPage = lazy(async () => ({ default: (await import('./pages/CoverStudio')).CoverStudio }));
@@ -27,7 +26,7 @@ const VIEW_PRELOADERS: Array<() => Promise<unknown>> = [
   () => import('./pages/Subjects'),
 ];
 
-export type ViewType = 'chat' | 'creative-chat' | 'skills' | 'knowledge' | 'advisors' | 'settings' | 'manuscripts' | 'archives' | 'wander' | 'xhs-browser' | 'redclaw' | 'media-library' | 'cover-studio' | 'subjects';
+export type ViewType = 'chat' | 'creative-chat' | 'skills' | 'knowledge' | 'advisors' | 'settings' | 'manuscripts' | 'archives' | 'wander' | 'redclaw' | 'media-library' | 'cover-studio' | 'subjects';
 
 // 待发送的聊天消息（用于跨页面传递）
 export interface PendingChatMessage {
@@ -418,13 +417,6 @@ function App() {
           <div className={currentView === 'cover-studio' ? 'h-full min-h-0 flex flex-col' : 'hidden'}>
             <Suspense fallback={currentView === 'cover-studio' ? <ViewLoadingFallback /> : null}>
               <CoverStudioPage isActive={currentView === 'cover-studio'} />
-            </Suspense>
-          </div>
-        )}
-        {mountedViews.has('xhs-browser') && (
-          <div className={currentView === 'xhs-browser' ? 'h-full min-h-0 flex flex-col' : 'hidden'}>
-            <Suspense fallback={currentView === 'xhs-browser' ? <ViewLoadingFallback /> : null}>
-              <XhsBrowserPage />
             </Suspense>
           </div>
         )}

@@ -1,5 +1,5 @@
 import { ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { MessageSquare, MessageSquarePlus, Settings as SettingsIcon, FolderOpen, FileEdit, Dices, Globe, Plus, Pencil, ChevronDown, Bot, Image, Users, ImagePlus, Sun, Moon, X, Download, Package } from 'lucide-react';
+import { MessageSquare, MessageSquarePlus, Settings as SettingsIcon, FolderOpen, FileEdit, Dices, Plus, Pencil, ChevronDown, Bot, Image, Users, ImagePlus, Sun, Moon, X, Download, Package } from 'lucide-react';
 import { clsx } from 'clsx';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -16,7 +16,6 @@ interface LayoutProps {
 
 const NAV_ITEMS: { id: ViewType; label: string; icon: typeof MessageSquare; group?: string }[] = [
   // { id: 'chat', label: 'AI 对话', icon: MessageSquare },
-  { id: 'xhs-browser', label: '红书', icon: Globe },
   { id: 'knowledge', label: '知识库', icon: FolderOpen },
   { id: 'wander', label: '漫步', icon: Dices },
   { id: 'manuscripts', label: '稿件', icon: FileEdit },
@@ -75,7 +74,7 @@ export function Layout({ children, currentView, onNavigate }: LayoutProps) {
   const [updateNotice, setUpdateNotice] = useState<AppUpdateNoticePayload | null>(null);
   const [isOpeningReleasePage, setIsOpeningReleasePage] = useState(false);
   const spaceMenuRef = useRef<HTMLDivElement | null>(null);
-  const isFixedViewportView = currentView === 'xhs-browser' || currentView === 'manuscripts';
+  const isFixedViewportView = currentView === 'manuscripts';
   const activeSpaceName = useMemo(
     () => spaces.find((space) => space.id === activeSpaceId)?.name || '暂无空间',
     [activeSpaceId, spaces]

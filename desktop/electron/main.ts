@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, protocol, nativeImage, shell, clipboard, dialog, session, net } from 'electron'
+import { app, BrowserWindow, ipcMain, protocol, nativeImage, shell, clipboard, dialog, net } from 'electron'
 import path from 'node:path'
 import fs from 'node:fs/promises'
 import fsSync from 'node:fs'
@@ -203,9 +203,6 @@ const XHS_ASSET_REQUEST_HEADERS = {
   'Origin': 'https://www.xiaohongshu.com',
   'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
 };
-const XHS_WEBVIEW_PARTITION = 'persist:redbox-xhs-browser';
-const XHS_BROWSER_ACCEPT_LANGUAGE = 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7';
-let xhsWebviewSessionConfigured = false;
 const APP_UPDATE_RELEASES_PAGE_URL = 'https://github.com/Jamailar/RedBox/releases';
 const APP_UPDATE_LATEST_RELEASE_API_URL = 'https://api.github.com/repos/Jamailar/RedBox/releases/latest';
 const APP_UPDATE_CHECK_TIMEOUT_MS = 10000;
@@ -235,59 +232,6 @@ const SIX_HAT_PROMPTS = {
 let appUpdateLastNotifiedVersion = '';
 const advisorAvatarLocalizationInFlight = new Set<string>();
 let localAssetProtocolsRegistered = false;
-
-const stripElectronTokenFromUA = (rawUA: string): string => {
-  return String(rawUA || '')
-    .replace(/\sElectron\/[^\s]+/gi, '')
-    .replace(/\sRedBox\/[^\s]+/gi, '')
-    .replace(/\sRedConvert\/[^\s]+/gi, '')
-    .replace(/\s{2,}/g, ' ')
-    .trim();
-};
-
-const isXhsHost = (rawUrl: string): boolean => {
-  try {
-    const hostname = new URL(String(rawUrl || '')).hostname.toLowerCase();
-    return hostname === 'xiaohongshu.com'
-      || hostname.endsWith('.xiaohongshu.com')
-      || hostname.endsWith('.xhscdn.com')
-      || hostname.endsWith('.xiaohongshu-cdn.com');
-  } catch {
-    return false;
-  }
-};
-
-const configureXhsWebviewSession = () => {
-  if (xhsWebviewSessionConfigured) return;
-  xhsWebviewSessionConfigured = true;
-
-  const xhsSession = session.fromPartition(XHS_WEBVIEW_PARTITION);
-  const defaultUA = xhsSession.getUserAgent();
-  const alignedUA = stripElectronTokenFromUA(defaultUA);
-  if (alignedUA) {
-    xhsSession.setUserAgent(alignedUA, XHS_BROWSER_ACCEPT_LANGUAGE);
-  }
-
-  xhsSession.webRequest.onBeforeSendHeaders((details, callback) => {
-    if (!isXhsHost(details.url)) {
-      callback({ requestHeaders: details.requestHeaders });
-      return;
-    }
-
-    const requestHeaders: Record<string, string | string[]> = {};
-    for (const [key, value] of Object.entries(details.requestHeaders || {})) {
-      if (value !== undefined) {
-        requestHeaders[key] = value;
-      }
-    }
-    requestHeaders['Accept-Language'] = requestHeaders['Accept-Language'] || XHS_BROWSER_ACCEPT_LANGUAGE;
-    requestHeaders['Sec-Fetch-Site'] = requestHeaders['Sec-Fetch-Site'] || 'same-origin';
-    if (alignedUA) {
-      requestHeaders['User-Agent'] = requestHeaders['User-Agent'] || alignedUA;
-    }
-    callback({ requestHeaders });
-  });
-};
 
 const getAllowedLocalFileRoots = (): string[] => {
   const workspacePaths = getWorkspacePaths();
@@ -926,7 +870,6 @@ app.whenReady().then(async () => {
     });
   }
 
-  configureXhsWebviewSession();
   registerLocalAssetProtocols();
   createWindow();
 

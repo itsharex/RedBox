@@ -26,12 +26,12 @@ export function FirstRunTour({ currentView, onNavigate }: FirstRunTourProps) {
 
   const steps = useMemo<TourStep[]>(() => ([
     {
-      id: 'xhs',
-      selector: '[data-guide-id="nav-xhs-browser"]',
-      title: '1/5 先采集小红书素材',
-      description: '先在红书里日常刷笔记。打开感兴趣的笔记后，点击“保存到知识库”完成采集。',
+      id: 'plugin-capture',
+      selector: '[data-guide-id="nav-knowledge"]',
+      title: '1/5 先用插件采集素材',
+      description: '安装 Chrome 插件后，可以把小红书笔记、YouTube 视频、网页链接和选中文字直接保存到知识库。',
       placement: 'right',
-      view: 'xhs-browser',
+      view: 'knowledge',
     },
     {
       id: 'youtube-clipboard',
@@ -53,7 +53,7 @@ export function FirstRunTour({ currentView, onNavigate }: FirstRunTourProps) {
       id: 'wander',
       selector: '[data-guide-id="nav-wander"]',
       title: '4/5 用漫步找灵感',
-      description: '当选题卡住时，用漫步随机重组素材，快速获得创作灵感。',
+      description: '当选题卡住时，先用漫步随机重组素材，快速获得创作灵感。',
       placement: 'right',
       view: 'wander',
     },
