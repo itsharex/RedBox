@@ -5141,7 +5141,18 @@ ipcMain.handle('knowledge:list', async () => {
           video = toLocalFileUrl(absolutePath);
         }
 
-        notes.push({ id: dir.name, ...meta, images, cover, video, transcript: meta.transcript || '', tags });
+        let htmlFileUrl = meta.htmlFile;
+        if (htmlFileUrl && typeof htmlFileUrl === 'string' && !htmlFileUrl.startsWith('http')) {
+          try {
+            await ensureRichHtmlUsesAbsoluteAssetUrls(noteDir, htmlFileUrl);
+          } catch (error) {
+            console.error('Failed to normalize rich html asset URLs:', error);
+          }
+          const absolutePath = path.join(noteDir, htmlFileUrl);
+          htmlFileUrl = toLocalFileUrl(absolutePath);
+        }
+
+        notes.push({ id: dir.name, ...meta, images, cover, video, htmlFileUrl, transcript: meta.transcript || '', tags });
       } catch {
         // Skip notes without valid meta
       }
@@ -5332,6 +5343,21 @@ ipcMain.handle('knowledge:retry-youtube-subtitle', async (_, videoId: string) =>
           meta.subtitleFile = subtitleResult.subtitleFile;
           meta.hasSubtitle = true;
           meta.status = 'completed';
+          meta.originalTitle = String(meta.originalTitle || meta.title || '').trim() || String(meta.title || '').trim();
+          meta.summary = String(meta.summary || '');
+          try {
+            const subtitleContent = await fs.readFile(path.join(videoDir, meta.subtitleFile), 'utf-8');
+            const summaryResult = await summarizeYoutubeVideoFromSubtitle({
+              originalTitle: String(meta.originalTitle || meta.title || ''),
+              description: String(meta.description || ''),
+              subtitleContent,
+              videoUrl: String(meta.videoUrl || ''),
+            });
+            meta.title = summaryResult.title;
+            meta.summary = summaryResult.summary;
+          } catch (summaryError) {
+            console.warn(`[YouTube] Subtitle summary retry failed for ${meta.videoId}:`, summaryError);
+          }
           console.log(`[YouTube] Subtitle retry succeeded for ${meta.videoId}: ${subtitleResult.subtitleFile}`);
         } else {
           meta.hasSubtitle = false;
@@ -5346,7 +5372,9 @@ ipcMain.handle('knowledge:retry-youtube-subtitle', async (_, videoId: string) =>
         win?.webContents.send('knowledge:youtube-video-updated', {
           noteId: videoId,
           status: 'completed',
-          hasSubtitle: meta.hasSubtitle
+          hasSubtitle: meta.hasSubtitle,
+          title: String(meta.title || ''),
+          summary: String(meta.summary || ''),
         });
       } catch (err) {
         console.error(`[YouTube] Subtitle retry error for ${meta.videoId}:`, err);
@@ -5366,6 +5394,50 @@ ipcMain.handle('knowledge:retry-youtube-subtitle', async (_, videoId: string) =>
   } catch (error) {
     console.error('Failed to retry subtitle:', error);
     return { success: false, error: String(error) };
+  }
+})
+
+ipcMain.handle('knowledge:youtube-regenerate-summaries', async (_event, payload?: { videoIds?: string[] }) => {
+  try {
+    await ensureKnowledgeYoutubeDir();
+    const targetIds = Array.isArray(payload?.videoIds) && payload?.videoIds.length > 0
+      ? payload.videoIds.map((value) => String(value || '').trim()).filter(Boolean)
+      : (await fs.readdir(getKnowledgeYoutubeDir(), { withFileTypes: true }))
+          .filter((entry) => entry.isDirectory())
+          .map((entry) => entry.name);
+
+    let updated = 0;
+    let skipped = 0;
+    const errors: Array<{ videoId: string; error: string }> = [];
+
+    for (const videoId of targetIds) {
+      const result = await regenerateYoutubeSummaryForVideo(videoId);
+      if (result.success) {
+        if (result.skipped) {
+          skipped += 1;
+        } else {
+          updated += 1;
+        }
+      } else {
+        errors.push({ videoId, error: String(result.error || 'unknown error') });
+      }
+    }
+
+    return {
+      success: errors.length === 0,
+      updated,
+      skipped,
+      failed: errors.length,
+      errors,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      updated: 0,
+      skipped: 0,
+      failed: 1,
+      errors: [{ videoId: '', error: String(error) }],
+    };
   }
 })
 
@@ -6069,6 +6141,43 @@ const buildExcerpt = (content?: string, maxLength = 120) => {
   if (!content) return '';
   const trimmed = content.replace(/\s+/g, ' ').trim();
   return trimmed.length > maxLength ? `${trimmed.slice(0, maxLength)}...` : trimmed;
+};
+
+const rewriteRichHtmlTokens = (
+  html: string,
+  replacements: Array<{ token: string; localPath: string }>
+): string => {
+  let next = String(html || '');
+  for (const replacement of replacements) {
+    const token = String(replacement.token || '').trim();
+    const localPath = String(replacement.localPath || '').trim();
+    if (!token || !localPath) continue;
+    next = next.split(token).join(localPath);
+  }
+  return next;
+};
+
+const absolutizeEmbeddedLocalAssetReferences = (html: string, noteDir: string): string => {
+  const raw = String(html || '');
+  if (!raw) return '';
+
+  return raw.replace(
+    /\b(src|href|poster)=("|')(images\/[^"']+)\2/gi,
+    (_match, attrName: string, quote: string, relativePath: string) => {
+      const absolutePath = path.join(noteDir, relativePath);
+      return `${attrName}=${quote}${toLocalFileUrl(absolutePath)}${quote}`;
+    },
+  );
+};
+
+const ensureRichHtmlUsesAbsoluteAssetUrls = async (noteDir: string, htmlFileName: string): Promise<string> => {
+  const htmlPath = path.join(noteDir, htmlFileName);
+  const current = await fs.readFile(htmlPath, 'utf-8');
+  const rewritten = absolutizeEmbeddedLocalAssetReferences(current, noteDir);
+  if (rewritten !== current) {
+    await fs.writeFile(htmlPath, rewritten, 'utf-8');
+  }
+  return rewritten;
 };
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -7048,6 +7157,14 @@ let httpServer: http.Server | null = null;
 async function persistXhsNote(note: any): Promise<{ success: boolean; noteId?: string; error?: string }> {
   const fs = require('fs/promises');
   try {
+    console.log('[xhs-save] incoming', {
+      title: String(note?.title || ''),
+      imageCount: Array.isArray(note?.images) ? note.images.length : 0,
+      coverUrl: typeof note?.coverUrl === 'string' ? note.coverUrl.slice(0, 80) : '',
+      videoUrl: typeof note?.videoUrl === 'string' ? note.videoUrl.slice(0, 120) : '',
+      hasVideoDataUrl: typeof note?.videoDataUrl === 'string' && note.videoDataUrl.startsWith('data:'),
+    });
+
     const noteId = note?.noteId || `note_${Date.now()}`;
     const noteDir = path.join(getKnowledgeRedbookDir(), noteId);
     await fs.mkdir(noteDir, { recursive: true });
@@ -7124,7 +7241,12 @@ async function persistXhsNote(note: any): Promise<{ success: boolean; noteId?: s
       try {
         const videoName = 'video.mp4';
         const videoPath = path.join(noteDir, videoName);
-        await downloadFile(note.videoUrl, videoPath);
+        if (typeof note.videoDataUrl === 'string' && note.videoDataUrl.startsWith('data:')) {
+          const base64Data = note.videoDataUrl.split(',')[1];
+          await fs.writeFile(videoPath, Buffer.from(base64Data, 'base64'));
+        } else {
+          await downloadFile(note.videoUrl, videoPath);
+        }
         await verifyVideoFileDecodable(videoPath);
         meta.video = videoName;
         meta.videoUrl = note.videoUrl;
@@ -7172,6 +7294,153 @@ async function persistXhsNote(note: any): Promise<{ success: boolean; noteId?: s
   }
 }
 
+function extractJsonObjectFromText(raw: string): Record<string, unknown> | null {
+  const text = String(raw || '').trim();
+  if (!text) return null;
+
+  try {
+    return JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1];
+    if (fenced) {
+      try {
+        return JSON.parse(fenced) as Record<string, unknown>;
+      } catch {}
+    }
+    const firstBrace = text.indexOf('{');
+    const lastBrace = text.lastIndexOf('}');
+    if (firstBrace >= 0 && lastBrace > firstBrace) {
+      try {
+        return JSON.parse(text.slice(firstBrace, lastBrace + 1)) as Record<string, unknown>;
+      } catch {}
+    }
+  }
+
+  return null;
+}
+
+async function summarizeYoutubeVideoFromSubtitle(input: {
+  originalTitle: string;
+  description: string;
+  subtitleContent: string;
+  videoUrl: string;
+}): Promise<{ title: string; summary: string }> {
+  const settings = (getSettings() || {}) as Record<string, unknown>;
+  const apiKey = String(settings.api_key || '').trim();
+  const baseURL = normalizeApiBaseUrl(String(settings.api_endpoint || ''), 'https://api.openai.com/v1');
+  const model = String(settings.model_name || '').trim();
+
+  const fallbackTitle = String(input.originalTitle || '未命名视频').trim() || '未命名视频';
+  const fallbackSummary = String(input.subtitleContent || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+
+  if (!apiKey || !baseURL || !model) {
+    return {
+      title: fallbackTitle,
+      summary: fallbackSummary,
+    };
+  }
+
+  const subtitleExcerpt = String(input.subtitleContent || '').trim().slice(0, 12000);
+  const systemPrompt = [
+    '你是一个 YouTube 视频内容总结助手。',
+    '你需要根据字幕内容，为用户生成中文标题和短摘要。',
+    '输出要求：',
+    '1. 只输出严格 JSON；',
+    '2. JSON 顶层必须包含 title 和 summary；',
+    '3. title 必须是自然中文标题，准确概括视频主题；',
+    '4. summary 必须是 1-2 句中文摘要，便于用户快速理解视频内容；',
+    '5. 不要输出 Markdown，不要解释。',
+  ].join('\n');
+  const userPrompt = [
+    `原始标题：${fallbackTitle}`,
+    input.description ? `视频描述：${String(input.description).trim().slice(0, 1200)}` : '',
+    input.videoUrl ? `视频链接：${String(input.videoUrl).trim()}` : '',
+    '',
+    '字幕内容：',
+    subtitleExcerpt,
+  ].filter(Boolean).join('\n');
+
+  const response = await fetch(safeUrlJoin(baseURL, '/chat/completions'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      temperature: 0.3,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      response_format: { type: 'json_object' },
+    }),
+  });
+
+  if (!response.ok) {
+    const bodyText = await response.text().catch(() => '');
+    throw new Error(`YouTube summary request failed (${response.status}): ${bodyText || response.statusText}`);
+  }
+
+  const payload = await response.json().catch(() => ({} as any));
+  const content = String(payload?.choices?.[0]?.message?.content || '').trim();
+  const parsed = extractJsonObjectFromText(content) || {};
+  const title = String(parsed.title || '').trim() || fallbackTitle;
+  const summary = String(parsed.summary || '').trim() || fallbackSummary;
+
+  return { title, summary };
+}
+
+async function regenerateYoutubeSummaryForVideo(videoId: string): Promise<{ success: boolean; title?: string; summary?: string; skipped?: boolean; error?: string }> {
+  const videoDir = path.join(getKnowledgeYoutubeDir(), videoId);
+  const metaPath = path.join(videoDir, 'meta.json');
+
+  try {
+    const metaContent = await fs.readFile(metaPath, 'utf-8');
+    const meta = JSON.parse(metaContent);
+    if (!meta.subtitleFile) {
+      return { success: true, skipped: true };
+    }
+
+    const subtitlePath = path.join(videoDir, meta.subtitleFile);
+    const subtitleContent = await fs.readFile(subtitlePath, 'utf-8');
+    if (!String(subtitleContent || '').trim()) {
+      return { success: true, skipped: true };
+    }
+
+    meta.originalTitle = String(meta.originalTitle || meta.title || '').trim() || String(meta.title || '').trim();
+    const summaryResult = await summarizeYoutubeVideoFromSubtitle({
+      originalTitle: String(meta.originalTitle || meta.title || ''),
+      description: String(meta.description || ''),
+      subtitleContent,
+      videoUrl: String(meta.videoUrl || ''),
+    });
+
+    meta.title = summaryResult.title;
+    meta.summary = summaryResult.summary;
+    await fs.writeFile(metaPath, JSON.stringify(meta, null, 2));
+
+    win?.webContents.send('knowledge:youtube-video-updated', {
+      noteId: videoId,
+      status: String(meta.status || 'completed'),
+      hasSubtitle: Boolean(meta.hasSubtitle),
+      title: String(meta.title || ''),
+      summary: String(meta.summary || ''),
+    });
+
+    return {
+      success: true,
+      title: String(meta.title || ''),
+      summary: String(meta.summary || ''),
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: String(error),
+    };
+  }
+}
+
 async function persistYoutubeNote(payload: {
   videoId?: string;
   videoUrl?: string;
@@ -7210,7 +7479,9 @@ async function persistYoutubeNote(payload: {
       videoId,
       videoUrl: payload.videoUrl || `https://www.youtube.com/watch?v=${videoId}`,
       title: payload.title || 'Untitled Video',
+      originalTitle: payload.title || 'Untitled Video',
       description: payload.description || '',
+      summary: '',
       thumbnailUrl: payload.thumbnailUrl || '',
       thumbnail: '',
       subtitleFile: '',
@@ -7247,6 +7518,20 @@ async function persistYoutubeNote(payload: {
           subtitleFile = subtitleResult.subtitleFile;
           hasSubtitle = true;
           console.log(`[YouTube] Subtitle downloaded for ${videoId}: ${subtitleFile}`);
+
+          try {
+            const subtitleContent = await fs.readFile(path.join(videoDir, subtitleFile), 'utf-8');
+            const summaryResult = await summarizeYoutubeVideoFromSubtitle({
+              originalTitle: initialMeta.originalTitle,
+              description: initialMeta.description,
+              subtitleContent,
+              videoUrl: initialMeta.videoUrl,
+            });
+            initialMeta.title = summaryResult.title;
+            initialMeta.summary = summaryResult.summary;
+          } catch (summaryError) {
+            console.warn(`[YouTube] Failed to summarize subtitle for ${videoId}:`, summaryError);
+          }
         } else {
           console.log(`[YouTube] No subtitle available for ${videoId}`);
         }
@@ -7269,7 +7554,9 @@ async function persistYoutubeNote(payload: {
         noteId,
         status: 'completed',
         hasSubtitle,
-        thumbnail: localThumbnail
+        thumbnail: localThumbnail,
+        title: finalMeta.title,
+        summary: finalMeta.summary || '',
       });
     })().catch(err => {
       console.error(`[YouTube] Background processing failed for ${videoId}:`, err);
@@ -7307,7 +7594,11 @@ function startHttpServer() {
       req.on("data", chunk => { body += chunk; });
       req.on("end", async () => {
         try {
-          const data = JSON.parse(body);
+          const parsed = JSON.parse(body);
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            throw new Error('Invalid save-text payload: expected object');
+          }
+          const data = parsed as Record<string, any>;
           const isLinkArticle = String(data.type || '').trim() === 'link-article';
           const noteId = `${isLinkArticle ? 'link' : 'text'}_${Date.now()}`;
           const noteDir = path.join(getKnowledgeRedbookDir(), noteId);
@@ -7316,6 +7607,8 @@ function startHttpServer() {
           const meta: {
             id: string;
             type: 'link-article' | 'text';
+            captureKind?: string;
+            htmlFile?: string;
             title: string;
             content: string;
             sourceUrl: string;
@@ -7326,9 +7619,11 @@ function startHttpServer() {
             stats: { likes: number; collects: number };
             images: string[];
             cover: string;
+            tags?: string[];
           } = {
             id: noteId,
             type: isLinkArticle ? 'link-article' : 'text',
+            captureKind: String(data.captureKind || '').trim() || undefined,
             title: data.title || (isLinkArticle ? 'Link Article' : 'Text Clipping'),
             content: data.text || "",
             sourceUrl: data.url || "",
@@ -7339,23 +7634,35 @@ function startHttpServer() {
             stats: { likes: 0, collects: 0 },
             images: [],
             cover: '',
+            tags: Array.isArray(data.tags)
+              ? data.tags.map((value: unknown) => String(value || '').trim()).filter(Boolean)
+              : [],
           };
 
           const imagesDir = path.join(noteDir, 'images');
           let nextImageIndex = 0;
+          const persistedImageBySource = new Map<string, string>();
           const persistImage = async (imageSource: string, preferredName?: string) => {
             if (!imageSource || typeof imageSource !== 'string') return '';
+            const normalizedSource = String(imageSource || '').trim();
+            if (persistedImageBySource.has(normalizedSource)) {
+              return persistedImageBySource.get(normalizedSource) || '';
+            }
             await fs.mkdir(imagesDir, { recursive: true });
             const fileName = preferredName || `${nextImageIndex++}.jpg`;
             const outputPath = path.join(imagesDir, fileName);
-            if (imageSource.startsWith('data:image')) {
-              const base64Data = imageSource.split(',')[1];
+            if (normalizedSource.startsWith('data:image')) {
+              const base64Data = normalizedSource.split(',')[1];
               await fs.writeFile(outputPath, Buffer.from(base64Data, 'base64'));
-              return `images/${fileName}`;
+              const relativePath = `images/${fileName}`;
+              persistedImageBySource.set(normalizedSource, relativePath);
+              return relativePath;
             }
-            if (imageSource.startsWith('http')) {
-              await downloadImageToFile(imageSource, outputPath);
-              return `images/${fileName}`;
+            if (normalizedSource.startsWith('http')) {
+              await downloadImageToFile(normalizedSource, outputPath);
+              const relativePath = `images/${fileName}`;
+              persistedImageBySource.set(normalizedSource, relativePath);
+              return relativePath;
             }
             return '';
           };
@@ -7373,7 +7680,7 @@ function startHttpServer() {
           }
 
           if (Array.isArray(data.images)) {
-            for (const imageSource of data.images.slice(0, 4)) {
+            for (const imageSource of data.images.slice(0, 8)) {
               try {
                 const imagePath = await persistImage(String(imageSource || '').trim());
                 if (imagePath && !meta.images.includes(imagePath)) {
@@ -7387,6 +7694,44 @@ function startHttpServer() {
 
           if (!meta.cover && meta.images.length > 0) {
             meta.cover = meta.images[0];
+          }
+
+          const richHtmlImageTokens = Array.isArray(data.richHtmlImageMap)
+            ? data.richHtmlImageMap
+                .map((entry: any) => ({
+                  token: String(entry?.token || '').trim(),
+                  url: String(entry?.url || '').trim(),
+                }))
+                .filter((entry: { token: string; url: string }) => entry.token && entry.url)
+                .slice(0, 80)
+            : [];
+
+          if (String(data.captureKind || '').trim() === 'wechat-article' && String(data.richHtmlDocument || '').trim()) {
+            const replacements: Array<{ token: string; localPath: string }> = [];
+            for (const entry of richHtmlImageTokens) {
+              try {
+                const localPath = await persistImage(entry.url);
+                if (localPath) {
+                  if (!meta.images.includes(localPath)) {
+                    meta.images.push(localPath);
+                  }
+                  replacements.push({ token: entry.token, localPath });
+                }
+              } catch (error) {
+                console.error('Failed to persist wechat rich-html image:', error);
+              }
+            }
+
+            const richHtmlDocument = absolutizeEmbeddedLocalAssetReferences(
+              rewriteRichHtmlTokens(String(data.richHtmlDocument || ''), replacements),
+              noteDir,
+            );
+            const htmlFile = 'content.html';
+            await fs.writeFile(path.join(noteDir, htmlFile), richHtmlDocument, 'utf-8');
+            meta.htmlFile = htmlFile;
+            if (!meta.tags?.includes('公众号文章')) {
+              meta.tags = [...(meta.tags || []), '公众号文章'];
+            }
           }
 
           await fs.writeFile(path.join(noteDir, "meta.json"), JSON.stringify(meta, null, 2));

@@ -88,6 +88,60 @@ function getEnv() {
     };
 }
 
+function buildCommonYtdlpArgs(): string[] {
+    return [
+        '--no-warnings',
+        '--ignore-errors',
+        '--no-call-home',
+        '--extractor-retries', '3',
+        '--retries', '3',
+        '--socket-timeout', '20',
+        '--geo-bypass',
+    ];
+}
+
+function normalizeChannelUrlCandidates(channelUrl: string): string[] {
+    const raw = String(channelUrl || '').trim().replace(/\/$/, '');
+    if (!raw) return [];
+
+    const candidates: string[] = [];
+    const push = (value: string) => {
+        const next = String(value || '').trim();
+        if (next && !candidates.includes(next)) {
+            candidates.push(next);
+        }
+    };
+
+    const alreadyScoped = /\/(videos|streams|shorts|featured)(\/)?$/i.test(raw);
+    if (alreadyScoped) {
+        push(raw);
+    } else {
+        push(`${raw}/videos`);
+        push(raw);
+        push(`${raw}/featured`);
+    }
+
+    return candidates;
+}
+
+function isTransientYoutubeError(text: string): boolean {
+    const lower = String(text || '').toLowerCase();
+    return [
+        '429',
+        'too many requests',
+        'timed out',
+        'timeout',
+        'http error 5',
+        'service unavailable',
+        'temporarily unavailable',
+        'remote end closed connection',
+        'connection reset',
+        'connection aborted',
+        'unable to download api page',
+        'precondition check failed',
+    ].some((pattern) => lower.includes(pattern));
+}
+
 export interface YouTubeChannelInfo {
     channelId: string;
     channelName: string;
@@ -328,61 +382,22 @@ export async function autoSetupYtdlp(): Promise<{ action: 'none' | 'installed' |
 export async function fetchChannelInfo(channelUrl: string, onProgress?: (msg: string) => void): Promise<YouTubeChannelInfo> {
     const { path: ytPath } = await checkYtdlp();
     const cmd = ytPath || 'yt-dlp';
+    const candidates = normalizeChannelUrlCandidates(channelUrl);
 
     console.log(`[fetchChannelInfo] using binary: ${cmd}`);
+    let lastError = 'unknown error';
 
-    return new Promise((resolve, reject) => {
-        // Get channel metadata and first few videos to verify
-        // --dump-json: output JSON
-        // --flat-playlist: don't download videos, just list them
-        // --playlist-end 5: just get first 5 items to keep it fast
-        const args = [
-            '--dump-json',
-            '--flat-playlist',
-            '--playlist-end', '5',
-            channelUrl
-        ];
+    for (const candidate of candidates) {
+        try {
+            if (onProgress) onProgress(`Starting info fetch for ${candidate}...`);
+            return await fetchChannelInfoWithSingleJson(candidate);
+        } catch (error) {
+            lastError = String(error);
+            console.warn(`[fetchChannelInfo] candidate failed: ${candidate}`, error);
+        }
+    }
 
-        console.log(`[fetchChannelInfo] spawning: ${cmd} ${args.join(' ')}`);
-        if (onProgress) onProgress(`Starting info fetch for ${channelUrl}...`);
-
-        const process = spawn(cmd, args, { env: getEnv() });
-        let output = '';
-        let errorOutput = '';
-
-        process.stdout.on('data', (data) => {
-            output += data.toString();
-            if (onProgress) onProgress("Receiving data...");
-        });
-
-        process.stderr.on('data', (data) => {
-            const msg = data.toString();
-            errorOutput += msg;
-            console.log(`[fetchChannelInfo] stderr: ${msg}`);
-            if (onProgress) onProgress(`yt-dlp (stderr): ${msg.slice(0, 50)}...`);
-        });
-
-        process.on('close', (code) => {
-            if (code !== 0) {
-                // Try to verify if it's a channel URL issue or something else
-                console.error('yt-dlp error:', errorOutput);
-                reject(new Error(`Failed to fetch channel info: ${errorOutput}`));
-                return;
-            }
-
-            try {
-                // yt-dlp outputs one JSON object per line/item. 
-                // The first line might be the playlist/channel metadata, or the first video.
-                // For --flat-playlist, it usually outputs individual video items. 
-                // However, we can use -J (dump-single-json) to get a single JSON object for the playlist/channel
-
-                // Let's retry with -J which is safer for parsing
-                resolve(fetchChannelInfoWithSingleJson(channelUrl));
-            } catch (e) {
-                reject(e);
-            }
-        });
-    });
+    throw new Error(`Failed to fetch channel info: ${lastError}`);
 }
 
 async function fetchChannelInfoWithSingleJson(channelUrl: string): Promise<YouTubeChannelInfo> {
@@ -391,6 +406,7 @@ async function fetchChannelInfoWithSingleJson(channelUrl: string): Promise<YouTu
 
     return new Promise((resolve, reject) => {
         const args = [
+            ...buildCommonYtdlpArgs(),
             '-J', // dump single json
             '--flat-playlist',
             '--playlist-end', '5',
@@ -525,62 +541,69 @@ export async function downloadSubtitles(
 export async function fetchVideoList(channelUrl: string, limit: number = 50): Promise<VideoEntry[]> {
     const { path: ytPath } = await checkYtdlp();
     const cmd = ytPath || 'yt-dlp';
+    const candidates = normalizeChannelUrlCandidates(channelUrl);
+    let lastError = 'unknown error';
 
-    // Normalize URL: ensure we're fetching from /videos tab, not channel root
-    // Channel root returns tabs (Videos, Shorts, etc.), not actual videos
-    let normalizedUrl = channelUrl.trim();
-    if (!normalizedUrl.includes('/videos') && !normalizedUrl.includes('/shorts') && !normalizedUrl.includes('/streams')) {
-        // Remove trailing slash if present
-        normalizedUrl = normalizedUrl.replace(/\/$/, '');
-        normalizedUrl += '/videos';
+    for (const candidate of candidates) {
+        try {
+            const videos = await new Promise<VideoEntry[]>((resolve, reject) => {
+                const args = [
+                    ...buildCommonYtdlpArgs(),
+                    '-J',
+                    '--flat-playlist',
+                    '--playlist-end', String(limit),
+                    candidate
+                ];
+
+                console.log(`[fetchVideoList] spawning: ${cmd} ${args.join(' ')}`);
+
+                const process = spawn(cmd, args, { env: getEnv() });
+                let output = '';
+                let errorOutput = '';
+
+                process.stdout.on('data', (data: Buffer) => {
+                    output += data.toString();
+                });
+
+                process.stderr.on('data', (data: Buffer) => {
+                    errorOutput += data.toString();
+                });
+
+                process.on('close', (code: number) => {
+                    if (code !== 0) {
+                        console.error('[fetchVideoList] error:', errorOutput);
+                        reject(new Error(`Failed to fetch video list: ${errorOutput}`));
+                        return;
+                    }
+
+                    try {
+                        const data = JSON.parse(output);
+                        const videos: VideoEntry[] = (data.entries || []).map((entry: { id: string; title: string; upload_date?: string }) => ({
+                            id: entry.id,
+                            title: entry.title || 'Untitled',
+                            publishedAt: entry.upload_date || '',
+                            status: 'pending' as const,
+                            retryCount: 0
+                        }));
+                        resolve(videos);
+                    } catch (e) {
+                        reject(new Error(`Failed to parse video list: ${e}`));
+                    }
+                });
+
+                process.on('error', (err) => reject(err));
+            });
+
+            if (videos.length > 0) {
+                return videos;
+            }
+        } catch (error) {
+            lastError = String(error);
+            console.warn(`[fetchVideoList] candidate failed: ${candidate}`, error);
+        }
     }
 
-    return new Promise((resolve, reject) => {
-        const args = [
-            '-J',
-            '--flat-playlist',
-            '--playlist-end', String(limit),
-            normalizedUrl
-        ];
-
-        console.log(`[fetchVideoList] spawning: ${cmd} ${args.join(' ')}`);
-
-        const process = spawn(cmd, args, { env: getEnv() });
-        let output = '';
-        let errorOutput = '';
-
-        process.stdout.on('data', (data: Buffer) => {
-            output += data.toString();
-        });
-
-        process.stderr.on('data', (data: Buffer) => {
-            errorOutput += data.toString();
-        });
-
-        process.on('close', (code: number) => {
-            if (code !== 0) {
-                console.error('[fetchVideoList] error:', errorOutput);
-                reject(new Error(`Failed to fetch video list: ${errorOutput}`));
-                return;
-            }
-
-            try {
-                const data = JSON.parse(output);
-                const videos: VideoEntry[] = (data.entries || []).map((entry: { id: string; title: string; upload_date?: string }) => ({
-                    id: entry.id,
-                    title: entry.title || 'Untitled',
-                    publishedAt: entry.upload_date || '',
-                    status: 'pending' as const,
-                    retryCount: 0
-                }));
-                resolve(videos);
-            } catch (e) {
-                reject(new Error(`Failed to parse video list: ${e}`));
-            }
-        });
-
-        process.on('error', (err) => reject(err));
-    });
+    throw new Error(`Failed to fetch video list: ${lastError}`);
 }
 
 /**
@@ -610,17 +633,51 @@ export async function downloadSingleSubtitle(
             return;
         }
 
-        const args = [
-            '--skip-download',
-            '--write-auto-sub',      // Download auto-generated subtitles
-            '--write-sub',           // Also try manual subtitles
-            // No --sub-lang: download whatever is available
-            // No --sub-format: accept any format available
-            '--output', tempOutputPath,
-            '--sleep-requests', '1', // Sleep 1 second between requests
-            '--retries', '3',        // Retry 3 times on failure
-            videoUrl
+        const attemptArgsMatrix: string[][] = [
+            [
+                ...buildCommonYtdlpArgs(),
+                '--skip-download',
+                '--write-auto-sub',
+                '--write-sub',
+                '--sub-langs', 'all,-live_chat',
+                '--sub-format', 'vtt/srt/best',
+                '--convert-subs', 'srt',
+                '--no-playlist',
+                '--sleep-requests', '1',
+                '--output', tempOutputPath,
+                videoUrl,
+            ],
+            [
+                ...buildCommonYtdlpArgs(),
+                '--extractor-args', 'youtube:player_client=android,web',
+                '--skip-download',
+                '--write-auto-sub',
+                '--write-sub',
+                '--sub-langs', 'all,-live_chat',
+                '--sub-format', 'vtt/srt/best',
+                '--convert-subs', 'srt',
+                '--no-playlist',
+                '--sleep-requests', '1',
+                '--output', tempOutputPath,
+                videoUrl,
+            ],
+            [
+                ...buildCommonYtdlpArgs(),
+                '--extractor-args', 'youtube:player_client=tv,ios,web',
+                '--skip-download',
+                '--write-auto-sub',
+                '--write-sub',
+                '--sub-langs', 'all,-live_chat',
+                '--sub-format', 'vtt/srt/best',
+                '--convert-subs', 'srt',
+                '--no-playlist',
+                '--sleep-requests', '1',
+                '--output', tempOutputPath,
+                videoUrl,
+            ],
         ];
+
+        const args = attemptArgsMatrix[Math.min(retryCount, attemptArgsMatrix.length - 1)];
 
         console.log(`[downloadSingleSubtitle] spawning (attempt ${retryCount + 1}/${MAX_RETRIES + 1}): ${cmd} ${args.join(' ')}`);
 
@@ -699,18 +756,17 @@ export async function downloadSingleSubtitle(
                 } catch (e) {
                     resolve({ success: false, error: `Failed to convert subtitle: ${e}` });
                 }
-            } else if (errorOutput.includes('429') || errorOutput.includes('Too Many Requests')) {
-                // Rate limited - retry with delay
+            } else if (isTransientYoutubeError(errorOutput) || isTransientYoutubeError(stdoutOutput)) {
                 if (retryCount < MAX_RETRIES) {
                     const delay = RETRY_DELAYS[retryCount] || 30000;
-                    console.log(`[downloadSingleSubtitle] Rate limited (429), retrying in ${delay / 1000}s... (attempt ${retryCount + 2}/${MAX_RETRIES + 1})`);
+                    console.log(`[downloadSingleSubtitle] transient failure, retrying in ${delay / 1000}s... (attempt ${retryCount + 2}/${MAX_RETRIES + 1})`);
                     setTimeout(async () => {
                         const result = await downloadSingleSubtitle(videoId, outputDir, retryCount + 1);
                         resolve(result);
                     }, delay);
                 } else {
                     console.error(`[downloadSingleSubtitle] Max retries reached for ${videoId}`);
-                    resolve({ success: false, error: 'Rate limited by YouTube (429). Please try again later.' });
+                    resolve({ success: false, error: `字幕下载失败（多次重试后仍失败）: ${errorOutput.slice(0, 280) || stdoutOutput.slice(0, 280)}` });
                 }
             } else if (code === 0) {
                 // yt-dlp succeeded but no subtitle found (video has no subtitles)

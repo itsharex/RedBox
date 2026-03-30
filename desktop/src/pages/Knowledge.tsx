@@ -12,6 +12,11 @@ interface Note { type?: string; sourceUrl?: string;
     title: string;
     author: string;
     content: string;
+    excerpt?: string;
+    siteName?: string;
+    captureKind?: string;
+    htmlFile?: string;
+    htmlFileUrl?: string;
     images: string[];
     tags?: string[];
     cover?: string;
@@ -30,7 +35,9 @@ interface YouTubeVideo {
     videoId: string;
     videoUrl: string;
     title: string;
+    originalTitle?: string;
     description: string;
+    summary?: string;
     thumbnailUrl: string;
     hasSubtitle: boolean;
     subtitleContent?: string;
@@ -38,8 +45,7 @@ interface YouTubeVideo {
     createdAt: string;
 }
 
-type TabType = 'xiaohongshu' | 'youtube' | 'docs';
-type XhsTabType = 'all' | 'image' | 'video';
+type KnowledgeTypeFilter = 'all' | 'xhs-image' | 'xhs-video' | 'link-article' | 'youtube' | 'docs';
 
 interface DocumentKnowledgeSource {
     id: string;
@@ -53,6 +59,20 @@ interface DocumentKnowledgeSource {
     sampleFiles: string[];
     createdAt: string;
     updatedAt: string;
+}
+
+interface KnowledgeCardItem {
+    id: string;
+    kind: Exclude<KnowledgeTypeFilter, 'all'>;
+    title: string;
+    summary: string;
+    createdAt: string;
+    searchText: string;
+    cover?: string;
+    tags: string[];
+    note?: Note;
+    video?: YouTubeVideo;
+    doc?: DocumentKnowledgeSource;
 }
 
 interface KnowledgeProps {
@@ -159,8 +179,6 @@ const hashContent = (content: string): string => {
 };
 
 export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = true, referenceContent }: KnowledgeProps) {
-    const [activeTab, setActiveTab] = useState<TabType>('xiaohongshu');
-    const [xhsTab, setXhsTab] = useState<XhsTabType>('all');
     const [notes, setNotes] = useState<Note[]>([]);
     const [youtubeVideos, setYoutubeVideos] = useState<YouTubeVideo[]>([]);
     const [documentSources, setDocumentSources] = useState<DocumentKnowledgeSource[]>([]);
@@ -169,6 +187,7 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
     const [selectedImageIndex, setSelectedImageIndex] = useState(0);
     const [isImagePreviewOpen, setIsImagePreviewOpen] = useState(false);
     const [searchQuery, setSearchQuery] = useState('');
+    const [selectedTypeFilter, setSelectedTypeFilter] = useState<KnowledgeTypeFilter>('all');
     const [selectedTag, setSelectedTag] = useState<string | null>(null);
     const [isLoading, setIsLoading] = useState(true);
     const [imageAspectMap, setImageAspectMap] = useState<Record<string, 'portrait' | 'landscape'>>({});
@@ -176,6 +195,7 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
     const [showTranscript, setShowTranscript] = useState(false);
     const [isTranscribing, setIsTranscribing] = useState(false);
     const [isSubtitleLoading, setIsSubtitleLoading] = useState(false);
+    const [isRefreshingYoutubeSummaries, setIsRefreshingYoutubeSummaries] = useState(false);
     const wasActiveRef = useRef<boolean>(isActive);
 
     // 搜索框状态
@@ -210,10 +230,6 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
     const embeddingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const isMountedRef = useRef(true);
 
-    // 分页状态
-    const [currentPage, setCurrentPage] = useState(1);
-    const PAGE_SIZE = 10;
-
     // 清理函数
     useEffect(() => {
         isMountedRef.current = true;
@@ -224,11 +240,6 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
             }
         };
     }, []);
-
-    // 切换 tab 时重置分页
-    useEffect(() => {
-        setCurrentPage(1);
-    }, [activeTab]);
 
     // 相似度排序 - 缓存读取立即执行，计算延迟执行
     useEffect(() => {
@@ -285,7 +296,6 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
                         cache.sortedIds.forEach((id: string, index: number) => orderMap.set(id, index));
                         setSimilarityOrder(orderMap);
                         lastContentHashRef.current = contentHash;
-                        setCurrentPage(1);
                         setIsSimilarityLoading(false);
                         return;
                     }
@@ -338,8 +348,6 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
                             sortedIds.forEach((id: string, index: number) => orderMap.set(id, index));
                             setSimilarityOrder(orderMap);
                             lastContentHashRef.current = contentHash;
-                            setCurrentPage(1);
-
                             window.ipcRenderer.invoke('similarity:save-cache', {
                                 manuscriptId,
                                 contentHash,
@@ -431,15 +439,30 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
         }
     }, []);
 
-    useEffect(() => {
-        if (activeTab === 'xiaohongshu') {
-            loadNotes();
-        } else if (activeTab === 'youtube') {
-            loadYoutubeVideos();
-        } else {
-            loadDocumentSources();
+    const loadAllKnowledge = useCallback(async () => {
+        setIsLoading(true);
+        try {
+            const [noteList, videoList, docList] = await Promise.all([
+                window.ipcRenderer.invoke('knowledge:list') as Promise<Note[]>,
+                window.ipcRenderer.invoke('knowledge:list-youtube') as Promise<YouTubeVideo[]>,
+                window.ipcRenderer.invoke('knowledge:docs:list') as Promise<DocumentKnowledgeSource[]>,
+            ]);
+            setNotes(Array.isArray(noteList) ? noteList : []);
+            setYoutubeVideos(Array.isArray(videoList) ? videoList : []);
+            setDocumentSources(Array.isArray(docList) ? docList : []);
+        } catch (error) {
+            console.error('Failed to load knowledge:', error);
+            setNotes([]);
+            setYoutubeVideos([]);
+            setDocumentSources([]);
+        } finally {
+            setIsLoading(false);
         }
-    }, [activeTab, loadNotes, loadYoutubeVideos, loadDocumentSources]);
+    }, []);
+
+    useEffect(() => {
+        void loadAllKnowledge();
+    }, [loadAllKnowledge]);
 
     // 每次从其他页面切回知识库时，强制刷新当前列表，避免页面显示旧缓存。
     useEffect(() => {
@@ -448,39 +471,39 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
         if (!isActive || wasActive) {
             return;
         }
-
-        if (activeTab === 'youtube') {
-            loadYoutubeVideos();
-            return;
-        }
-        if (activeTab === 'docs') {
-            loadDocumentSources();
-            return;
-        }
-        loadNotes();
-    }, [isActive, activeTab, loadNotes, loadYoutubeVideos, loadDocumentSources]);
+        void loadAllKnowledge();
+    }, [isActive, loadAllKnowledge]);
 
     // 监听 YouTube 视频更新事件
     useEffect(() => {
-        const handleVideoUpdated = (_event: unknown, data: { noteId: string; status: string; hasSubtitle?: boolean }) => {
+        const handleVideoUpdated = (_event: unknown, data: { noteId: string; status: string; hasSubtitle?: boolean; title?: string; summary?: string }) => {
             console.log('[Knowledge] Video updated:', data);
             setYoutubeVideos(prev => prev.map(video =>
                 video.id === data.noteId
-                    ? { ...video, status: data.status as YouTubeVideo['status'], hasSubtitle: data.hasSubtitle ?? video.hasSubtitle }
+                    ? {
+                        ...video,
+                        status: data.status as YouTubeVideo['status'],
+                        hasSubtitle: data.hasSubtitle ?? video.hasSubtitle,
+                        title: typeof data.title === 'string' && data.title.trim() ? data.title : video.title,
+                        summary: typeof data.summary === 'string' ? data.summary : video.summary,
+                    }
                     : video
             ));
             // 如果当前选中的视频更新了，也更新选中状态
             if (selectedVideo?.id === data.noteId) {
-                setSelectedVideo(prev => prev ? { ...prev, status: data.status as YouTubeVideo['status'], hasSubtitle: data.hasSubtitle ?? prev.hasSubtitle } : null);
+                setSelectedVideo(prev => prev ? {
+                    ...prev,
+                    status: data.status as YouTubeVideo['status'],
+                    hasSubtitle: data.hasSubtitle ?? prev.hasSubtitle,
+                    title: typeof data.title === 'string' && data.title.trim() ? data.title : prev.title,
+                    summary: typeof data.summary === 'string' ? data.summary : prev.summary,
+                } : null);
             }
         };
 
         const handleNewVideo = (_event: unknown, data: { noteId: string; title: string; status?: string }) => {
             console.log('[Knowledge] New video added:', data);
-            // 如果当前在 YouTube tab，重新加载列表
-            if (activeTab === 'youtube') {
-                loadYoutubeVideos();
-            }
+            void loadYoutubeVideos();
         };
 
         window.ipcRenderer.on('knowledge:youtube-video-updated', handleVideoUpdated);
@@ -490,19 +513,17 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
             window.ipcRenderer.off('knowledge:youtube-video-updated', handleVideoUpdated);
             window.ipcRenderer.off('knowledge:new-youtube-video', handleNewVideo);
         };
-    }, [activeTab, loadYoutubeVideos, selectedVideo?.id]);
+    }, [loadYoutubeVideos, selectedVideo?.id]);
 
     useEffect(() => {
         const handleDocsUpdated = () => {
-            if (activeTab === 'docs') {
-                loadDocumentSources();
-            }
+            void loadDocumentSources();
         };
         window.ipcRenderer.on('knowledge:docs-updated', handleDocsUpdated);
         return () => {
             window.ipcRenderer.off('knowledge:docs-updated', handleDocsUpdated);
         };
-    }, [activeTab, loadDocumentSources]);
+    }, [loadDocumentSources]);
 
     // Aggregate tags from notes
     const allTags = useMemo(() => {
@@ -519,84 +540,6 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
             .map(([tag, count]) => ({ tag, count }));
     }, [notes]);
 
-    const filteredXhsNotes = useMemo(() => {
-        const filtered = notes.filter(note =>
-            (!note.type || note.type === 'xiaohongshu') &&
-            (note.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
-            note.content.toLowerCase().includes(searchQuery.toLowerCase())) &&
-            (!selectedTag || (note.tags && note.tags.includes(selectedTag)))
-        ).filter(note => {
-            if (xhsTab === 'all') return true;
-            if (xhsTab === 'video') return !!note.video;
-            return !note.video;
-        });
-
-        // 如果有向量相似度排序，使用它
-        if (similarityOrder.size > 0) {
-            return [...filtered].sort((a, b) => {
-                const orderA = similarityOrder.get(a.id) ?? Infinity;
-                const orderB = similarityOrder.get(b.id) ?? Infinity;
-                return orderA - orderB;
-            });
-        }
-        return filtered;
-    }, [notes, searchQuery, xhsTab, selectedTag, similarityOrder]);
-
-    // 分页后的数据
-    const pagedXhsNotes = useMemo(() => {
-        const start = (currentPage - 1) * PAGE_SIZE;
-        return filteredXhsNotes.slice(start, start + PAGE_SIZE);
-    }, [filteredXhsNotes, currentPage]);
-
-    const filteredDocs = useMemo(() => {
-        const query = searchQuery.trim().toLowerCase();
-        if (!query) return documentSources;
-        return documentSources.filter((source) =>
-            source.name.toLowerCase().includes(query) ||
-            source.rootPath.toLowerCase().includes(query) ||
-            source.sampleFiles.some((file) => file.toLowerCase().includes(query))
-        );
-    }, [documentSources, searchQuery]);
-
-    const pagedDocs = useMemo(() => {
-        const start = (currentPage - 1) * PAGE_SIZE;
-        return filteredDocs.slice(start, start + PAGE_SIZE);
-    }, [filteredDocs, currentPage]);
-
-    const filteredVideos = useMemo(() => {
-        const filtered = youtubeVideos.filter(video =>
-            video.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
-            video.description.toLowerCase().includes(searchQuery.toLowerCase())
-        );
-
-        if (similarityOrder.size > 0) {
-            return [...filtered].sort((a, b) => {
-                const orderA = similarityOrder.get(a.id) ?? Infinity;
-                const orderB = similarityOrder.get(b.id) ?? Infinity;
-                return orderA - orderB;
-            });
-        }
-        return filtered;
-    }, [youtubeVideos, searchQuery, similarityOrder]);
-
-    // 分页后的视频
-    const pagedVideos = useMemo(() => {
-        const start = (currentPage - 1) * PAGE_SIZE;
-        return filteredVideos.slice(start, start + PAGE_SIZE);
-    }, [filteredVideos, currentPage]);
-
-    // 计算总页数
-    const totalPages = useMemo(() => {
-        if (activeTab === 'xiaohongshu') return Math.ceil(filteredXhsNotes.length / PAGE_SIZE);
-        if (activeTab === 'docs') return Math.ceil(filteredDocs.length / PAGE_SIZE);
-        return Math.ceil(filteredVideos.length / PAGE_SIZE);
-    }, [activeTab, filteredXhsNotes.length, filteredDocs.length, filteredVideos.length]);
-
-    // 切换 tab 或筛选条件时重置分页
-    useEffect(() => {
-        setCurrentPage(1);
-    }, [activeTab, xhsTab, selectedTag, searchQuery]);
-
     const orderImages = (images: string[]) => {
         return [...images].sort((a, b) => {
             const extractIndex = (value: string) => {
@@ -611,6 +554,114 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
             return extractIndex(a) - extractIndex(b);
         });
     };
+
+    const knowledgeItems = useMemo<KnowledgeCardItem[]>(() => {
+        const noteItems: KnowledgeCardItem[] = notes.map((note) => {
+            const orderedImages = orderImages(note.images || []);
+            const kind: KnowledgeCardItem['kind'] = (note.type === 'link-article' || note.type === 'text')
+                ? 'link-article'
+                : note.video
+                    ? 'xhs-video'
+                    : 'xhs-image';
+
+            return {
+                id: note.id,
+                kind,
+                title: note.title || '未命名内容',
+                summary: note.excerpt || note.content || note.sourceUrl || '',
+                createdAt: note.createdAt,
+                searchText: [
+                    note.title,
+                    note.author,
+                    note.siteName,
+                    note.excerpt,
+                    note.content,
+                    note.sourceUrl,
+                    ...(note.tags || []),
+                ].join('\n').toLowerCase(),
+                cover: note.cover || orderedImages[0] || note.video || '',
+                tags: Array.isArray(note.tags) ? note.tags : [],
+                note,
+            };
+        });
+
+        const videoItems: KnowledgeCardItem[] = youtubeVideos.map((video) => ({
+            id: video.id,
+            kind: 'youtube',
+            title: video.title || '未命名视频',
+            summary: video.summary || video.description || '',
+            createdAt: video.createdAt,
+            searchText: [video.title, video.originalTitle, video.summary, video.description, video.videoUrl].join('\n').toLowerCase(),
+            cover: video.thumbnailUrl || '',
+            tags: [],
+            video,
+        }));
+
+        const docItems: KnowledgeCardItem[] = documentSources.map((doc) => ({
+            id: doc.id,
+            kind: 'docs',
+            title: doc.name,
+            summary: doc.rootPath,
+            createdAt: doc.updatedAt || doc.createdAt,
+            searchText: [doc.name, doc.rootPath, ...doc.sampleFiles].join('\n').toLowerCase(),
+            tags: [],
+            doc,
+        }));
+
+        return [...noteItems, ...videoItems, ...docItems];
+    }, [notes, youtubeVideos, documentSources]);
+
+    const typeFilters = useMemo(() => {
+        const counts: Record<Exclude<KnowledgeTypeFilter, 'all'>, number> = {
+            'xhs-image': 0,
+            'xhs-video': 0,
+            'link-article': 0,
+            'youtube': 0,
+            'docs': 0,
+        };
+        knowledgeItems.forEach((item) => {
+            counts[item.kind] += 1;
+        });
+        return [
+            { key: 'all' as const, label: '全部', count: knowledgeItems.length },
+            { key: 'xhs-image' as const, label: '小红书图文', count: counts['xhs-image'] },
+            { key: 'xhs-video' as const, label: '小红书视频', count: counts['xhs-video'] },
+            { key: 'link-article' as const, label: '链接文章', count: counts['link-article'] },
+            { key: 'youtube' as const, label: 'YouTube', count: counts.youtube },
+            { key: 'docs' as const, label: '文档', count: counts.docs },
+        ].filter((item) => item.key === 'all' || item.count > 0);
+    }, [knowledgeItems]);
+
+    const youtubeSummaryPendingCount = useMemo(() => {
+        return youtubeVideos.filter((video) => video.hasSubtitle && !String(video.summary || '').trim()).length;
+    }, [youtubeVideos]);
+
+    const filteredKnowledgeItems = useMemo(() => {
+        const query = searchQuery.trim().toLowerCase();
+        const filtered = knowledgeItems.filter((item) => {
+            if (selectedTypeFilter !== 'all' && item.kind !== selectedTypeFilter) {
+                return false;
+            }
+            if (selectedTag && !item.tags.includes(selectedTag)) {
+                return false;
+            }
+            if (!query) {
+                return true;
+            }
+            return item.searchText.includes(query);
+        });
+
+        if (similarityOrder.size > 0) {
+            return [...filtered].sort((a, b) => {
+                const orderA = similarityOrder.get(a.id) ?? Infinity;
+                const orderB = similarityOrder.get(b.id) ?? Infinity;
+                if (orderA !== orderB) return orderA - orderB;
+                return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+            });
+        }
+
+        return [...filtered].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    }, [knowledgeItems, searchQuery, selectedTypeFilter, selectedTag, similarityOrder]);
 
     const resolveAspectClass = (key: string) => {
         const aspect = imageAspectMap[key] || 'portrait';
@@ -669,15 +720,13 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
 
     useEffect(() => {
         const handleNoteUpdated = (_event: unknown, _data: { noteId: string }) => {
-            if (activeTab === 'xiaohongshu') {
-                loadNotes();
-            }
+            void loadNotes();
         };
         window.ipcRenderer.on('knowledge:note-updated', handleNoteUpdated);
         return () => {
             window.ipcRenderer.off('knowledge:note-updated', handleNoteUpdated);
         };
-    }, [activeTab, loadNotes]);
+    }, [loadNotes]);
 
     const handleDeleteNote = async (noteId: string) => {
         if (!confirm('确定要删除这篇笔记吗？')) return;
@@ -838,6 +887,31 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
         }
     };
 
+    const handleRefreshYoutubeSummaries = async () => {
+        try {
+            setIsRefreshingYoutubeSummaries(true);
+            const result = await window.ipcRenderer.invoke('knowledge:youtube-regenerate-summaries') as {
+                success?: boolean;
+                updated?: number;
+                skipped?: number;
+                failed?: number;
+                errors?: Array<{ videoId?: string; error?: string }>;
+            };
+            await loadYoutubeVideos();
+            if (result?.success) {
+                alert(`已更新 ${result.updated || 0} 个 YouTube 视频摘要${result?.skipped ? `，跳过 ${result.skipped} 个无字幕视频` : ''}`);
+                return;
+            }
+            const firstError = result?.errors?.[0]?.error || '批量刷新摘要失败';
+            alert(firstError);
+        } catch (error) {
+            console.error('Failed to refresh YouTube summaries:', error);
+            alert('批量刷新 YouTube 摘要失败');
+        } finally {
+            setIsRefreshingYoutubeSummaries(false);
+        }
+    };
+
     const handleAddDocumentFiles = async () => {
         const result = await window.ipcRenderer.invoke('knowledge:docs:add-files') as { success?: boolean; error?: string };
         if (!result?.success) {
@@ -873,6 +947,40 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
             return;
         }
         await loadDocumentSources();
+    };
+
+    const getKnowledgeKindLabel = (kind: KnowledgeCardItem['kind']) => {
+        switch (kind) {
+            case 'xhs-image':
+                return '小红书图文';
+            case 'xhs-video':
+                return '小红书视频';
+            case 'link-article':
+                return '链接文章';
+            case 'youtube':
+                return 'YouTube';
+            case 'docs':
+                return '文档';
+            default:
+                return kind;
+        }
+    };
+
+    const getKnowledgeKindBadgeClass = (kind: KnowledgeCardItem['kind']) => {
+        switch (kind) {
+            case 'xhs-image':
+                return 'bg-rose-500/90 text-white';
+            case 'xhs-video':
+                return 'bg-red-500/90 text-white';
+            case 'link-article':
+                return 'bg-sky-500/90 text-white';
+            case 'youtube':
+                return 'bg-red-600/90 text-white';
+            case 'docs':
+                return 'bg-emerald-500/90 text-white';
+            default:
+                return 'bg-surface-tertiary text-text-primary';
+        }
     };
 
     // Embedded View Renders
@@ -1094,86 +1202,42 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
 
     return (
         <div className="flex h-full flex-col">
-            <div className={clsx(
-                "border-b border-border bg-surface-primary",
-                isEmbedded ? "px-3 py-2" : "px-6 py-4"
-            )}>
-                <div className={clsx("flex flex-col", isEmbedded ? "gap-2" : "gap-3")}>
-                    {/* Embedded mode: Tab + Search button OR Search input */}
-                    {isEmbedded ? (
-                        isSearchOpen ? (
-                            /* Search input mode */
-                            <div className="flex items-center gap-1">
-                                <div className="relative flex-1">
-                                    <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3 h-3 text-text-tertiary" />
-                                    <input
-                                        type="text"
-                                        value={searchQuery}
-                                        onChange={(e) => setSearchQuery(e.target.value)}
-                                        placeholder="搜索..."
-                                        autoFocus
-                                        className="w-full bg-surface-secondary border border-border rounded-lg pl-7 pr-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-accent-primary"
-                                    />
-                                </div>
+            <div
+                className={clsx(
+                    'border-b border-border bg-surface-primary',
+                    isEmbedded ? 'px-3 py-2' : 'px-6 py-4'
+                )}
+            >
+                <div className={clsx('flex flex-col', isEmbedded ? 'gap-2' : 'gap-3')}>
+                    <div className="flex items-center gap-2 py-1">
+                        <div className="flex-1 flex items-center gap-2 overflow-x-auto no-scrollbar">
+                            {typeFilters.map((item) => (
                                 <button
-                                    onClick={() => { setIsSearchOpen(false); setSearchQuery(''); }}
-                                    className="p-1 text-text-tertiary hover:text-text-primary hover:bg-surface-secondary rounded transition-colors"
+                                    key={item.key}
+                                    onClick={() => setSelectedTypeFilter(item.key)}
+                                    className={clsx(
+                                        'shrink-0 px-3.5 py-2 text-xs rounded-xl border transition-all flex items-center gap-2 backdrop-blur-sm',
+                                        selectedTypeFilter === item.key
+                                            ? 'bg-text-primary text-white border-text-primary shadow-md'
+                                            : 'bg-surface-primary text-text-secondary border-border hover:border-text-tertiary/30 hover:bg-surface-secondary hover:text-text-primary'
+                                    )}
                                 >
-                                    <X className="w-3.5 h-3.5" />
+                                    <span className="font-medium tracking-[0.01em]">{item.label}</span>
+                                    <span className={clsx(
+                                        'text-[10px] px-1.5 py-0.5 rounded-lg',
+                                        selectedTypeFilter === item.key
+                                            ? 'bg-white/15 text-white'
+                                            : 'bg-surface-secondary text-text-tertiary'
+                                    )}>
+                                        {item.count}
+                                    </span>
                                 </button>
-                            </div>
-                        ) : (
-                            /* Tab switcher + search button */
-                            <div className="flex items-center gap-1">
-                                <div className="flex flex-1 bg-surface-secondary rounded-lg p-0.5">
-                                    <button
-                                        onClick={() => setActiveTab('xiaohongshu')}
-                                        className={clsx(
-                                            "flex-1 rounded-md font-medium transition-all flex items-center justify-center px-2 py-1 text-xs",
-                                            activeTab === 'xiaohongshu'
-                                                ? 'bg-surface-primary text-text-primary shadow-sm'
-                                                : 'text-text-tertiary hover:text-text-secondary'
-                                        )}
-                                    >
-                                        📕
-                                    </button>
-                                    <button
-                                        onClick={() => setActiveTab('youtube')}
-                                        className={clsx(
-                                            "flex-1 rounded-md font-medium transition-all flex items-center justify-center px-2 py-1 text-xs",
-                                            activeTab === 'youtube'
-                                                ? 'bg-surface-primary text-text-primary shadow-sm'
-                                                : 'text-text-tertiary hover:text-text-secondary'
-                                        )}
-                                    >
-                                        ▶️
-                                    </button>
-                                    <button
-                                        onClick={() => setActiveTab('docs')}
-                                        className={clsx(
-                                            "flex-1 rounded-md font-medium transition-all flex items-center justify-center px-2 py-1 text-xs",
-                                            activeTab === 'docs'
-                                                ? 'bg-surface-primary text-text-primary shadow-sm'
-                                                : 'text-text-tertiary hover:text-text-secondary'
-                                        )}
-                                    >
-                                        📝
-                                    </button>
-                                </div>
-                                <button
-                                    onClick={() => setIsSearchOpen(true)}
-                                    className="p-1.5 text-text-tertiary hover:text-text-primary hover:bg-surface-secondary rounded-lg transition-colors"
-                                    title="搜索"
-                                >
-                                    <Search className="w-3.5 h-3.5" />
-                                </button>
-                            </div>
-                        )
-                    ) : (
-                        /* Non-embedded: Search Toggle + Tab switcher */
-                        isSearchOpen ? (
-                            <div className="flex items-center gap-2 h-10">
-                                <div className="relative flex-1">
+                            ))}
+                        </div>
+
+                        {isSearchOpen ? (
+                            <div className="flex items-center gap-2 shrink-0">
+                                <div className="relative w-[220px] sm:w-[260px]">
                                     <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-text-tertiary" />
                                     <input
                                         ref={searchInputRef}
@@ -1181,7 +1245,8 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
                                         value={searchQuery}
                                         onChange={(e) => setSearchQuery(e.target.value)}
                                         placeholder="搜索知识库..."
-                                        className="w-full bg-surface-secondary border border-border rounded-lg pl-9 pr-8 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-accent-primary animate-in fade-in zoom-in-95 duration-200"
+                                        autoFocus
+                                        className="w-full bg-surface-secondary border border-border rounded-lg pl-9 pr-8 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-accent-primary"
                                     />
                                     {searchQuery && (
                                         <button
@@ -1193,142 +1258,102 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
                                     )}
                                 </div>
                                 <button
-                                    onClick={() => { setIsSearchOpen(false); setSearchQuery(''); }}
+                                    onClick={() => {
+                                        setIsSearchOpen(false);
+                                        setSearchQuery('');
+                                    }}
                                     className="px-3 py-2 text-sm text-text-tertiary hover:text-text-primary hover:bg-surface-secondary rounded-lg transition-colors"
                                 >
                                     取消
                                 </button>
                             </div>
                         ) : (
-                            <div className="flex items-center gap-3 h-10">
+                            <div className="flex items-center gap-2 shrink-0">
                                 <button
                                     onClick={() => setIsSearchOpen(true)}
-                                    className="h-full px-3 text-text-tertiary hover:text-text-primary hover:bg-surface-secondary rounded-lg transition-colors border border-transparent hover:border-border flex items-center justify-center"
+                                    className="inline-flex h-9 px-3 text-text-tertiary hover:text-text-primary hover:bg-surface-secondary rounded-lg transition-colors border border-border/60 items-center justify-center"
                                     title="搜索 (Cmd+F)"
                                 >
                                     <Search className="w-4 h-4" />
                                 </button>
-                                <div className="flex-1 flex p-1 bg-surface-secondary rounded-lg h-full">
-                                    <button
-                                        onClick={() => setActiveTab('xiaohongshu')}
-                                        className={clsx(
-                                            "flex-1 px-3 py-1.5 rounded-md text-sm font-medium transition-all flex items-center justify-center gap-2",
-                                            activeTab === 'xiaohongshu'
-                                                ? 'bg-surface-primary text-text-primary shadow-sm'
-                                                : 'text-text-tertiary hover:text-text-secondary'
-                                        )}
-                                    >
-                                        <span>📕</span>
-                                        小红书
-                                    </button>
-                                    <button
-                                        onClick={() => setActiveTab('youtube')}
-                                        className={clsx(
-                                            "flex-1 px-3 py-1.5 rounded-md text-sm font-medium transition-all flex items-center justify-center gap-2",
-                                            activeTab === 'youtube'
-                                                ? 'bg-surface-primary text-text-primary shadow-sm'
-                                                : 'text-text-tertiary hover:text-text-secondary'
-                                        )}
-                                    >
-                                        <span>▶️</span>
-                                        YouTube
-                                    </button>
-                                    <button
-                                        onClick={() => setActiveTab('docs')}
-                                        className={clsx(
-                                            "flex-1 px-3 py-1.5 rounded-md text-sm font-medium transition-all flex items-center justify-center gap-2",
-                                            activeTab === 'docs'
-                                                ? 'bg-surface-primary text-text-primary shadow-sm'
-                                                : 'text-text-tertiary hover:text-text-secondary'
-                                        )}
-                                    >
-                                        <span>📝</span>
-                                        文档
-                                    </button>
-                                </div>
-                            </div>
-                        )
-                    )}
-
-                    {activeTab === 'xiaohongshu' && (
-                        <div className="flex items-center gap-3 overflow-hidden py-1">
-                            {/* 类型筛选 (左侧固定) */}
-                            <div className="flex bg-surface-secondary p-0.5 rounded-lg border border-border/50 shrink-0">
-                                <button
-                                    onClick={() => setXhsTab('all')}
-                                    className={`px-3 py-1 rounded-md text-xs font-medium transition-all ${
-                                        xhsTab === 'all'
-                                            ? 'bg-surface-primary text-text-primary shadow-sm'
-                                            : 'text-text-tertiary hover:text-text-secondary'
-                                    }`}
-                                >
-                                    全部
-                                </button>
-                                <button
-                                    onClick={() => setXhsTab('image')}
-                                    className={`px-3 py-1 rounded-md text-xs font-medium transition-all ${
-                                        xhsTab === 'image'
-                                            ? 'bg-surface-primary text-text-primary shadow-sm'
-                                            : 'text-text-tertiary hover:text-text-secondary'
-                                    }`}
-                                >
-                                    图文
-                                </button>
-                                <button
-                                    onClick={() => setXhsTab('video')}
-                                    className={`px-3 py-1 rounded-md text-xs font-medium transition-all ${
-                                        xhsTab === 'video'
-                                            ? 'bg-surface-primary text-text-primary shadow-sm'
-                                            : 'text-text-tertiary hover:text-text-secondary'
-                                    }`}
-                                >
-                                    视频
-                                </button>
-                            </div>
-
-                            {/* Tags Filter (右侧滚动) - Hidden in embedded mode */}
-                            {!isEmbedded && allTags.length > 0 && (
-                                <>
-                                    <div className="w-px h-4 bg-border/50 shrink-0" />
-
-                                    <div className="flex-1 flex items-center gap-2 overflow-x-auto no-scrollbar -mx-1 px-1">
-                                        {/* "All" Tag Pill */}
-                                        <button
-                                            onClick={() => setSelectedTag(null)}
-                                            className={`shrink-0 px-3 py-1 text-xs font-medium rounded-full transition-all border ${
-                                                !selectedTag
-                                                    ? 'bg-surface-primary text-text-primary border-border shadow-sm ring-1 ring-border/50'
-                                                    : 'bg-transparent text-text-tertiary border-transparent hover:bg-surface-secondary hover:text-text-secondary'
-                                            }`}
-                                        >
-                                            全部标签
-                                        </button>
-
-                                        {/* Tag Pills */}
-                                        {allTags.map(({ tag, count }) => (
+                                {!isEmbedded && (
+                                    <>
+                                        {(selectedTypeFilter === 'all' || selectedTypeFilter === 'youtube') && youtubeSummaryPendingCount > 0 && (
                                             <button
-                                                key={tag}
-                                                onClick={() => setSelectedTag(selectedTag === tag ? null : tag)}
-                                                className={`shrink-0 px-3 py-1 text-xs rounded-full transition-all flex items-center gap-1.5 border ${
-                                                    selectedTag === tag
-                                                        ? 'bg-accent-primary text-white border-accent-primary shadow-md shadow-accent-primary/20'
-                                                        : 'bg-surface-secondary/50 text-text-secondary border-transparent hover:bg-surface-secondary hover:text-text-primary'
-                                                }`}
+                                                onClick={() => void handleRefreshYoutubeSummaries()}
+                                                disabled={isRefreshingYoutubeSummaries}
+                                                className="inline-flex items-center gap-1.5 h-9 px-3 text-xs font-medium border border-border rounded-lg bg-surface-primary hover:bg-surface-secondary transition-colors disabled:opacity-60"
                                             >
-                                                <span className="opacity-70">#</span>
-                                                {tag}
-                                                <span className={`text-[10px] py-0.5 px-1.5 rounded-full ${
-                                                    selectedTag === tag
-                                                        ? 'bg-white/20 text-white'
-                                                        : 'bg-surface-tertiary text-text-tertiary'
-                                                }`}>
-                                                    {count}
+                                                {isRefreshingYoutubeSummaries ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5" />}
+                                                补全 YouTube 摘要
+                                                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-surface-secondary text-text-tertiary">
+                                                    {youtubeSummaryPendingCount}
                                                 </span>
                                             </button>
-                                        ))}
-                                    </div>
-                                </>
-                            )}
+                                        )}
+                                        <button
+                                            onClick={handleAddDocumentFiles}
+                                            className="inline-flex items-center gap-1.5 h-9 px-3 text-xs font-medium border border-border rounded-lg bg-surface-primary hover:bg-surface-secondary transition-colors"
+                                        >
+                                            <Plus className="w-3.5 h-3.5" />
+                                            文件
+                                        </button>
+                                        <button
+                                            onClick={handleAddDocumentFolder}
+                                            className="inline-flex items-center gap-1.5 h-9 px-3 text-xs font-medium border border-border rounded-lg bg-surface-primary hover:bg-surface-secondary transition-colors"
+                                        >
+                                            <FolderPlus className="w-3.5 h-3.5" />
+                                            文件夹
+                                        </button>
+                                        <button
+                                            onClick={handleAddObsidianVault}
+                                            className="inline-flex items-center gap-1.5 h-9 px-3 text-xs font-medium border border-border rounded-lg bg-surface-primary hover:bg-surface-secondary transition-colors"
+                                        >
+                                            <FolderOpen className="w-3.5 h-3.5" />
+                                            Obsidian
+                                        </button>
+                                    </>
+                                )}
+                            </div>
+                        )}
+                    </div>
+
+                    {!isEmbedded && allTags.length > 0 && (
+                        <div className="flex items-center gap-2 overflow-x-auto no-scrollbar">
+                            <button
+                                onClick={() => setSelectedTag(null)}
+                                className={clsx(
+                                    'shrink-0 px-3 py-1 text-xs font-medium rounded-full transition-all border',
+                                    !selectedTag
+                                        ? 'bg-surface-primary text-text-primary border-border shadow-sm ring-1 ring-border/50'
+                                        : 'bg-transparent text-text-tertiary border-transparent hover:bg-surface-secondary hover:text-text-secondary'
+                                )}
+                            >
+                                全部标签
+                            </button>
+                            {allTags.map(({ tag, count }) => (
+                                <button
+                                    key={tag}
+                                    onClick={() => setSelectedTag(selectedTag === tag ? null : tag)}
+                                    className={clsx(
+                                        'shrink-0 px-3 py-1 text-xs rounded-full transition-all flex items-center gap-1.5 border',
+                                        selectedTag === tag
+                                            ? 'bg-accent-primary text-white border-accent-primary shadow-md shadow-accent-primary/20'
+                                            : 'bg-surface-secondary/50 text-text-secondary border-transparent hover:bg-surface-secondary hover:text-text-primary'
+                                    )}
+                                >
+                                    <span className="opacity-70">#</span>
+                                    {tag}
+                                    <span
+                                        className={clsx(
+                                            'text-[10px] py-0.5 px-1.5 rounded-full',
+                                            selectedTag === tag ? 'bg-white/20 text-white' : 'bg-surface-tertiary text-text-tertiary'
+                                        )}
+                                    >
+                                        {count}
+                                    </span>
+                                </button>
+                            ))}
                         </div>
                     )}
                 </div>
@@ -1337,313 +1362,320 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
             <div className="flex-1 overflow-auto p-6">
                 {isLoading ? (
                     <div className="text-center text-text-tertiary text-xs py-16">加载中...</div>
-                ) : activeTab === 'docs' ? (
+                ) : (
                     <div className="space-y-4">
-                        <div className="flex flex-wrap items-center gap-2">
-                            <button
-                                onClick={handleAddDocumentFiles}
-                                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border border-border rounded-lg bg-surface-primary hover:bg-surface-secondary transition-colors"
-                            >
-                                <Plus className="w-3.5 h-3.5" />
-                                添加文件
-                            </button>
-                            <button
-                                onClick={handleAddDocumentFolder}
-                                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border border-border rounded-lg bg-surface-primary hover:bg-surface-secondary transition-colors"
-                            >
-                                <FolderPlus className="w-3.5 h-3.5" />
-                                添加文件夹
-                            </button>
-                            <button
-                                onClick={handleAddObsidianVault}
-                                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border border-border rounded-lg bg-surface-primary hover:bg-surface-secondary transition-colors"
-                            >
-                                <FolderOpen className="w-3.5 h-3.5" />
-                                添加 Obsidian 仓库
-                            </button>
-                        </div>
-
-                        {filteredDocs.length === 0 ? (
+                        {filteredKnowledgeItems.length === 0 ? (
                             <div className="text-center text-text-tertiary text-xs py-16">
-                                暂无文档源，可添加文件、文件夹或 Obsidian 仓库
+                                暂无内容，可使用插件保存小红书、YouTube、公众号文章和网页链接，也可添加文档源
                             </div>
                         ) : (
-                            <div className="grid gap-3">
-                                {pagedDocs.map((source) => (
-                                    <div
-                                        key={source.id}
-                                        className="rounded-xl border border-border bg-surface-primary p-4 shadow-sm"
-                                    >
-                                        <div className="flex items-center justify-between gap-3">
-                                            <div className="min-w-0">
-                                                <div className="flex items-center gap-2">
-                                                    <div className="text-sm font-semibold text-text-primary truncate">{source.name}</div>
-                                                    <span className={clsx(
-                                                        'text-[10px] px-1.5 py-0.5 rounded-full',
-                                                        source.kind === 'obsidian-vault'
-                                                            ? 'bg-violet-100 text-violet-700'
-                                                            : source.kind === 'tracked-folder'
-                                                                ? 'bg-blue-100 text-blue-700'
-                                                                : 'bg-emerald-100 text-emerald-700'
-                                                    )}>
-                                                        {source.kind === 'obsidian-vault' ? 'Obsidian' : source.kind === 'tracked-folder' ? '文件夹' : '文件'}
+                            <div className="columns-3 md:columns-4 xl:columns-5 2xl:columns-6" style={{ columnGap: '0.75rem' }}>
+                                {filteredKnowledgeItems.map((item) => {
+                                    if (item.kind === 'docs' && item.doc) {
+                                        const source = item.doc;
+                                        return (
+                                            <div
+                                                key={item.id}
+                                                className="mb-3 break-inside-avoid rounded-xl border border-border bg-surface-primary p-3 shadow-sm"
+                                            >
+                                                <div className="flex items-start justify-between gap-3">
+                                                    <div className="min-w-0">
+                                                        <div className="flex items-center gap-2">
+                                                            <div className="text-sm font-semibold text-text-primary truncate">{source.name}</div>
+                                                            <span className={clsx('text-[10px] px-1.5 py-0.5 rounded-full', getKnowledgeKindBadgeClass('docs'))}>
+                                                                {getKnowledgeKindLabel('docs')}
+                                                            </span>
+                                                            {source.locked && (
+                                                                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700">
+                                                                    锁定目录
+                                                                </span>
+                                                            )}
+                                                        </div>
+                                                        <div className="mt-1 text-[11px] text-text-tertiary break-all">{source.rootPath}</div>
+                                                    </div>
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => void handleDeleteDocumentSource(source)}
+                                                        className="p-1.5 rounded-md text-text-tertiary hover:text-red-500 hover:bg-red-500/10 transition-colors"
+                                                        title="移除此文档源"
+                                                    >
+                                                        <Trash2 className="w-3.5 h-3.5" />
+                                                    </button>
+                                                </div>
+                                                <div className="mt-2.5 flex flex-wrap gap-1.5 text-[11px] text-text-secondary">
+                                                    <span className="inline-flex items-center gap-1 rounded-md bg-surface-secondary px-2 py-1">
+                                                        <FileText className="w-3 h-3" />
+                                                        {source.fileCount} 个文档
                                                     </span>
-                                                    {source.locked && (
-                                                        <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700">
-                                                            锁定目录
-                                                        </span>
-                                                    )}
                                                     {source.indexing && (
-                                                        <span className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full bg-blue-100 text-blue-700">
+                                                        <span className="inline-flex items-center gap-1 rounded-md bg-blue-100 text-blue-700 px-2 py-1">
                                                             <Loader2 className="w-3 h-3 animate-spin" />
                                                             建立索引中
                                                         </span>
                                                     )}
                                                     {!source.indexing && source.indexError && (
-                                                        <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-red-100 text-red-700">
+                                                        <span className="inline-flex items-center gap-1 rounded-md bg-red-100 text-red-700 px-2 py-1">
                                                             索引失败
                                                         </span>
                                                     )}
                                                 </div>
-                                                <div className="mt-1 text-[11px] text-text-tertiary truncate">{source.rootPath}</div>
-                                                {!source.indexing && source.indexError && (
-                                                    <div className="mt-1 text-[11px] text-red-500 truncate">
-                                                        {source.indexError}
+                                                {source.sampleFiles.length > 0 && (
+                                                    <div className="mt-2.5 flex flex-wrap gap-1.5">
+                                                        {source.sampleFiles.slice(0, 6).map((file) => (
+                                                            <span
+                                                                key={`${source.id}-${file}`}
+                                                                className="inline-flex max-w-full items-start gap-1 text-[11px] px-2 py-1 rounded-md bg-surface-secondary text-text-secondary"
+                                                            >
+                                                                <FileText className="w-3 h-3 shrink-0 mt-0.5" />
+                                                                <span className="min-w-0 break-all leading-relaxed">{file}</span>
+                                                            </span>
+                                                        ))}
                                                     </div>
                                                 )}
                                             </div>
-                                            <div className="flex items-center gap-3 shrink-0">
-                                                <div className="text-xs text-text-secondary">{source.fileCount} 个文档</div>
-                                                <button
-                                                    type="button"
-                                                    onClick={() => void handleDeleteDocumentSource(source)}
-                                                    className="p-1.5 rounded-md text-text-tertiary hover:text-red-500 hover:bg-red-500/10 transition-colors"
-                                                    title="移除此文档源"
-                                                >
-                                                    <Trash2 className="w-3.5 h-3.5" />
-                                                </button>
-                                            </div>
-                                        </div>
-                                        {source.sampleFiles.length > 0 && (
-                                            <div className="mt-3 flex flex-wrap gap-1.5">
-                                                {source.sampleFiles.map((file) => (
-                                                    <span
-                                                        key={`${source.id}-${file}`}
-                                                        className="inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded-md bg-surface-secondary text-text-secondary"
-                                                    >
-                                                        <FileText className="w-3 h-3" />
-                                                        <span className="max-w-[300px] truncate">{file}</span>
+                                        );
+                                    }
+
+                                    if (item.kind === 'youtube' && item.video) {
+                                        const video = item.video;
+                                        const isProcessing = video.status === 'processing';
+                                        const isFailed = video.status === 'failed';
+                                        return (
+                                            <button
+                                                key={item.id}
+                                                onClick={() => setSelectedVideo(video)}
+                                                className={clsx(
+                                                    'group mb-3 break-inside-avoid w-full text-left bg-surface-primary border rounded-lg overflow-hidden shadow-sm hover:shadow-md transition-shadow',
+                                                    isProcessing ? 'border-yellow-400 animate-pulse' : isFailed ? 'border-red-400' : 'border-border'
+                                                )}
+                                            >
+                                                <div className="relative aspect-[16/10] bg-surface-secondary overflow-hidden">
+                                                    <span className={clsx('absolute top-2 right-2 z-10 text-[10px] px-2 py-1 rounded-full shadow-sm', getKnowledgeKindBadgeClass('youtube'))}>
+                                                        {getKnowledgeKindLabel('youtube')}
                                                     </span>
-                                                ))}
-                                            </div>
-                                        )}
-                                    </div>
-                                ))}
-                            </div>
-                        )}
-                    </div>
-                ) : activeTab === 'xiaohongshu' ? (
-                    /* Xiaohongshu Notes Grid */
-                    filteredXhsNotes.length === 0 ? (
-                        <div className="text-center text-text-tertiary text-xs py-16">
-                            暂无笔记，使用插件保存小红书笔记
-                        </div>
-                    ) : (
-                        <div className="grid gap-4" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(min(180px, 45%), 1fr))" }}>
-                            {pagedXhsNotes.map((note) => {
-                                const orderedImages = orderImages(note.images || []);
-                                const coverImage = note.cover || orderedImages[0];
-                                return (
-                                    <button
-                                        key={note.id}
-                                        onClick={() => setSelectedNote(note)}
-                                        className="w-full text-left bg-surface-primary border border-border rounded-lg overflow-hidden shadow-sm hover:shadow-md transition-shadow"
-                                    >
-                                        {coverImage ? (
-                                            <div className={`w-full ${resolveAspectClass(note.id)} bg-surface-secondary overflow-hidden`}>
-                                                <img
-                                                    src={resolveAssetUrl(coverImage)}
-                                                    alt={note.title}
-                                                    className="w-full h-full object-cover"
-                                                    onLoad={(event) => handleImageLoad(note.id, event)}
-                                                />
-                                            </div>
-                                        ) : note.video ? (
-                                            <div className="relative w-full aspect-[3/4] bg-surface-secondary overflow-hidden flex items-center justify-center">
-                                                <video
-                                                    src={resolveAssetUrl(note.video)}
-                                                    className="w-full h-full object-contain"
-                                                    muted
-                                                    playsInline
-                                                    preload="metadata"
-                                                />
-                                                <div className="absolute inset-0 flex items-center justify-center bg-black/20">
-                                                    <div className="w-10 h-10 rounded-full bg-black/50 flex items-center justify-center">
-                                                        <Play className="w-5 h-5 text-white ml-0.5" fill="white" />
-                                                    </div>
-                                                </div>
-                                            </div>
-                                        ) : (
-                                            <div className="aspect-[3/4] bg-surface-secondary flex items-center justify-center text-text-tertiary">
-                                                <Image className="w-6 h-6" />
-                                            </div>
-                                        )}
-                                        <div className="p-3">
-                                            <div className="text-xs font-semibold text-text-primary line-clamp-2">{note.title}</div>
-                                            <div className="mt-1.5 text-[11px] text-text-tertiary line-clamp-3">
-                                                {note.content}
-                                            </div>
-                                            {!isEmbedded && note.tags && note.tags.length > 0 && (
-                                                <div className="mt-2 flex flex-wrap gap-1">
-                                                    {note.tags.slice(0, 3).map(tag => (
-                                                        <span key={tag} className="text-[10px] text-accent-primary bg-accent-primary/5 px-1.5 py-0.5 rounded">
-                                                            #{tag}
-                                                        </span>
-                                                    ))}
-                                                    {note.tags.length > 3 && (
-                                                        <span className="text-[10px] text-text-tertiary px-1">+{note.tags.length - 3}</span>
+                                                    {video.thumbnailUrl && !isProcessing ? (
+                                                        <img
+                                                            src={resolveAssetUrl(video.thumbnailUrl)}
+                                                            alt={video.title}
+                                                            className="w-full h-full object-cover"
+                                                        />
+                                                    ) : (
+                                                        <div className="w-full h-full flex items-center justify-center text-text-tertiary">
+                                                            {isProcessing ? (
+                                                                <div className="flex flex-col items-center gap-2">
+                                                                    <div className="w-8 h-8 border-2 border-yellow-400 border-t-transparent rounded-full animate-spin" />
+                                                                    <span className="text-xs text-yellow-600">处理中...</span>
+                                                                </div>
+                                                            ) : (
+                                                                <Play className="w-8 h-8" />
+                                                            )}
+                                                        </div>
+                                                    )}
+                                                    {isProcessing && video.thumbnailUrl && (
+                                                        <div className="absolute inset-0 flex items-center justify-center bg-black/50">
+                                                            <div className="flex flex-col items-center gap-2">
+                                                                <div className="w-10 h-10 border-3 border-white border-t-transparent rounded-full animate-spin" />
+                                                                <span className="text-xs text-white font-medium">下载字幕中...</span>
+                                                            </div>
+                                                        </div>
+                                                    )}
+                                                    {!isProcessing && !isFailed && (
+                                                        <div className="absolute inset-0 flex items-center justify-center bg-black/20 opacity-0 hover:opacity-100 transition-opacity">
+                                                            <div className="w-12 h-12 rounded-full bg-red-600 flex items-center justify-center">
+                                                                <Play className="w-6 h-6 text-white ml-1" fill="white" />
+                                                            </div>
+                                                        </div>
+                                                    )}
+                                                    {video.summary && !isProcessing && (
+                                                        <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/85 via-black/50 to-transparent p-3 opacity-0 transition-opacity duration-200 group-hover:opacity-100">
+                                                            {video.originalTitle && video.originalTitle.trim() && video.originalTitle !== video.title && (
+                                                                <div className="mb-1 text-[10px] text-white/70 line-clamp-2">
+                                                                    原始标题：{video.originalTitle}
+                                                                </div>
+                                                            )}
+                                                            <div className="text-[11px] leading-relaxed text-white line-clamp-4">
+                                                                {video.summary}
+                                                            </div>
+                                                        </div>
                                                     )}
                                                 </div>
-                                            )}
-                                            <div className="mt-2.5 flex items-center gap-2 text-[10px] text-text-tertiary">
-                                                <span className="flex items-center gap-1">
-                                                    <Heart className="w-3 h-3" />
-                                                    {note.stats?.likes || 0}
-                                                </span>
-                                                {typeof note.stats?.collects === 'number' && (
-                                                    <span className="flex items-center gap-1">
-                                                        <Star className="w-3 h-3" />
-                                                        {note.stats.collects}
-                                                    </span>
-                                                )}
-                                                {note.images?.length > 0 && (
-                                                    <span className="flex items-center gap-1">
-                                                        <Image className="w-3 h-3" />
-                                                        {note.images.length}
-                                                    </span>
-                                                )}
-                                                {note.video && (
-                                                    <span className="flex items-center gap-1">
-                                                        <Play className="w-3 h-3" />
-                                                        视频
-                                                    </span>
-                                                )}
-                                            </div>
-                                        </div>
-                                    </button>
-                                );
-                            })}
-                        </div>
-                    )
-                ) : (
-                    /* YouTube Videos Grid */
-                    filteredVideos.length === 0 ? (
-                        <div className="text-center text-text-tertiary text-xs py-16">
-                            暂无视频，复制 YouTube 链接后可自动采集保存
-                        </div>
-                    ) : (
-                        <div className="grid gap-4" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(min(180px, 45%), 1fr))" }}>
-                            {pagedVideos.map((video) => {
-                                const isProcessing = video.status === 'processing';
-                                const isFailed = video.status === 'failed';
-                                return (
-                                <button
-                                    key={video.id}
-                                    onClick={() => setSelectedVideo(video)}
-                                    className={`w-full text-left bg-surface-primary border rounded-lg overflow-hidden shadow-sm hover:shadow-md transition-shadow ${
-                                        isProcessing ? 'border-yellow-400 animate-pulse' : isFailed ? 'border-red-400' : 'border-border'
-                                    }`}
-                                >
-                                    <div className="relative aspect-video bg-surface-secondary overflow-hidden">
-                                        {video.thumbnailUrl && !isProcessing ? (
-                                            <img
-                                                src={resolveAssetUrl(video.thumbnailUrl)}
-                                                alt={video.title}
-                                                className="w-full h-full object-cover"
-                                            />
-                                        ) : (
-                                            <div className="w-full h-full flex items-center justify-center text-text-tertiary">
-                                                {isProcessing ? (
-                                                    <div className="flex flex-col items-center gap-2">
-                                                        <div className="w-8 h-8 border-2 border-yellow-400 border-t-transparent rounded-full animate-spin" />
-                                                        <span className="text-xs text-yellow-600">处理中...</span>
+                                                <div className="p-2.5">
+                                                    <div className="text-xs font-semibold text-text-primary line-clamp-2">{video.title}</div>
+                                                    <div className="mt-1 text-[11px] text-text-tertiary line-clamp-2">
+                                                        {isProcessing ? '正在下载字幕和封面...' : (video.summary || video.description || '暂无描述')}
                                                     </div>
-                                                ) : (
-                                                    <Play className="w-8 h-8" />
-                                                )}
-                                            </div>
-                                        )}
-                                        {/* Processing overlay */}
-                                        {isProcessing && video.thumbnailUrl && (
-                                            <div className="absolute inset-0 flex items-center justify-center bg-black/50">
-                                                <div className="flex flex-col items-center gap-2">
-                                                    <div className="w-10 h-10 border-3 border-white border-t-transparent rounded-full animate-spin" />
-                                                    <span className="text-xs text-white font-medium">下载字幕中...</span>
+                                                    <div className="mt-2 flex items-center justify-between gap-2 text-[10px] text-text-tertiary">
+                                                        <span>{new Date(video.createdAt).toLocaleDateString()}</span>
+                                                        {video.hasSubtitle && !isProcessing && <span>已提取字幕</span>}
+                                                        {isFailed && <span className="text-red-500">处理失败</span>}
+                                                    </div>
                                                 </div>
-                                            </div>
-                                        )}
-                                        {/* Play overlay - only show when completed */}
-                                        {!isProcessing && !isFailed && (
-                                            <div className="absolute inset-0 flex items-center justify-center bg-black/20 opacity-0 hover:opacity-100 transition-opacity">
-                                                <div className="w-12 h-12 rounded-full bg-red-600 flex items-center justify-center">
-                                                    <Play className="w-6 h-6 text-white ml-1" fill="white" />
-                                                </div>
-                                            </div>
-                                        )}
-                                        {/* Status badges */}
-                                        {video.hasSubtitle && !isProcessing && (
-                                            <div className="absolute bottom-2 right-2 px-1.5 py-0.5 bg-black/70 rounded text-[10px] text-white flex items-center gap-1">
-                                                <FileText className="w-3 h-3" />
-                                                字幕
-                                            </div>
-                                        )}
-                                        {isFailed && (
-                                            <div className="absolute bottom-2 right-2 px-1.5 py-0.5 bg-red-600 rounded text-[10px] text-white">
-                                                处理失败
-                                            </div>
-                                        )}
-                                    </div>
-                                    <div className="p-3">
-                                        <div className="text-xs font-semibold text-text-primary line-clamp-2">{video.title}</div>
-                                        <div className="mt-1.5 text-[11px] text-text-tertiary line-clamp-2">
-                                            {isProcessing ? '正在下载字幕和封面...' : (video.description || '暂无描述')}
-                                        </div>
-                                        <div className="mt-2 flex items-center justify-between">
-                                            <span className="text-[10px] text-text-tertiary">
-                                                {new Date(video.createdAt).toLocaleDateString()}
-                                            </span>
-                                            {isProcessing && (
-                                                <span className="text-[10px] text-yellow-600 font-medium">处理中</span>
-                                            )}
-                                        </div>
-                                    </div>
-                                </button>
-                                );
-                            })}
-                        </div>
-                    )
-                )}
+                                            </button>
+                                        );
+                                    }
 
-                {/* 分页控件 */}
-                {totalPages > 1 && (
-                    <div className="flex items-center justify-center gap-2 mt-4 pb-2">
-                        <button
-                            onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
-                            disabled={currentPage === 1}
-                            className="px-2 py-1 text-xs rounded border border-border hover:bg-surface-secondary disabled:opacity-30 disabled:cursor-not-allowed"
-                        >
-                            <ChevronLeft className="w-3 h-3" />
-                        </button>
-                        <span className="text-xs text-text-tertiary">
-                            {currentPage} / {totalPages}
-                        </span>
-                        <button
-                            onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
-                            disabled={currentPage === totalPages}
-                            className="px-2 py-1 text-xs rounded border border-border hover:bg-surface-secondary disabled:opacity-30 disabled:cursor-not-allowed"
-                        >
-                            <ChevronRight className="w-3 h-3" />
-                        </button>
+                                    if (!item.note) {
+                                        return null;
+                                    }
+
+                                    const note = item.note;
+                                    const orderedImages = orderImages(note.images || []);
+                                    const coverImage = note.cover || orderedImages[0];
+                                    const isTextArticleCard = item.kind === 'link-article' && !coverImage && !note.video;
+                                    const notePreviewText = note.excerpt || note.content || note.sourceUrl || '暂无摘要';
+
+                                    return (
+                                        <button
+                                            key={item.id}
+                                            onClick={() => setSelectedNote(note)}
+                                            className={clsx(
+                                                'mb-3 break-inside-avoid w-full text-left bg-surface-primary border border-border rounded-lg shadow-sm hover:shadow-md transition-shadow',
+                                                isTextArticleCard ? 'overflow-visible p-3' : 'overflow-hidden'
+                                            )}
+                                        >
+                                            {isTextArticleCard ? (
+                                                <div className="flex items-start gap-3">
+                                                    <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-sky-500/10 text-sky-600">
+                                                        <FileText className="w-5 h-5" />
+                                                    </div>
+                                                    <div className="min-w-0 flex-1">
+                                                        <div className="flex items-start justify-between gap-2">
+                                                            <div className="text-xs font-semibold text-text-primary line-clamp-2">
+                                                                {note.title}
+                                                            </div>
+                                                            <span className={clsx('shrink-0 text-[10px] px-2 py-1 rounded-full shadow-sm', getKnowledgeKindBadgeClass(item.kind))}>
+                                                                {getKnowledgeKindLabel(item.kind)}
+                                                            </span>
+                                                        </div>
+                                                        <div className="mt-2 text-[11px] text-text-tertiary line-clamp-6 leading-relaxed">
+                                                            {notePreviewText}
+                                                        </div>
+                                                        <div className="mt-3 flex items-center gap-2 text-[10px] text-text-tertiary flex-wrap">
+                                                            <span>{new Date(note.createdAt).toLocaleDateString()}</span>
+                                                            {note.sourceUrl && (
+                                                                <span className="flex items-center gap-1 max-w-full">
+                                                                    <ExternalLink className="w-3 h-3" />
+                                                                    <span className="truncate max-w-[140px]">{note.author || '原文链接'}</span>
+                                                                </span>
+                                                            )}
+                                                            {note.tags?.slice(0, 2).map((tag) => (
+                                                                <span key={tag} className="text-[10px] text-accent-primary bg-accent-primary/5 px-1.5 py-0.5 rounded">
+                                                                    #{tag}
+                                                                </span>
+                                                            ))}
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            ) : coverImage ? (
+                                                <div
+                                                    className={clsx(
+                                                        'relative w-full bg-surface-secondary overflow-hidden',
+                                                        item.kind === 'link-article' ? 'aspect-[4/3]' : resolveAspectClass(note.id)
+                                                    )}
+                                                >
+                                                    <span className={clsx('absolute top-2 right-2 z-10 text-[10px] px-2 py-1 rounded-full shadow-sm', getKnowledgeKindBadgeClass(item.kind))}>
+                                                        {getKnowledgeKindLabel(item.kind)}
+                                                    </span>
+                                                    <img
+                                                        src={resolveAssetUrl(coverImage)}
+                                                        alt={note.title}
+                                                        className="w-full h-full object-cover"
+                                                        onLoad={(event) => handleImageLoad(note.id, event)}
+                                                    />
+                                                </div>
+                                            ) : note.video ? (
+                                                <div className="relative w-full aspect-[3/4] bg-surface-secondary overflow-hidden flex items-center justify-center">
+                                                    <span className={clsx('absolute top-2 right-2 z-10 text-[10px] px-2 py-1 rounded-full shadow-sm', getKnowledgeKindBadgeClass(item.kind))}>
+                                                        {getKnowledgeKindLabel(item.kind)}
+                                                    </span>
+                                                    <video
+                                                        src={resolveAssetUrl(note.video)}
+                                                        className="w-full h-full object-contain"
+                                                        muted
+                                                        playsInline
+                                                        preload="metadata"
+                                                    />
+                                                    <div className="absolute inset-0 flex items-center justify-center bg-black/20">
+                                                        <div className="w-10 h-10 rounded-full bg-black/50 flex items-center justify-center">
+                                                            <Play className="w-5 h-5 text-white ml-0.5" fill="white" />
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            ) : (
+                                                <div
+                                                    className={clsx(
+                                                        'relative bg-surface-secondary flex items-center justify-center text-text-tertiary',
+                                                        item.kind === 'link-article' ? 'aspect-[4/2.6]' : 'aspect-[3/4]'
+                                                    )}
+                                                >
+                                                    <span className={clsx('absolute top-2 right-2 z-10 text-[10px] px-2 py-1 rounded-full shadow-sm', getKnowledgeKindBadgeClass(item.kind))}>
+                                                        {getKnowledgeKindLabel(item.kind)}
+                                                    </span>
+                                                    {item.kind === 'link-article' ? <FileText className="w-6 h-6" /> : <Image className="w-6 h-6" />}
+                                                </div>
+                                            )}
+                                            <div className="p-2.5">
+                                                <div className="text-xs font-semibold text-text-primary line-clamp-2">{note.title}</div>
+                                                <div
+                                                    className={clsx(
+                                                        'text-[11px] text-text-tertiary',
+                                                        item.kind === 'link-article' ? 'mt-1 line-clamp-5' : 'mt-1 line-clamp-3'
+                                                    )}
+                                                >
+                                                    {notePreviewText}
+                                                </div>
+                                                {!isEmbedded && note.tags && note.tags.length > 0 && (
+                                                    <div className="mt-1.5 flex flex-wrap gap-1">
+                                                        {note.tags.slice(0, 3).map((tag) => (
+                                                            <span key={tag} className="text-[10px] text-accent-primary bg-accent-primary/5 px-1.5 py-0.5 rounded">
+                                                                #{tag}
+                                                            </span>
+                                                        ))}
+                                                        {note.tags.length > 3 && (
+                                                            <span className="text-[10px] text-text-tertiary px-1">+{note.tags.length - 3}</span>
+                                                        )}
+                                                    </div>
+                                                )}
+                                                <div className="mt-2 flex items-center gap-2 text-[10px] text-text-tertiary flex-wrap">
+                                                    <span>{new Date(note.createdAt).toLocaleDateString()}</span>
+                                                    {item.kind !== 'link-article' && (
+                                                        <span className="flex items-center gap-1">
+                                                            <Heart className="w-3 h-3" />
+                                                            {note.stats?.likes || 0}
+                                                        </span>
+                                                    )}
+                                                    {typeof note.stats?.collects === 'number' && item.kind !== 'link-article' && (
+                                                        <span className="flex items-center gap-1">
+                                                            <Star className="w-3 h-3" />
+                                                            {note.stats.collects}
+                                                        </span>
+                                                    )}
+                                                    {note.images?.length > 0 && (
+                                                        <span className="flex items-center gap-1">
+                                                            <Image className="w-3 h-3" />
+                                                            {note.images.length}
+                                                        </span>
+                                                    )}
+                                                    {note.video && (
+                                                        <span className="flex items-center gap-1">
+                                                            <Play className="w-3 h-3" />
+                                                            视频
+                                                        </span>
+                                                    )}
+                                                    {item.kind === 'link-article' && note.sourceUrl && (
+                                                        <span className="flex items-center gap-1 max-w-full">
+                                                            <ExternalLink className="w-3 h-3" />
+                                                            <span className="truncate max-w-[120px]">{note.author || '原文链接'}</span>
+                                                        </span>
+                                                    )}
+                                                </div>
+                                            </div>
+                                        </button>
+                                    );
+                                })}
+                            </div>
+                        )}
+
                     </div>
                 )}
             </div>
@@ -1658,11 +1690,18 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
                         className="w-full max-w-3xl mx-4 bg-surface-primary rounded-2xl border border-border shadow-2xl overflow-hidden max-h-[85vh] flex flex-col"
                         onClick={(event) => event.stopPropagation()}
                     >
+                        {(() => {
+                            const showRichArticle = Boolean(selectedNote.htmlFileUrl && selectedNote.captureKind === 'wechat-article');
+                            return (
+                        <>
                         <div className="px-6 py-4 border-b border-border flex items-start justify-between">
                             <div className="min-w-0">
                                 <h1 className="text-lg font-semibold text-text-primary line-clamp-2">{selectedNote.title}</h1>
                                 <div className="flex items-center gap-3 mt-1 text-xs text-text-tertiary">
                                     <span>作者: {selectedNote.author}</span>
+                                    {selectedNote.siteName && (
+                                        <span>{selectedNote.siteName}</span>
+                                    )}
                                     <span className="flex items-center gap-1">
                                         <Heart className="w-3 h-3" /> {selectedNote.stats?.likes || 0}
                                     </span>
@@ -1734,7 +1773,7 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
                                 </div>
                             )}
 
-                            {selectedNote.images && selectedNote.images.length > 0 && (() => {
+                            {!showRichArticle && selectedNote.images && selectedNote.images.length > 0 && (() => {
                                 const orderedImages = orderImages(selectedNote.images);
                                 const currentImage = orderedImages[selectedImageIndex];
                                 const aspectClass = resolveAspectClass(currentImage);
@@ -1772,11 +1811,22 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
                                 );
                             })()}
 
-                            <div className="bg-surface-secondary/50 rounded-lg border border-border p-4">
-                                <pre className="text-sm text-text-primary whitespace-pre-wrap font-sans leading-relaxed">
-                                    {selectedNote.content}
-                                </pre>
-                            </div>
+                            {showRichArticle ? (
+                                <div className="rounded-xl border border-border overflow-hidden bg-white">
+                                    <iframe
+                                        src={resolveAssetUrl(selectedNote.htmlFileUrl)}
+                                        title={selectedNote.title}
+                                        sandbox="allow-popups allow-popups-to-escape-sandbox"
+                                        className="block w-full h-[72vh] bg-white"
+                                    />
+                                </div>
+                            ) : (
+                                <div className="bg-surface-secondary/50 rounded-lg border border-border p-4">
+                                    <pre className="text-sm text-text-primary whitespace-pre-wrap font-sans leading-relaxed">
+                                        {selectedNote.content}
+                                    </pre>
+                                </div>
+                            )}
 
                             {selectedNote.video && selectedNote.transcript && (
                                 <div className="bg-surface-secondary/50 rounded-lg border border-border overflow-hidden">
@@ -1811,6 +1861,9 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
                                 删除笔记
                             </button>
                         </div>
+                        </>
+                            );
+                        })()}
                     </div>
                 </div>
             )}
@@ -1836,6 +1889,16 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
                                         </span>
                                     )}
                                 </div>
+                                {selectedVideo.summary && (
+                                    <div className="mt-2 text-sm text-text-secondary line-clamp-3">
+                                        {selectedVideo.summary}
+                                    </div>
+                                )}
+                                {selectedVideo.originalTitle && selectedVideo.originalTitle.trim() && selectedVideo.originalTitle !== selectedVideo.title && (
+                                    <div className="mt-1 text-xs text-text-tertiary line-clamp-2">
+                                        原始标题：{selectedVideo.originalTitle}
+                                    </div>
+                                )}
                             </div>
                             <div className="flex items-center gap-2">
                                 <button
