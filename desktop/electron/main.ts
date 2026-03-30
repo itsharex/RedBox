@@ -5152,7 +5152,7 @@ ipcMain.handle('knowledge:list', async () => {
           htmlFileUrl = toLocalFileUrl(absolutePath);
         }
 
-        notes.push({ id: dir.name, ...meta, images, cover, video, htmlFileUrl, transcript: meta.transcript || '', tags });
+        notes.push({ id: dir.name, ...meta, images, cover, video, htmlFileUrl, transcript: meta.transcript || '', tags, folderPath: noteDir });
       } catch {
         // Skip notes without valid meta
       }
@@ -5263,7 +5263,8 @@ ipcMain.handle('knowledge:list-youtube', async () => {
           id: dir.name,
           ...meta,
           thumbnailUrl,
-          subtitleContent
+          subtitleContent,
+          folderPath: videoDir,
         });
       } catch {
         // Skip videos without valid meta
@@ -6185,6 +6186,124 @@ const ensureRichHtmlUsesAbsoluteAssetUrls = async (noteDir: string, htmlFileName
     await fs.writeFile(htmlPath, rewritten, 'utf-8');
   }
   return rewritten;
+};
+
+const extractArticleFromHtmlSnapshot = (input: {
+  htmlSnapshot?: string;
+  url?: string;
+  fallbackTitle?: string;
+  fallbackExcerpt?: string;
+  fallbackAuthor?: string;
+  fallbackSiteName?: string;
+}): {
+  title: string;
+  markdown: string;
+  excerpt: string;
+  author: string;
+  siteName: string;
+  contentHtml: string;
+} | null => {
+  const htmlSnapshot = String(input.htmlSnapshot || '').trim();
+  if (!htmlSnapshot) return null;
+
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { JSDOM } = require('jsdom') as typeof import('jsdom');
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { Readability } = require('@mozilla/readability') as typeof import('@mozilla/readability');
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const TurndownService = require('turndown') as typeof import('turndown');
+
+    const dom = new JSDOM(htmlSnapshot, {
+      url: String(input.url || 'https://example.com'),
+    });
+    const reader = new Readability(dom.window.document);
+    const article = reader.parse();
+    if (!article || !String(article.content || '').trim()) {
+      return null;
+    }
+
+    const turndownService = new TurndownService({
+      headingStyle: 'atx',
+      codeBlockStyle: 'fenced',
+      bulletListMarker: '-',
+      emDelimiter: '_',
+      strongDelimiter: '**',
+    });
+
+    turndownService.remove(['script', 'style', 'noscript', 'iframe']);
+    const markdown = String(turndownService.turndown(article.content || '') || '').trim();
+    const excerpt = String(article.excerpt || input.fallbackExcerpt || buildExcerpt(markdown, 180)).trim();
+
+    return {
+      title: String(article.title || input.fallbackTitle || 'Untitled Page').trim(),
+      markdown,
+      excerpt,
+      author: String(article.byline || input.fallbackAuthor || '').trim(),
+      siteName: String(article.siteName || input.fallbackSiteName || '').trim(),
+      contentHtml: String(article.content || '').trim(),
+    };
+  } catch (error) {
+    console.error('Failed to extract article from html snapshot:', error);
+    return null;
+  }
+};
+
+const localizeGenericArticleHtml = async (
+  html: string,
+  noteDir: string,
+  persistImage: (imageSource: string, preferredName?: string) => Promise<string>,
+  onPersistedImage?: (relativePath: string) => void,
+): Promise<string> => {
+  const rawHtml = String(html || '').trim();
+  if (!rawHtml) return '';
+
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { JSDOM } = require('jsdom') as typeof import('jsdom');
+    const dom = new JSDOM('<!doctype html><html><body></body></html>');
+    const { document } = dom.window;
+    const root = document.createElement('div');
+    root.innerHTML = rawHtml;
+
+    const images = Array.from(root.querySelectorAll('img'));
+    for (let index = 0; index < images.length; index += 1) {
+      const img = images[index];
+      const source = String(
+        img.getAttribute('src')
+        || img.getAttribute('data-src')
+        || img.getAttribute('data-original')
+        || '',
+      ).trim();
+      if (!source) continue;
+      try {
+        const localPath = await persistImage(source, index === 0 ? 'cover.jpg' : undefined);
+        if (!localPath) continue;
+        img.setAttribute('src', localPath);
+        img.removeAttribute('srcset');
+        img.removeAttribute('data-src');
+        img.removeAttribute('data-original');
+        onPersistedImage?.(localPath);
+      } catch (error) {
+        console.error('Failed to localize generic article image:', error);
+      }
+    }
+
+    for (const anchor of Array.from(root.querySelectorAll('a[href]'))) {
+      const href = String(anchor.getAttribute('href') || '').trim();
+      if (!href || href.startsWith('#') || href.startsWith('mailto:') || href.startsWith('tel:')) continue;
+      try {
+        anchor.setAttribute('href', new URL(href, 'https://example.com').toString());
+      } catch {
+        // keep original href when it is not a valid URL-like string
+      }
+    }
+
+    return absolutizeEmbeddedLocalAssetReferences(root.innerHTML, noteDir);
+  } catch (error) {
+    console.error('Failed to localize generic article html:', error);
+    return absolutizeEmbeddedLocalAssetReferences(rawHtml, noteDir);
+  }
 };
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -7620,6 +7739,16 @@ function startHttpServer() {
           const noteId = `${isLinkArticle ? 'link' : 'text'}_${Date.now()}`;
           const noteDir = path.join(getKnowledgeRedbookDir(), noteId);
           await fs.mkdir(noteDir, { recursive: true });
+          const extractedArticle = isLinkArticle && String(data.captureKind || '').trim() !== 'wechat-article'
+            ? extractArticleFromHtmlSnapshot({
+                htmlSnapshot: String(data.htmlSnapshot || ''),
+                url: String(data.url || ''),
+                fallbackTitle: String(data.title || ''),
+                fallbackExcerpt: String(data.excerpt || ''),
+                fallbackAuthor: String(data.author || ''),
+                fallbackSiteName: String(data.siteName || ''),
+              })
+            : null;
 
           const meta: {
             id: string;
@@ -7641,13 +7770,13 @@ function startHttpServer() {
             id: noteId,
             type: isLinkArticle ? 'link-article' : 'text',
             captureKind: String(data.captureKind || '').trim() || undefined,
-            title: data.title || (isLinkArticle ? 'Link Article' : 'Text Clipping'),
-            content: data.text || "",
+            title: extractedArticle?.title || data.title || (isLinkArticle ? 'Link Article' : 'Text Clipping'),
+            content: extractedArticle?.markdown || data.text || "",
             sourceUrl: data.url || "",
-            siteName: data.siteName || '',
-            excerpt: data.excerpt || '',
+            siteName: extractedArticle?.siteName || data.siteName || '',
+            excerpt: extractedArticle?.excerpt || data.excerpt || '',
             createdAt: new Date().toISOString(),
-            author: data.author || 'User',
+            author: extractedArticle?.author || data.author || 'User',
             stats: { likes: 0, collects: 0 },
             images: [],
             cover: '',
@@ -7655,6 +7784,9 @@ function startHttpServer() {
               ? data.tags.map((value: unknown) => String(value || '').trim()).filter(Boolean)
               : [],
           };
+          if (isLinkArticle && !meta.tags?.includes('网页文章')) {
+            meta.tags = [...(meta.tags || []), '网页文章'];
+          }
 
           const imagesDir = path.join(noteDir, 'images');
           let nextImageIndex = 0;
@@ -7749,13 +7881,62 @@ function startHttpServer() {
             if (!meta.tags?.includes('公众号文章')) {
               meta.tags = [...(meta.tags || []), '公众号文章'];
             }
+          } else if (isLinkArticle && extractedArticle?.contentHtml) {
+            const htmlFile = 'content.html';
+            const articleHtmlBody = await localizeGenericArticleHtml(
+              extractedArticle.contentHtml,
+              noteDir,
+              persistImage,
+              (localPath) => {
+                if (!meta.images.includes(localPath)) {
+                  meta.images.push(localPath);
+                }
+              },
+            );
+            if (!meta.cover && meta.images.length > 0) {
+              meta.cover = meta.images[0];
+            }
+            const simpleArticleHtml = `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${String(meta.title || 'Article')}</title>
+  <style>
+    :root { color-scheme: light; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f5f5f3; color: #1f2937; font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", Arial, sans-serif; line-height: 1.85; }
+    .rb-article-shell { max-width: 820px; margin: 0 auto; padding: 28px 20px 60px; }
+    .rb-article { background: #ffffff; border-radius: 18px; padding: 32px 28px 40px; box-shadow: 0 12px 32px rgba(15, 23, 42, 0.08); border: 1px solid rgba(15, 23, 42, 0.06); }
+    .rb-article-title { margin: 0; font-size: 30px; line-height: 1.3; font-weight: 700; color: #111827; }
+    .rb-article-meta { margin-top: 12px; font-size: 13px; color: #6b7280; }
+    .rb-article-body { margin-top: 24px; font-size: 17px; color: #1f2937; word-break: break-word; }
+    .rb-article-body img { max-width: 100%; height: auto; display: block; margin: 18px auto; border-radius: 14px; }
+    .rb-article-body a { color: #0369a1; text-decoration: underline; text-underline-offset: 2px; }
+    .rb-article-body pre { white-space: pre-wrap; background: #111827; color: #f9fafb; padding: 14px 16px; border-radius: 12px; overflow: auto; }
+    .rb-article-body table { width: 100%; border-collapse: collapse; }
+    .rb-article-body td, .rb-article-body th { border: 1px solid #d1d5db; padding: 10px 12px; vertical-align: top; }
+  </style>
+</head>
+<body>
+  <div class="rb-article-shell">
+    <article class="rb-article">
+      <h1 class="rb-article-title">${String(meta.title || 'Article')}</h1>
+      <div class="rb-article-meta">${[meta.author, meta.siteName].filter(Boolean).join(' · ')}</div>
+      <div class="rb-article-body">${articleHtmlBody}</div>
+    </article>
+  </div>
+</body>
+</html>`;
+            await fs.writeFile(path.join(noteDir, htmlFile), simpleArticleHtml, 'utf-8');
+            meta.htmlFile = htmlFile;
           }
 
           await fs.writeFile(path.join(noteDir, "meta.json"), JSON.stringify(meta, null, 2));
-          await fs.writeFile(path.join(noteDir, "content.md"), data.text || "");
+          await fs.writeFile(path.join(noteDir, "content.md"), meta.content || "");
 
           // Index the text
-          indexManager.addToQueue(normalizeNote(noteId, meta, data.text || ""));
+          indexManager.addToQueue(normalizeNote(noteId, meta, meta.content || ""));
 
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ success: true, noteId }));

@@ -237,6 +237,8 @@ export function Chat({
   const pendingUpdateRef = useRef<{ content: string } | null>(null);
   const updateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastStreamChunkRef = useRef<{ content: string; at: number }>({ content: '', at: 0 });
+  const localMessageMutationRef = useRef(0);
+  const selectSessionRequestRef = useRef(0);
   
   // 缓冲未处理的 chunk，用于解决页面加载期间的数据丢失问题
   const missedChunksRef = useRef<string>('');
@@ -426,9 +428,11 @@ export function Chat({
       };
 
       if (shouldAppendToCurrentSession) {
+        localMessageMutationRef.current += 1;
         setMessages(prev => [...prev, userMsg, aiPlaceholder]);
       } else {
         // 新会话直接设置消息
+        localMessageMutationRef.current += 1;
         setMessages([userMsg, aiPlaceholder]);
       }
       setIsProcessing(true);
@@ -463,11 +467,19 @@ export function Chat({
 
   const selectSession = async (sessionId: string) => {
     setCurrentSessionId(sessionId);
+    const requestId = ++selectSessionRequestRef.current;
+    const mutationVersionAtStart = localMessageMutationRef.current;
     try {
       const [history, runtimeStateRaw] = await Promise.all([
         window.ipcRenderer.chat.getMessages(sessionId),
         window.ipcRenderer.chat.getRuntimeState(sessionId),
       ]);
+      if (requestId !== selectSessionRequestRef.current) {
+        return;
+      }
+      if (localMessageMutationRef.current !== mutationVersionAtStart) {
+        return;
+      }
       const runtimeState = runtimeStateRaw as ChatRuntimeState;
 
       // Convert DB messages to UI messages
@@ -1254,6 +1266,7 @@ export function Chat({
       isStreaming: true
     };
 
+    localMessageMutationRef.current += 1;
     setMessages(prev => [...prev, userMsg, aiPlaceholder]);
     setInput('');
     setPendingAttachment(null);

@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState, useCallback, useRef } from 'react';
 import type { SyntheticEvent } from 'react';
 import { Search, Trash2, Image, Heart, MessageCircle, X, ChevronLeft, ChevronRight, Play, FileText, ExternalLink, RefreshCw, Sparkles, Star, BookmarkPlus, FolderPlus, FolderOpen, Plus, Loader2 } from 'lucide-react';
 import { clsx } from 'clsx';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import type { PendingChatMessage } from '../App';
 import { KnowledgeChatModal } from '../components/KnowledgeChatModal';
 import { useFeatureFlag } from '../hooks/useFeatureFlags';
@@ -29,6 +31,7 @@ interface Note { type?: string; sourceUrl?: string;
         collects?: number;
     };
     createdAt: string;
+    folderPath?: string;
 }
 
 interface YouTubeVideo {
@@ -44,9 +47,10 @@ interface YouTubeVideo {
     subtitleContent?: string;
     status?: 'processing' | 'completed' | 'failed';
     createdAt: string;
+    folderPath?: string;
 }
 
-type KnowledgeTypeFilter = 'all' | 'xhs-image' | 'xhs-video' | 'link-article' | 'youtube' | 'docs';
+type KnowledgeTypeFilter = 'all' | 'xhs-image' | 'xhs-video' | 'link-article' | 'wechat-article' | 'youtube' | 'docs';
 
 interface DocumentKnowledgeSource {
     id: string;
@@ -560,7 +564,9 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
         const noteItems: KnowledgeCardItem[] = notes.map((note) => {
             const orderedImages = orderImages(note.images || []);
             const kind: KnowledgeCardItem['kind'] = (note.type === 'link-article' || note.type === 'text')
-                ? 'link-article'
+                ? note.captureKind === 'wechat-article'
+                    ? 'wechat-article'
+                    : 'link-article'
                 : note.video
                     ? 'xhs-video'
                     : 'xhs-image';
@@ -617,6 +623,7 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
             'xhs-image': 0,
             'xhs-video': 0,
             'link-article': 0,
+            'wechat-article': 0,
             'youtube': 0,
             'docs': 0,
         };
@@ -628,6 +635,7 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
             { key: 'xhs-image' as const, label: '小红书图文', count: counts['xhs-image'] },
             { key: 'xhs-video' as const, label: '小红书视频', count: counts['xhs-video'] },
             { key: 'link-article' as const, label: '链接文章', count: counts['link-article'] },
+            { key: 'wechat-article' as const, label: '公众号文章', count: counts['wechat-article'] },
             { key: 'youtube' as const, label: 'YouTube', count: counts.youtube },
             { key: 'docs' as const, label: '文档', count: counts.docs },
         ].filter((item) => item.key === 'all' || item.count > 0);
@@ -970,6 +978,15 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
         await loadDocumentSources();
     };
 
+    const handleShowInFolder = async (source?: string) => {
+        const normalized = String(source || '').trim();
+        if (!normalized) return;
+        const result = await window.ipcRenderer.invoke('file:show-in-folder', { source: normalized }) as { success?: boolean; error?: string };
+        if (!result?.success) {
+            alert(result?.error || '打开文件夹失败');
+        }
+    };
+
     const getKnowledgeKindLabel = (kind: KnowledgeCardItem['kind']) => {
         switch (kind) {
             case 'xhs-image':
@@ -978,6 +995,8 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
                 return '小红书视频';
             case 'link-article':
                 return '链接文章';
+            case 'wechat-article':
+                return '公众号文章';
             case 'youtube':
                 return 'YouTube';
             case 'docs':
@@ -995,6 +1014,8 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
                 return 'bg-red-500/90 text-white';
             case 'link-article':
                 return 'bg-sky-500/90 text-white';
+            case 'wechat-article':
+                return 'bg-emerald-500/90 text-white';
             case 'youtube':
                 return 'bg-red-600/90 text-white';
             case 'docs':
@@ -1002,6 +1023,40 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
             default:
                 return 'bg-surface-tertiary text-text-primary';
         }
+    };
+
+    const getKnowledgeTagClass = (tag: string) => {
+        switch (tag) {
+            case '公众号文章':
+                return 'text-emerald-700 bg-emerald-50 border-emerald-200';
+            case '网页文章':
+                return 'text-sky-700 bg-sky-50 border-sky-200';
+            default:
+                return 'text-accent-primary bg-accent-primary/5 border-accent-primary/10';
+        }
+    };
+
+    const renderNoteBody = (note: Note) => {
+        const isMarkdownArticle = note.type === 'link-article' && note.captureKind !== 'wechat-article';
+        if (isMarkdownArticle) {
+            return (
+                <div className="bg-surface-secondary/50 rounded-lg border border-border p-4">
+                    <article className="prose prose-sm max-w-none prose-headings:text-text-primary prose-p:text-text-primary prose-li:text-text-primary prose-strong:text-text-primary prose-a:text-sky-700 prose-pre:bg-slate-900 prose-pre:text-slate-100 prose-code:text-rose-700">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                            {note.content || ''}
+                        </ReactMarkdown>
+                    </article>
+                </div>
+            );
+        }
+
+        return (
+            <div className="bg-surface-secondary/50 rounded-lg border border-border p-4">
+                <pre className="text-sm text-text-primary whitespace-pre-wrap font-sans leading-relaxed">
+                    {note.content}
+                </pre>
+            </div>
+        );
     };
 
     // Embedded View Renders
@@ -1359,8 +1414,12 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
                                     className={clsx(
                                         'shrink-0 px-3 py-1 text-xs rounded-full transition-all flex items-center gap-1.5 border',
                                         selectedTag === tag
-                                            ? 'bg-accent-primary text-white border-accent-primary shadow-md shadow-accent-primary/20'
-                                            : 'bg-surface-secondary/50 text-text-secondary border-transparent hover:bg-surface-secondary hover:text-text-primary'
+                                            ? tag === '公众号文章'
+                                                ? 'bg-emerald-600 text-white border-emerald-600 shadow-md shadow-emerald-600/20'
+                                                : tag === '网页文章'
+                                                    ? 'bg-sky-600 text-white border-sky-600 shadow-md shadow-sky-600/20'
+                                                    : 'bg-accent-primary text-white border-accent-primary shadow-md shadow-accent-primary/20'
+                                            : clsx('bg-surface-secondary/50 border-transparent hover:bg-surface-secondary hover:text-text-primary', getKnowledgeTagClass(tag))
                                     )}
                                 >
                                     <span className="opacity-70">#</span>
@@ -1368,7 +1427,13 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
                                     <span
                                         className={clsx(
                                             'text-[10px] py-0.5 px-1.5 rounded-full',
-                                            selectedTag === tag ? 'bg-white/20 text-white' : 'bg-surface-tertiary text-text-tertiary'
+                                            selectedTag === tag
+                                                ? 'bg-white/20 text-white'
+                                                : tag === '公众号文章'
+                                                    ? 'bg-emerald-100 text-emerald-700'
+                                                    : tag === '网页文章'
+                                                        ? 'bg-sky-100 text-sky-700'
+                                                        : 'bg-surface-tertiary text-text-tertiary'
                                         )}
                                     >
                                         {count}
@@ -1542,7 +1607,7 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
                                     const note = item.note;
                                     const orderedImages = orderImages(note.images || []);
                                     const coverImage = note.cover || orderedImages[0];
-                                    const isTextArticleCard = item.kind === 'link-article' && !coverImage && !note.video;
+                                    const isTextArticleCard = (item.kind === 'link-article' || item.kind === 'wechat-article') && !coverImage && !note.video;
                                     const notePreviewText = note.excerpt || note.content || note.sourceUrl || '暂无摘要';
                                     const isNoteTranscribing = Boolean(note.video && !note.transcript && note.transcriptionStatus === 'processing');
 
@@ -1581,7 +1646,7 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
                                                                 </span>
                                                             )}
                                                             {note.tags?.slice(0, 2).map((tag) => (
-                                                                <span key={tag} className="text-[10px] text-accent-primary bg-accent-primary/5 px-1.5 py-0.5 rounded">
+                                                                <span key={tag} className={clsx('text-[10px] px-1.5 py-0.5 rounded border', getKnowledgeTagClass(tag))}>
                                                                     #{tag}
                                                                 </span>
                                                             ))}
@@ -1592,7 +1657,7 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
                                                 <div
                                                     className={clsx(
                                                         'relative w-full bg-surface-secondary overflow-hidden',
-                                                        item.kind === 'link-article' ? 'aspect-[4/3]' : resolveAspectClass(note.id)
+                                                        (item.kind === 'link-article' || item.kind === 'wechat-article') ? 'aspect-[4/3]' : resolveAspectClass(note.id)
                                                     )}
                                                 >
                                                     <span className={clsx('absolute top-2 right-2 z-10 text-[10px] px-2 py-1 rounded-full shadow-sm', getKnowledgeKindBadgeClass(item.kind))}>
@@ -1639,13 +1704,13 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
                                                 <div
                                                     className={clsx(
                                                         'relative bg-surface-secondary flex items-center justify-center text-text-tertiary',
-                                                        item.kind === 'link-article' ? 'aspect-[4/2.6]' : 'aspect-[3/4]'
+                                                        (item.kind === 'link-article' || item.kind === 'wechat-article') ? 'aspect-[4/2.6]' : 'aspect-[3/4]'
                                                     )}
                                                 >
                                                     <span className={clsx('absolute top-2 right-2 z-10 text-[10px] px-2 py-1 rounded-full shadow-sm', getKnowledgeKindBadgeClass(item.kind))}>
                                                         {getKnowledgeKindLabel(item.kind)}
                                                     </span>
-                                                    {item.kind === 'link-article' ? <FileText className="w-6 h-6" /> : <Image className="w-6 h-6" />}
+                                                    {(item.kind === 'link-article' || item.kind === 'wechat-article') ? <FileText className="w-6 h-6" /> : <Image className="w-6 h-6" />}
                                                 </div>
                                             )}
                                             <div className="p-2.5">
@@ -1653,7 +1718,7 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
                                                 <div
                                                     className={clsx(
                                                         'text-[11px] text-text-tertiary',
-                                                        item.kind === 'link-article' ? 'mt-1 line-clamp-5' : 'mt-1 line-clamp-3'
+                                                        (item.kind === 'link-article' || item.kind === 'wechat-article') ? 'mt-1 line-clamp-5' : 'mt-1 line-clamp-3'
                                                     )}
                                                 >
                                                     {notePreviewText}
@@ -1661,7 +1726,7 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
                                                 {!isEmbedded && note.tags && note.tags.length > 0 && (
                                                     <div className="mt-1.5 flex flex-wrap gap-1">
                                                         {note.tags.slice(0, 3).map((tag) => (
-                                                            <span key={tag} className="text-[10px] text-accent-primary bg-accent-primary/5 px-1.5 py-0.5 rounded">
+                                                            <span key={tag} className={clsx('text-[10px] px-1.5 py-0.5 rounded border', getKnowledgeTagClass(tag))}>
                                                                 #{tag}
                                                             </span>
                                                         ))}
@@ -1702,7 +1767,7 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
                                                             视频
                                                         </span>
                                                     )}
-                                                    {item.kind === 'link-article' && note.sourceUrl && (
+                                                    {(item.kind === 'link-article' || item.kind === 'wechat-article') && note.sourceUrl && (
                                                         <span className="flex items-center gap-1 max-w-full">
                                                             <ExternalLink className="w-3 h-3" />
                                                             <span className="truncate max-w-[120px]">{note.author || '原文链接'}</span>
@@ -1772,6 +1837,13 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
                                 >
                                     <BookmarkPlus className="w-3.5 h-3.5" />
                                     存为封面模板
+                                </button>
+                                <button
+                                    onClick={() => void handleShowInFolder(selectedNote.folderPath)}
+                                    className="p-2 text-text-tertiary hover:text-text-primary transition-colors"
+                                    title="在文件夹中打开"
+                                >
+                                    <FolderOpen className="w-4 h-4" />
                                 </button>
                                 {selectedNote.video && !selectedNote.transcript && (
                                     <button
@@ -1860,13 +1932,7 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
                                         className="block w-full h-[72vh] bg-white"
                                     />
                                 </div>
-                            ) : (
-                                <div className="bg-surface-secondary/50 rounded-lg border border-border p-4">
-                                    <pre className="text-sm text-text-primary whitespace-pre-wrap font-sans leading-relaxed">
-                                        {selectedNote.content}
-                                    </pre>
-                                </div>
-                            )}
+                            ) : renderNoteBody(selectedNote)}
 
                             {selectedNote.video && selectedNote.transcript && (
                                 <div className="bg-surface-secondary/50 rounded-lg border border-border overflow-hidden">
@@ -1952,6 +2018,13 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
                                 >
                                     <MessageCircle className="w-3.5 h-3.5" />
                                     AI 助手
+                                </button>
+                                <button
+                                    onClick={() => void handleShowInFolder(selectedVideo.folderPath)}
+                                    className="p-2 text-text-tertiary hover:text-text-primary transition-colors"
+                                    title="在文件夹中打开"
+                                >
+                                    <FolderOpen className="w-4 h-4" />
                                 </button>
                                 <button
                                     onClick={() => setSelectedVideo(null)}
