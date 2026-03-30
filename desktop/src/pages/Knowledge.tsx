@@ -23,6 +23,7 @@ interface Note { type?: string; sourceUrl?: string;
     video?: string;
     videoUrl?: string;
     transcript?: string;
+    transcriptionStatus?: 'processing' | 'completed' | 'failed';
     stats: {
         likes: number;
         collects?: number;
@@ -719,14 +720,28 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
     }, [selectedVideo, loadSelectedVideoSubtitle]);
 
     useEffect(() => {
-        const handleNoteUpdated = (_event: unknown, _data: { noteId: string }) => {
+        const handleNoteUpdated = (_event: unknown, data: { noteId: string; hasTranscript?: boolean; transcriptionStatus?: 'processing' | 'completed' | 'failed' }) => {
+            setNotes(prev => prev.map(note => {
+                if (note.id !== data.noteId) return note;
+                return {
+                    ...note,
+                    transcript: data.hasTranscript ? note.transcript : note.transcript,
+                    transcriptionStatus: data.transcriptionStatus || note.transcriptionStatus,
+                };
+            }));
+            if (selectedNote?.id === data.noteId && data.transcriptionStatus) {
+                setSelectedNote(prev => prev && prev.id === data.noteId
+                    ? { ...prev, transcriptionStatus: data.transcriptionStatus }
+                    : prev
+                );
+            }
             void loadNotes();
         };
         window.ipcRenderer.on('knowledge:note-updated', handleNoteUpdated);
         return () => {
             window.ipcRenderer.off('knowledge:note-updated', handleNoteUpdated);
         };
-    }, [loadNotes]);
+    }, [loadNotes, selectedNote]);
 
     const handleDeleteNote = async (noteId: string) => {
         if (!confirm('确定要删除这篇笔记吗？')) return;
@@ -745,6 +760,8 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
     const handleTranscribeNote = async (noteId: string) => {
         try {
             setIsTranscribing(true);
+            setNotes(prev => prev.map(note => note.id === noteId ? { ...note, transcriptionStatus: 'processing' } : note));
+            setSelectedNote(prev => prev && prev.id === noteId ? { ...prev, transcriptionStatus: 'processing' } : prev);
             const res = await window.ipcRenderer.invoke('knowledge:transcribe', noteId) as { success: boolean; transcript?: string; error?: string };
             if (res.success) {
                 await loadNotes();
@@ -754,10 +771,14 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
                 setSelectedNote(refreshed);
                 setShowTranscript(true);
             } else {
+                setNotes(prev => prev.map(note => note.id === noteId ? { ...note, transcriptionStatus: 'failed' } : note));
+                setSelectedNote(prev => prev && prev.id === noteId ? { ...prev, transcriptionStatus: 'failed' } : prev);
                 alert(res.error || '转录失败');
             }
         } catch (e) {
             console.error('Failed to transcribe note:', e);
+            setNotes(prev => prev.map(note => note.id === noteId ? { ...note, transcriptionStatus: 'failed' } : note));
+            setSelectedNote(prev => prev && prev.id === noteId ? { ...prev, transcriptionStatus: 'failed' } : prev);
             alert('转录失败');
         } finally {
             setIsTranscribing(false);
@@ -1007,16 +1028,16 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
                         {selectedNote.video && !selectedNote.transcript && (
                             <button
                                 onClick={() => handleTranscribeNote(selectedNote.id)}
-                                disabled={isTranscribing}
+                                disabled={isTranscribing || selectedNote.transcriptionStatus === 'processing'}
                                 className="flex items-center gap-1.5 px-2 py-1 text-xs font-medium text-text-primary bg-surface-secondary border border-border rounded hover:bg-surface-hover disabled:opacity-50 transition-colors"
                                 title="提取文字"
                             >
-                                {isTranscribing ? (
+                                {isTranscribing || selectedNote.transcriptionStatus === 'processing' ? (
                                     <RefreshCw className="w-3 h-3 animate-spin" />
                                 ) : (
                                     <FileText className="w-3 h-3" />
                                 )}
-                                提取文字
+                                {selectedNote.transcriptionStatus === 'processing' || isTranscribing ? '转录中...' : '提取文字'}
                             </button>
                         )}
                     </div>
@@ -1523,6 +1544,7 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
                                     const coverImage = note.cover || orderedImages[0];
                                     const isTextArticleCard = item.kind === 'link-article' && !coverImage && !note.video;
                                     const notePreviewText = note.excerpt || note.content || note.sourceUrl || '暂无摘要';
+                                    const isNoteTranscribing = Boolean(note.video && !note.transcript && note.transcriptionStatus === 'processing');
 
                                     return (
                                         <button
@@ -1582,6 +1604,12 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
                                                         className="w-full h-full object-cover"
                                                         onLoad={(event) => handleImageLoad(note.id, event)}
                                                     />
+                                                    {isNoteTranscribing && (
+                                                        <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-2 bg-black/45 text-white">
+                                                            <Loader2 className="w-5 h-5 animate-spin" />
+                                                            <span className="text-[11px] font-medium">转录中...</span>
+                                                        </div>
+                                                    )}
                                                 </div>
                                             ) : note.video ? (
                                                 <div className="relative w-full aspect-[3/4] bg-surface-secondary overflow-hidden flex items-center justify-center">
@@ -1600,6 +1628,12 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
                                                             <Play className="w-5 h-5 text-white ml-0.5" fill="white" />
                                                         </div>
                                                     </div>
+                                                    {isNoteTranscribing && (
+                                                        <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-2 bg-black/45 text-white">
+                                                            <Loader2 className="w-5 h-5 animate-spin" />
+                                                            <span className="text-[11px] font-medium">转录中...</span>
+                                                        </div>
+                                                    )}
                                                 </div>
                                             ) : (
                                                 <div
@@ -1638,6 +1672,12 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
                                                 )}
                                                 <div className="mt-2 flex items-center gap-2 text-[10px] text-text-tertiary flex-wrap">
                                                     <span>{new Date(note.createdAt).toLocaleDateString()}</span>
+                                                    {isNoteTranscribing && (
+                                                        <span className="flex items-center gap-1 text-blue-600">
+                                                            <Loader2 className="w-3 h-3 animate-spin" />
+                                                            转录中
+                                                        </span>
+                                                    )}
                                                     {item.kind !== 'link-article' && (
                                                         <span className="flex items-center gap-1">
                                                             <Heart className="w-3 h-3" />
@@ -1736,16 +1776,16 @@ export function Knowledge({ onNavigateToChat, isEmbedded = false, isActive = tru
                                 {selectedNote.video && !selectedNote.transcript && (
                                     <button
                                         onClick={() => handleTranscribeNote(selectedNote.id)}
-                                        disabled={isTranscribing}
+                                        disabled={isTranscribing || selectedNote.transcriptionStatus === 'processing'}
                                         className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-gradient-to-r from-blue-500 to-cyan-500 rounded-lg hover:from-blue-600 hover:to-cyan-600 transition-all shadow-sm disabled:opacity-60"
                                         title="提取文字"
                                     >
-                                        {isTranscribing ? (
+                                        {isTranscribing || selectedNote.transcriptionStatus === 'processing' ? (
                                             <RefreshCw className="w-3.5 h-3.5 animate-spin" />
                                         ) : (
                                             <FileText className="w-3.5 h-3.5" />
                                         )}
-                                        提取文字
+                                        {selectedNote.transcriptionStatus === 'processing' || isTranscribing ? '转录中...' : '提取文字'}
                                     </button>
                                 )}
                                 <button

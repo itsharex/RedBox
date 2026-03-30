@@ -5186,21 +5186,28 @@ ipcMain.handle('knowledge:transcribe', async (_event, noteId: string) => {
   const metaPath = path.join(noteDir, 'meta.json');
   try {
     const metaContent = await fs.readFile(metaPath, 'utf-8');
-    const meta = JSON.parse(metaContent) as { video?: string; transcript?: string; transcriptFile?: string };
+    const meta = JSON.parse(metaContent) as { video?: string; transcript?: string; transcriptFile?: string; transcriptionStatus?: 'processing' | 'completed' | 'failed' };
     if (!meta.video) {
       return { success: false, error: 'No video found' };
     }
     if (meta.transcript && meta.transcript.trim()) {
       return { success: true, transcript: meta.transcript };
     }
+    meta.transcriptionStatus = 'processing';
+    await fs.writeFile(metaPath, JSON.stringify(meta, null, 2));
+    win?.webContents.send('knowledge:note-updated', { noteId, hasTranscript: false, transcriptionStatus: 'processing' });
     const videoPath = path.join(noteDir, meta.video);
     const transcriptResult = await transcribeVideoToText(videoPath);
     const transcript = transcriptResult.text;
     if (!transcript) {
+      meta.transcriptionStatus = 'failed';
+      await fs.writeFile(metaPath, JSON.stringify(meta, null, 2));
+      win?.webContents.send('knowledge:note-updated', { noteId, hasTranscript: false, transcriptionStatus: 'failed' });
       return { success: false, error: transcriptResult.error || 'Transcription failed' };
     }
     meta.transcript = transcript;
     meta.transcriptFile = 'transcript.txt';
+    meta.transcriptionStatus = 'completed';
     await fs.writeFile(path.join(noteDir, meta.transcriptFile), transcript);
     await fs.writeFile(metaPath, JSON.stringify(meta, null, 2));
 
@@ -5212,7 +5219,7 @@ ipcMain.handle('knowledge:transcribe', async (_event, noteId: string) => {
       'user'
     ));
 
-    win?.webContents.send('knowledge:note-updated', { noteId, hasTranscript: true });
+    win?.webContents.send('knowledge:note-updated', { noteId, hasTranscript: true, transcriptionStatus: 'completed' });
     return { success: true, transcript };
   } catch (error) {
     console.error('Failed to transcribe note video:', error);
@@ -7181,6 +7188,7 @@ async function persistXhsNote(note: any): Promise<{ success: boolean; noteId?: s
       videoUrl?: string;
       transcript?: string;
       transcriptFile?: string;
+      transcriptionStatus?: 'processing' | 'completed' | 'failed';
       createdAt: string;
     } = {
       title: note?.title || '无标题',
@@ -7250,8 +7258,10 @@ async function persistXhsNote(note: any): Promise<{ success: boolean; noteId?: s
         await verifyVideoFileDecodable(videoPath);
         meta.video = videoName;
         meta.videoUrl = note.videoUrl;
+        meta.transcriptionStatus = 'processing';
       } catch (error) {
         console.error('Failed to download video:', error);
+        meta.transcriptionStatus = 'failed';
       }
     }
 
@@ -7270,6 +7280,7 @@ async function persistXhsNote(note: any): Promise<{ success: boolean; noteId?: s
         if (transcript) {
           meta.transcript = transcript;
           meta.transcriptFile = 'transcript.txt';
+          meta.transcriptionStatus = 'completed';
           await fs.writeFile(path.join(noteDir, meta.transcriptFile), transcript);
           await fs.writeFile(metaPath, JSON.stringify(meta, null, 2));
           indexManager.addToQueue(normalizeVideo(
@@ -7278,12 +7289,18 @@ async function persistXhsNote(note: any): Promise<{ success: boolean; noteId?: s
             transcript,
             'user'
           ));
-          win?.webContents.send('knowledge:note-updated', { noteId, hasTranscript: true });
+          win?.webContents.send('knowledge:note-updated', { noteId, hasTranscript: true, transcriptionStatus: 'completed' });
         } else if (transcriptResult.error) {
+          meta.transcriptionStatus = 'failed';
+          await fs.writeFile(metaPath, JSON.stringify(meta, null, 2));
           console.warn(`[Transcription] Skipped background transcript for ${noteId}: ${transcriptResult.error}`);
+          win?.webContents.send('knowledge:note-updated', { noteId, hasTranscript: false, transcriptionStatus: 'failed' });
         }
       })().catch((err) => {
         console.error('Failed to transcribe video:', err);
+        meta.transcriptionStatus = 'failed';
+        fs.writeFile(metaPath, JSON.stringify(meta, null, 2)).catch(() => {});
+        win?.webContents.send('knowledge:note-updated', { noteId, hasTranscript: false, transcriptionStatus: 'failed' });
       });
     }
 
