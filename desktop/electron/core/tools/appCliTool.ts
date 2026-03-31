@@ -120,6 +120,22 @@ interface GeneratedImageCliResult {
     }>;
 }
 
+const CONCURRENCY_SAFE_APP_CLI_ACTIONS = new Map<string, Set<string>>([
+    ['workspace', new Set(['list', 'show', 'get'])],
+    ['spaces', new Set(['list'])],
+    ['manuscripts', new Set(['list'])],
+    ['knowledge', new Set(['list', 'get', 'search'])],
+    ['advisors', new Set(['list', 'get', 'search'])],
+    ['memory', new Set(['list', 'get', 'search'])],
+    ['redclaw', new Set(['list', 'get', 'status'])],
+    ['media', new Set(['list', 'get', 'search'])],
+    ['subjects', new Set(['list', 'get', 'search'])],
+    ['mcp', new Set(['list', 'status', 'oauth-status'])],
+    ['settings', new Set(['get', 'show'])],
+    ['archives', new Set(['list', 'get'])],
+    ['wander', new Set(['list', 'get'])],
+]);
+
 function toPrettyJson(data: unknown): string {
     return JSON.stringify(data, null, 2);
 }
@@ -378,6 +394,15 @@ export class AppCliTool extends DeclarativeTool<typeof AppCliParamsSchema> {
 
     getDescription(params: AppCliParams): string {
         return `app_cli: ${params.command}`;
+    }
+
+    isConcurrencySafe(params: AppCliParams): boolean {
+        const parsed = parseCommand(params.command);
+        const allowedActions = CONCURRENCY_SAFE_APP_CLI_ACTIONS.get(parsed.namespace);
+        if (!allowedActions) {
+            return false;
+        }
+        return allowedActions.has(parsed.action);
     }
 
     async execute(params: AppCliParams): Promise<ToolResult> {

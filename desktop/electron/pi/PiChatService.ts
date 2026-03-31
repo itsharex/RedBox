@@ -35,6 +35,7 @@ import {
 } from '../core/toolRegistry';
 import { createBuiltinTools } from '../core/tools';
 import { createCompressionService } from '../core/compressionService';
+import { QueryRuntime } from '../core/queryRuntime';
 import { getLongTermMemoryPrompt } from '../core/fileMemoryStore';
 import { getRedClawProjectContextPrompt } from '../core/redclawStore';
 import { getMcpServers } from '../core/mcpStore';
@@ -50,6 +51,7 @@ import { normalizeApiBaseUrl, safeUrlJoin } from '../core/urlUtils';
 import { logDebugEvent } from '../core/debugLogger';
 import { loadPrompt, renderPrompt } from '../prompts/runtime';
 import { getAgentRuntime, getTaskGraphRuntime, type PreparedRuntimeExecution, type RuntimeMode } from '../core/ai';
+import type { RuntimeEvent } from '../core/runtimeTypes';
 
 interface SessionMetadata {
   associatedFilePath?: string;
@@ -629,38 +631,38 @@ export class PiChatService {
 
     try {
       this.emitDebugLog('info', 'agent:run:start');
-      let runResult = await this.runAgentAttempt({
-        model,
-        apiKey,
-        prompt: systemPrompt,
-        history,
-        userInput: content,
-        signal,
-        metadata,
-      });
-
-      const finalError = runResult.error || '';
-      if (finalError && !signal.aborted) {
-        console.error('[PiChatService] Agent completed with error state, falling back to direct completion:', finalError);
-        this.emitDebugLog('warn', 'agent:run:error-fallback', { error: finalError });
-        const fallbackResult = await this.runDirectCompletionFallback({
-          modelName,
-          baseURL,
+      const generatedImages: GeneratedImagePreview[] = [];
+      const runtime = new QueryRuntime(
+        this.toolRegistry,
+        this.toolExecutor,
+        {
+          onEvent: (event) => this.handleQueryRuntimeEvent(event, generatedImages),
+          onToolResult: (toolName, result, command) => {
+            this.maybeRegisterArtifactFromRuntimeToolResult(toolName, result, command);
+          },
+          summarizeToolResult: (_toolName, result) => {
+            const contentText = String(result.llmContent || result.display || result.error?.message || '');
+            if (contentText.length <= 22000) {
+              return contentText;
+            }
+            return `${contentText.slice(0, 22000)}\n\n[tool result truncated]`;
+          },
+        },
+        {
+          sessionId,
           apiKey,
+          baseURL,
+          model: modelName,
           systemPrompt,
-          history,
-          userInput: content,
+          messages: this.historyToRuntimeMessages(sessionId, content, metadata),
           signal,
-        });
-        if (!fallbackResult.error) {
-          this.emitDebugLog('info', 'fallback:completion:success', { responseLength: fallbackResult.response.length });
-          runResult = fallbackResult;
-        } else {
-          this.emitDebugLog('error', 'fallback:completion:failed', { error: fallbackResult.error });
-          runResult.error = `${finalError}\n\nFallback error: ${fallbackResult.error}`;
-        }
-      }
-
+          maxTurns: 24,
+          maxTimeMinutes: 12,
+          temperature: 0.6,
+          toolPack: 'redclaw',
+        },
+      );
+      const runResult = await runtime.run(content);
       const finalResultError = runResult.error || '';
       if (finalResultError) {
         console.error('[PiChatService] Chat failed after fallback:', finalResultError);
@@ -670,16 +672,16 @@ export class PiChatService {
         return;
       }
 
-      const fullResponse = runResult.response || '';
+      let fullResponse = runResult.response || '';
+      if (generatedImages.length > 0) {
+        fullResponse = this.appendGeneratedImagesMarkdown(fullResponse, generatedImages);
+      }
       if (fullResponse) {
         this.emitDebugLog('info', 'sendMessage:full-response', {
-          streamedChunks: runResult.streamedChunks,
+          streamedChunks: true,
           responseLength: fullResponse.length,
           responsePreview: fullResponse.slice(0, 160),
         });
-        if (!runResult.streamedChunks) {
-          this.sendToUI('chat:response-chunk', { content: fullResponse });
-        }
         this.setRuntimeState({ partialResponse: fullResponse });
         addChatMessage({
           id: `msg_${Date.now()}`,
@@ -690,22 +692,22 @@ export class PiChatService {
       } else {
         console.warn('[PiChatService] Empty assistant response', {
           sessionId,
-          streamedChunks: runResult.streamedChunks,
+          streamedChunks: true,
           historyCount: history.length,
         });
         this.emitDebugLog('warn', 'sendMessage:empty-response', {
-          streamedChunks: runResult.streamedChunks,
+          streamedChunks: true,
           historyCount: history.length,
         });
       }
 
       this.emitDebugLog('info', 'sendMessage:success', {
-        streamedChunks: runResult.streamedChunks,
+        streamedChunks: true,
         responseLength: fullResponse.length,
       });
       getAgentRuntime().completeExecution(preparedExecution.task.id, {
         responseLength: fullResponse.length,
-        streamedChunks: runResult.streamedChunks,
+        streamedChunks: true,
       });
       this.sendToUI('chat:response-end', { content: fullResponse });
     } catch (error: unknown) {
@@ -2163,6 +2165,17 @@ export class PiChatService {
     }));
   }
 
+  private historyToRuntimeMessages(
+    sessionId: string,
+    currentInput: string,
+    metadata?: SessionMetadata,
+  ): Array<{ role: 'user' | 'assistant'; content: string }> {
+    return this.historyToAgentMessages(sessionId, currentInput, metadata).map((message) => ({
+      role: message.role,
+      content: message.content.map((item) => item.text).join(''),
+    }));
+  }
+
   private estimateTokenCountFromText(text: string): number {
     return Math.ceil(text.length / 4);
   }
@@ -2319,6 +2332,103 @@ export class PiChatService {
       }
     }
     return '';
+  }
+
+  private handleQueryRuntimeEvent(
+    event: RuntimeEvent,
+    generatedImages: GeneratedImagePreview[],
+  ): void {
+    switch (event.type) {
+      case 'thinking':
+        this.sendToUI('chat:thought-delta', { content: event.content });
+        this.traceActiveExecution(`runtime.${event.phase}`, { content: event.content }, event.phase === 'tooling' ? 'execute_tools' : 'plan');
+        break;
+      case 'response_chunk':
+        this.setRuntimeState({ partialResponse: event.content });
+        this.sendToUI('chat:response-chunk', { content: event.content });
+        break;
+      case 'response_end':
+        this.setRuntimeState({ partialResponse: event.content });
+        break;
+      case 'tool_start':
+        this.emitDebugLog('info', 'runtime:tool:start', {
+          callId: event.callId,
+          name: event.name,
+          params: event.params,
+        });
+        this.sendToUI('chat:tool-start', {
+          callId: event.callId,
+          name: event.name,
+          input: event.params,
+          description: event.description,
+        });
+        this.traceActiveExecution('tool.start', {
+          callId: event.callId,
+          name: event.name,
+          args: event.params,
+        }, event.name === 'read_file' || event.name === 'grep' || event.name === 'web_search' ? 'retrieve' : 'execute_tools');
+        break;
+      case 'tool_output':
+        this.sendToUI('chat:tool-update', {
+          callId: event.callId,
+          name: event.name,
+          partial: event.chunk,
+        });
+        break;
+      case 'tool_end':
+        if (event.name === 'app_cli') {
+          const data = (event.result.data || null) as Record<string, unknown> | null;
+          if (data?.kind === 'generated-images' && Array.isArray(data.assets)) {
+            generatedImages.push(...this.extractGeneratedImagesFromToolResult({
+              details: event.result,
+            }));
+          }
+        }
+        this.sendToUI('chat:tool-end', {
+          callId: event.callId,
+          name: event.name,
+          output: {
+            success: event.result.success,
+            content: event.result.display || event.result.llmContent || event.result.error?.message || '',
+          },
+        });
+        this.traceActiveExecution('tool.end', {
+          callId: event.callId,
+          name: event.name,
+          success: event.result.success,
+          outputPreview: String(event.result.llmContent || '').slice(0, 400),
+        }, event.name === 'read_file' || event.name === 'grep' || event.name === 'web_search' ? 'retrieve' : 'execute_tools');
+        break;
+      case 'compact_start':
+        this.sendToUI('chat:thought-delta', { content: `上下文整理中（${event.strategy}）...` });
+        break;
+      case 'compact_end':
+        this.emitDebugLog('info', 'runtime:compact:end', event);
+        break;
+      case 'hook_start':
+      case 'hook_end':
+        this.emitDebugLog('info', `runtime:${event.type}`, event);
+        break;
+      case 'checkpoint':
+        this.traceActiveExecution('runtime.checkpoint', {
+          checkpointType: event.checkpointType,
+          summary: event.summary,
+        }, 'execute_tools');
+        break;
+      case 'error':
+        this.emitDebugLog('error', 'runtime:error', { message: event.message });
+        break;
+      case 'done':
+        this.emitDebugLog('info', 'runtime:done', { responseLength: event.response.length });
+        break;
+      case 'tool_summary':
+      case 'query_start':
+        break;
+    }
+  }
+
+  private maybeRegisterArtifactFromRuntimeToolResult(toolName: string, result: ToolResult, command?: string): void {
+    this.maybeRegisterArtifactFromToolResult(toolName, { details: result }, command);
   }
 
   private extractText(content: unknown): string {

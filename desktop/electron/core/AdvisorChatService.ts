@@ -8,12 +8,10 @@
  */
 
 import { EventEmitter } from 'events';
-import { Agent, type AgentEvent, type AgentTool } from '@mariozechner/pi-agent-core';
 import { getModel, type Model } from '@mariozechner/pi-ai';
 import {
     ToolRegistry,
     ToolExecutor,
-    type ToolCallRequest,
     ToolConfirmationOutcome,
     type ToolResult,
 } from './toolRegistry';
@@ -21,9 +19,10 @@ import { CalculatorTool } from './tools/calculatorTool';
 import { WriteFileTool } from './tools/writeFileTool';
 import { EditTool } from './tools/editTool';
 import { embeddingService } from './vector/EmbeddingService';
-import { getSettings, searchVectors } from '../db';
+import { createChatSession, getChatSession, getSettings, searchVectors } from '../db';
 import { resolveChatMaxTokens } from './chatTokenConfig';
 import { normalizeApiBaseUrl } from './urlUtils';
+import { QueryRuntime } from './queryRuntime';
 
 // ========== Types ==========
 
@@ -82,23 +81,6 @@ interface ChatHistoryMessage {
     content: string;
 }
 
-interface AgentTextContent {
-    type: 'text';
-    text: string;
-}
-
-interface AssistantToolCallContent {
-    type: 'toolCall';
-    id: string;
-    name: string;
-    arguments: Record<string, unknown>;
-}
-
-interface AssistantMessageLike {
-    role: string;
-    content?: Array<AgentTextContent | AssistantToolCallContent | { type: string; [k: string]: unknown }>;
-}
-
 // ========== AdvisorChatService Class ==========
 
 /**
@@ -109,7 +91,6 @@ export class AdvisorChatService extends EventEmitter {
     private toolRegistry: ToolRegistry;
     private toolExecutor: ToolExecutor;
     private abortController: AbortController | null = null;
-    private agent: Agent | null = null;
 
     constructor(config: AdvisorChatConfig) {
         super();
@@ -176,9 +157,6 @@ export class AdvisorChatService extends EventEmitter {
     cancel(): void {
         if (this.abortController) {
             this.abortController.abort();
-        }
-        if (this.agent) {
-            this.agent.abort();
         }
     }
 
@@ -351,110 +329,11 @@ ${ragContext.context}
         }
     }
 
-    private createAgentTools(signal: AbortSignal): AgentTool[] {
-        const schemaMap = new Map<string, unknown>();
-        for (const schema of this.toolRegistry.getToolSchemas()) {
-            schemaMap.set(schema.function.name, schema.function.parameters);
-        }
-
-        return this.toolRegistry.getAllTools().map((tool) => ({
-            name: tool.name,
-            label: tool.displayName || tool.name,
-            description: tool.description,
-            parameters: (schemaMap.get(tool.name) || {
-                type: 'object',
-                properties: {},
-                additionalProperties: false,
-            }) as any,
-            execute: async (toolCallId: string, params: Record<string, unknown>) => {
-                const request: ToolCallRequest = {
-                    callId: toolCallId,
-                    name: tool.name,
-                    params,
-                };
-                const response = await this.toolExecutor.execute(request, signal);
-                return this.toolResultToAgentResult(response.result);
-            },
-        })) as AgentTool[];
-    }
-
-    private toolResultToAgentResult(result: ToolResult) {
-        const text = result.display || result.llmContent || '';
-        return {
-            content: [{ type: 'text' as const, text }],
-            details: result,
-        };
-    }
-
-    private historyToAgentMessages(history: ChatHistoryMessage[]) {
+    private historyToRuntimeMessages(history: ChatHistoryMessage[]) {
         return history.slice(-10).map((msg) => ({
             role: msg.role,
-            content: [{ type: 'text', text: msg.content }],
-            timestamp: Date.now(),
-        })) as any[];
-    }
-
-    private normalizeStreamingTextDelta(rawDelta: string, currentResponse: string): string {
-        const delta = typeof rawDelta === 'string' ? rawDelta : '';
-        if (!delta) return '';
-        if (!currentResponse) return delta;
-
-        // Some providers emit cumulative text instead of strict delta chunks.
-        if (delta.startsWith(currentResponse)) {
-            return delta.slice(currentResponse.length);
-        }
-
-        const maxOverlap = Math.min(currentResponse.length, delta.length);
-        for (let overlap = maxOverlap; overlap >= 4; overlap -= 1) {
-            if (currentResponse.endsWith(delta.slice(0, overlap))) {
-                return delta.slice(overlap);
-            }
-        }
-
-        return delta;
-    }
-
-    private extractTextFromUnknownContent(content: unknown): string {
-        if (!content) return '';
-        if (typeof content === 'string') return content;
-
-        if (Array.isArray(content)) {
-            return content
-                .map((item) => {
-                    if (!item || typeof item !== 'object') return '';
-                    const value = item as Record<string, unknown>;
-                    if (typeof value.text === 'string') return value.text;
-                    if (typeof value.content === 'string') return value.content;
-                    if (typeof value.delta === 'string') return value.delta;
-                    return '';
-                })
-                .join('');
-        }
-
-        if (typeof content === 'object') {
-            const value = content as Record<string, unknown>;
-            if (typeof value.text === 'string') return value.text;
-            if (typeof value.content === 'string') return value.content;
-            if (typeof value.delta === 'string') return value.delta;
-        }
-
-        return String(content);
-    }
-
-    private getLastAssistantTextFromState(): string {
-        const stateMessages = (this.agent?.state?.messages || []) as unknown[];
-        for (let i = stateMessages.length - 1; i >= 0; i -= 1) {
-            const msg = stateMessages[i] as { role?: string; content?: unknown };
-            if (msg?.role !== 'assistant') continue;
-            const text = this.extractTextFromUnknownContent(msg.content);
-            if (text) return text;
-        }
-        return '';
-    }
-
-    private extractTextFromAssistantMessage(message: AssistantMessageLike | null | undefined): string {
-        if (!message || !Array.isArray(message.content)) return '';
-        return this.extractTextFromUnknownContent(message.content);
+            content: msg.content,
+        })) as Array<{ role: 'user' | 'assistant'; content: string }>;
     }
 
     /**
@@ -466,116 +345,84 @@ ${ragContext.context}
         systemPrompt: string,
         signal: AbortSignal
     ): Promise<string> {
+        const sessionId = `advisor_${this.config.advisorId}_${Date.now()}`;
+        if (!getChatSession(sessionId)) {
+            createChatSession(sessionId, `Advisor ${this.config.advisorName}`, {
+                contextType: 'advisor-discussion',
+                contextId: this.config.advisorId,
+            });
+        }
         let fullResponse = '';
-        let emittedEnd = false;
 
-        this.agent = new Agent({
-            initialState: {
-                model: this.createModelWithBaseUrl(),
-                thinkingLevel: 'low',
+        const runtime = new QueryRuntime(
+            this.toolRegistry,
+            this.toolExecutor,
+            {
+                onEvent: (event) => {
+                    switch (event.type) {
+                        case 'thinking':
+                            this.emitEvent({
+                                type: 'thinking_chunk',
+                                content: event.content,
+                            });
+                            break;
+                        case 'tool_start':
+                            this.emitEvent({
+                                type: 'tool_start',
+                                tool: { name: event.name, params: event.params },
+                            });
+                            break;
+                        case 'tool_end':
+                            this.emitEvent({
+                                type: 'tool_end',
+                                tool: {
+                                    name: event.name,
+                                    result: {
+                                        success: event.result.success,
+                                        content: event.result.display || event.result.llmContent || '',
+                                    },
+                                },
+                            });
+                            break;
+                        case 'response_chunk':
+                            fullResponse = event.content;
+                            this.emitEvent({ type: 'response_chunk', content: event.content });
+                            break;
+                        case 'response_end':
+                            fullResponse = event.content;
+                            this.emitEvent({ type: 'response_end', content: event.content });
+                            break;
+                        case 'error':
+                            this.emitEvent({ type: 'error', content: event.message });
+                            break;
+                        case 'done':
+                            this.emitEvent({ type: 'done' });
+                            break;
+                        default:
+                            break;
+                    }
+                },
             },
-            getApiKey: async () => this.config.apiKey,
-        });
-        this.agent.setSystemPrompt(systemPrompt);
-        this.agent.setTools(this.createAgentTools(signal));
-        this.agent.replaceMessages(this.historyToAgentMessages(history));
+            {
+                sessionId,
+                apiKey: this.config.apiKey,
+                baseURL: this.config.baseURL,
+                model: this.config.model,
+                systemPrompt,
+                messages: this.historyToRuntimeMessages(history),
+                signal,
+                maxTurns: this.config.maxTurns || 8,
+                maxTimeMinutes: 6,
+                temperature: this.config.temperature ?? 0.7,
+                toolPack: 'chatroom',
+            },
+        );
 
-        const unsubscribe = this.agent.subscribe((event: AgentEvent) => {
-            if (signal.aborted) return;
-
-            switch (event.type) {
-                case 'message_update':
-                    if (event.assistantMessageEvent.type === 'text_delta') {
-                        const rawDelta = event.assistantMessageEvent.delta || '';
-                        const normalizedDelta = this.normalizeStreamingTextDelta(rawDelta, fullResponse);
-                        if (!normalizedDelta) break;
-                        fullResponse += normalizedDelta;
-                        this.emitEvent({ type: 'response_chunk', content: normalizedDelta });
-                    }
-                    break;
-
-                case 'message_end': {
-                    const msg = event.message as AssistantMessageLike;
-                    if (msg.role === 'assistant') {
-                        const text = this.extractTextFromAssistantMessage(msg);
-                        if (!text) break;
-
-                        if (!fullResponse) {
-                            fullResponse = text;
-                            this.emitEvent({ type: 'response_chunk', content: text });
-                        } else if (text.startsWith(fullResponse)) {
-                            const tail = text.slice(fullResponse.length);
-                            if (tail) {
-                                fullResponse = text;
-                                this.emitEvent({ type: 'response_chunk', content: tail });
-                            }
-                        }
-                    }
-                    break;
-                }
-
-                case 'tool_execution_start':
-                    this.emitEvent({
-                        type: 'tool_start',
-                        tool: { name: event.toolName, params: event.args },
-                    });
-                    break;
-
-                case 'tool_execution_end': {
-                    const result = event.result as ToolResult | undefined;
-                    const content = result?.display || result?.llmContent || '';
-                    this.emitEvent({
-                        type: 'tool_end',
-                        tool: {
-                            name: event.toolName,
-                            result: {
-                                success: !event.isError,
-                                content,
-                            },
-                        },
-                    });
-                    break;
-                }
-
-                case 'agent_end':
-                    if (!emittedEnd) {
-                        this.emitEvent({ type: 'response_end', content: fullResponse });
-                        emittedEnd = true;
-                    }
-                    break;
-            }
-        });
-
-        try {
-            await this.agent.prompt(message);
-            await this.agent.waitForIdle();
-
-            if (!fullResponse) {
-                const fallbackText = this.getLastAssistantTextFromState();
-                if (fallbackText) {
-                    console.warn('[AdvisorChatService] Recovered response from final agent state', {
-                        advisorId: this.config.advisorId,
-                        advisorName: this.config.advisorName,
-                        length: fallbackText.length,
-                    });
-                    fullResponse = fallbackText;
-                    this.emitEvent({ type: 'response_chunk', content: fallbackText });
-                } else {
-                    console.warn('[AdvisorChatService] Empty assistant response', {
-                        advisorId: this.config.advisorId,
-                        advisorName: this.config.advisorName,
-                        historyCount: history.length,
-                    });
-                }
-            }
-        } finally {
-            unsubscribe();
+        const result = await runtime.run(message);
+        if (result.error) {
+            throw new Error(result.error);
         }
-
-        if (!emittedEnd) {
-            this.emitEvent({ type: 'response_end', content: fullResponse });
-        }
-
+        fullResponse = result.response || fullResponse;
         return fullResponse;
     }
 

@@ -68,6 +68,10 @@ export class ListDirTool extends DeclarativeTool<typeof ListDirParamsSchema> {
         return `List directory: ${params.path || Instance.directory}`;
     }
 
+    isConcurrencySafe(_params: ListDirParams): boolean {
+        return true;
+    }
+
     async execute(params: ListDirParams, signal: AbortSignal): Promise<ToolResult> {
         if (signal.aborted) {
             return createErrorResult('List cancelled', ToolErrorType.CANCELLED);

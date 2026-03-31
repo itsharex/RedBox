@@ -107,6 +107,8 @@ export interface ToolDefinition<TParams = unknown, TResult extends ToolResult = 
     requiresConfirmation: boolean;
     /** 是否支持流式输出 */
     canStreamOutput?: boolean;
+    /** 给运行时做并发编排用。默认 false，工具可自行声明只读并发安全。 */
+    isConcurrencySafe?(params: TParams): boolean;
 
     /**
      * 验证参数
@@ -178,6 +180,10 @@ export abstract class DeclarativeTool<TParams extends z.ZodType<any, any>, TResu
 
     readonly requiresConfirmation: boolean = false;
     readonly canStreamOutput: boolean = false;
+
+    isConcurrencySafe(_params: z.infer<TParams>): boolean {
+        return false;
+    }
 
     /**
      * 验证参数

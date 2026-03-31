@@ -44,6 +44,25 @@ contextBridge.exposeInMainWorld('ipcRenderer', {
     getRecent: (limit?: number) => ipcRenderer.invoke('debug:get-recent', { limit }),
     openLogDir: () => ipcRenderer.invoke('debug:open-log-dir'),
   },
+  sessions: {
+    list: () => ipcRenderer.invoke('sessions:list'),
+    get: (sessionId: string) => ipcRenderer.invoke('sessions:get', { sessionId }),
+    resume: (sessionId: string) => ipcRenderer.invoke('sessions:resume', { sessionId }),
+    fork: (sessionId: string) => ipcRenderer.invoke('sessions:fork', { sessionId }),
+    getTranscript: (sessionId: string, limit?: number) => ipcRenderer.invoke('sessions:get-transcript', { sessionId, limit }),
+  },
+  runtime: {
+    query: (payload: { sessionId?: string; message: string; modelConfig?: unknown }) => ipcRenderer.invoke('runtime:query', payload),
+    resume: (payload: { sessionId: string }) => ipcRenderer.invoke('runtime:resume', payload),
+    forkSession: (payload: { sessionId: string }) => ipcRenderer.invoke('runtime:fork-session', payload),
+    getTrace: (payload: { sessionId: string; limit?: number }) => ipcRenderer.invoke('runtime:get-trace', payload),
+    getCheckpoints: (payload: { sessionId: string; limit?: number }) => ipcRenderer.invoke('runtime:get-checkpoints', payload),
+  },
+  toolHooks: {
+    list: () => ipcRenderer.invoke('tools:hooks:list'),
+    register: (hook: unknown) => ipcRenderer.invoke('tools:hooks:register', hook),
+    remove: (hookId: string) => ipcRenderer.invoke('tools:hooks:remove', { hookId }),
+  },
   tasks: {
     create: (payload?: { runtimeMode?: string; sessionId?: string; userInput?: string; metadata?: Record<string, unknown> }) => ipcRenderer.invoke('tasks:create', payload || {}),
     list: (payload?: { status?: string; ownerSessionId?: string; limit?: number }) => ipcRenderer.invoke('tasks:list', payload || {}),

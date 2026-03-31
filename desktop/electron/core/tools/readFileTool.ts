@@ -43,6 +43,10 @@ export class ReadFileTool extends DeclarativeTool<typeof ReadFileParamsSchema> {
         return `Read file: ${params.filePath}${range}`;
     }
 
+    isConcurrencySafe(_params: ReadFileParams): boolean {
+        return true;
+    }
+
     async execute(params: ReadFileParams, signal: AbortSignal): Promise<ToolResult> {
         if (signal.aborted) {
             return createErrorResult('Read cancelled', ToolErrorType.CANCELLED);

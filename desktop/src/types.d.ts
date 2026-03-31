@@ -105,6 +105,25 @@ export interface AgentTaskTrace {
   createdAt: number;
 }
 
+export interface SessionRuntimeRecord {
+  id: number;
+  sessionId: string;
+  recordType: string;
+  role: string;
+  content: string;
+  payload?: unknown;
+  createdAt: number;
+}
+
+export interface SessionCheckpointRecord {
+  id: string;
+  sessionId: string;
+  checkpointType: string;
+  summary: string;
+  payload?: unknown;
+  createdAt: number;
+}
+
 export interface RoleSpec {
   roleId: string;
   purpose: string;
@@ -167,6 +186,37 @@ declare global {
         getStatus: () => Promise<{ enabled: boolean; logDirectory: string }>;
         getRecent: (limit?: number) => Promise<{ lines: string[] }>;
         openLogDir: () => Promise<{ success: boolean; error?: string; path: string }>;
+      };
+      sessions: {
+        list: () => Promise<Array<{
+          id: string;
+          transcriptCount: number;
+          checkpointCount: number;
+          chatSession?: { id: string; title?: string; updatedAt?: string } | null;
+        }>>;
+        get: (sessionId: string) => Promise<{
+          chatSession?: { id: string; title?: string; updatedAt?: string } | null;
+          transcript?: SessionRuntimeRecord[];
+          checkpoints?: SessionCheckpointRecord[];
+        } | null>;
+        resume: (sessionId: string) => Promise<{
+          chatSession?: { id: string; title?: string; updatedAt?: string } | null;
+          lastCheckpoint?: SessionCheckpointRecord | null;
+        } | null>;
+        fork: (sessionId: string) => Promise<{ success: boolean; session?: { id: string; transcriptCount: number; checkpointCount: number }; error?: string }>;
+        getTranscript: (sessionId: string, limit?: number) => Promise<SessionRuntimeRecord[]>;
+      };
+      runtime: {
+        query: (payload: { sessionId?: string; message: string; modelConfig?: unknown }) => Promise<{ success: boolean; sessionId: string; response?: string; error?: string }>;
+        resume: (payload: { sessionId: string }) => Promise<{ success: boolean; sessionId: string }>;
+        forkSession: (payload: { sessionId: string }) => Promise<{ success: boolean; sessionId?: string; forkedSessionId?: string }>;
+        getTrace: (payload: { sessionId: string; limit?: number }) => Promise<SessionRuntimeRecord[]>;
+        getCheckpoints: (payload: { sessionId: string; limit?: number }) => Promise<SessionCheckpointRecord[]>;
+      };
+      toolHooks: {
+        list: () => Promise<unknown[]>;
+        register: (hook: unknown) => Promise<{ success: boolean; hookId: string }>;
+        remove: (hookId: string) => Promise<{ success: boolean }>;
       };
       tasks: {
         create: (payload?: { runtimeMode?: string; sessionId?: string; userInput?: string; metadata?: Record<string, unknown> }) => Promise<AgentTaskSnapshot>;

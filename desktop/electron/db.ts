@@ -140,6 +140,33 @@ const initDb = () => {
     CREATE INDEX IF NOT EXISTS idx_chat_messages_timestamp
       ON chat_messages(timestamp);
 
+    CREATE TABLE IF NOT EXISTS session_transcript_records (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      record_type TEXT NOT NULL,
+      role TEXT,
+      content TEXT,
+      payload_json TEXT,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_session_transcript_records_session
+      ON session_transcript_records(session_id, created_at ASC);
+
+    CREATE TABLE IF NOT EXISTS session_checkpoints (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      checkpoint_type TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      payload_json TEXT,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_session_checkpoints_session
+      ON session_checkpoints(session_id, created_at DESC);
+
     CREATE TABLE IF NOT EXISTS knowledge_vectors (
       id TEXT PRIMARY KEY,
       source_id TEXT NOT NULL,
@@ -1050,7 +1077,28 @@ export interface ChatMessage {
   content: string;
   tool_calls?: string;
   tool_call_id?: string;
+  display_content?: string;
+  attachment?: string;
   timestamp: number;
+}
+
+export interface SessionTranscriptRecord {
+  id: string;
+  session_id: string;
+  record_type: string;
+  role?: string | null;
+  content?: string | null;
+  payload_json?: string | null;
+  created_at: number;
+}
+
+export interface SessionCheckpointRecord {
+  id: string;
+  session_id: string;
+  checkpoint_type: string;
+  summary: string;
+  payload_json?: string | null;
+  created_at: number;
 }
 
 export type AgentTaskStatus = 'pending' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled';
@@ -1482,6 +1530,135 @@ export const getChatMessages = (sessionId: string): ChatMessage[] => {
 export const clearChatMessages = (sessionId: string): void => {
   const stmt = db.prepare('DELETE FROM chat_messages WHERE session_id = ?');
   stmt.run(sessionId);
+};
+
+export const addSessionTranscriptRecord = (record: Omit<SessionTranscriptRecord, 'created_at'> & { created_at?: number }): SessionTranscriptRecord => {
+  const createdAt = record.created_at ?? Date.now();
+  db.prepare(`
+    INSERT INTO session_transcript_records (id, session_id, record_type, role, content, payload_json, created_at)
+    VALUES (@id, @session_id, @record_type, @role, @content, @payload_json, @created_at)
+  `).run({
+    id: record.id,
+    session_id: record.session_id,
+    record_type: record.record_type,
+    role: record.role ?? null,
+    content: record.content ?? null,
+    payload_json: record.payload_json ?? null,
+    created_at: createdAt,
+  });
+  return {
+    id: record.id,
+    session_id: record.session_id,
+    record_type: record.record_type,
+    role: record.role ?? null,
+    content: record.content ?? null,
+    payload_json: record.payload_json ?? null,
+    created_at: createdAt,
+  };
+};
+
+export const listSessionTranscriptRecords = (sessionId: string, limit?: number): SessionTranscriptRecord[] => {
+  if (limit && limit > 0) {
+    return db.prepare(`
+      SELECT * FROM session_transcript_records
+      WHERE session_id = ?
+      ORDER BY created_at ASC
+      LIMIT ?
+    `).all(sessionId, Math.floor(limit)) as SessionTranscriptRecord[];
+  }
+  return db.prepare(`
+    SELECT * FROM session_transcript_records
+    WHERE session_id = ?
+    ORDER BY created_at ASC
+  `).all(sessionId) as SessionTranscriptRecord[];
+};
+
+export const addSessionCheckpoint = (record: Omit<SessionCheckpointRecord, 'created_at'> & { created_at?: number }): SessionCheckpointRecord => {
+  const createdAt = record.created_at ?? Date.now();
+  db.prepare(`
+    INSERT INTO session_checkpoints (id, session_id, checkpoint_type, summary, payload_json, created_at)
+    VALUES (@id, @session_id, @checkpoint_type, @summary, @payload_json, @created_at)
+  `).run({
+    id: record.id,
+    session_id: record.session_id,
+    checkpoint_type: record.checkpoint_type,
+    summary: record.summary,
+    payload_json: record.payload_json ?? null,
+    created_at: createdAt,
+  });
+  return {
+    id: record.id,
+    session_id: record.session_id,
+    checkpoint_type: record.checkpoint_type,
+    summary: record.summary,
+    payload_json: record.payload_json ?? null,
+    created_at: createdAt,
+  };
+};
+
+export const listSessionCheckpoints = (sessionId: string, limit?: number): SessionCheckpointRecord[] => {
+  if (limit && limit > 0) {
+    return db.prepare(`
+      SELECT * FROM session_checkpoints
+      WHERE session_id = ?
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(sessionId, Math.floor(limit)) as SessionCheckpointRecord[];
+  }
+  return db.prepare(`
+    SELECT * FROM session_checkpoints
+    WHERE session_id = ?
+    ORDER BY created_at DESC
+  `).all(sessionId) as SessionCheckpointRecord[];
+};
+
+export const cloneChatSession = (sourceSessionId: string, nextSessionId: string, title?: string): ChatSession => {
+  const source = getChatSession(sourceSessionId);
+  if (!source) {
+    throw new Error(`Source chat session not found: ${sourceSessionId}`);
+  }
+
+  const parsedMetadata = source.metadata ? safeJsonParse(source.metadata, {} as Record<string, unknown>) : {};
+  const cloned = createChatSession(nextSessionId, title || source.title, parsedMetadata);
+  const messages = getChatMessages(sourceSessionId);
+  const transcript = listSessionTranscriptRecords(sourceSessionId);
+  const checkpoints = listSessionCheckpoints(sourceSessionId);
+
+  for (const message of messages) {
+    addChatMessage({
+      id: `${message.id}_fork_${Math.random().toString(36).slice(2, 8)}`,
+      session_id: nextSessionId,
+      role: message.role,
+      content: message.content,
+      tool_calls: message.tool_calls,
+      tool_call_id: message.tool_call_id,
+      display_content: message.display_content,
+      attachment: message.attachment,
+    });
+  }
+
+  for (const item of transcript) {
+    addSessionTranscriptRecord({
+      id: `${item.id}_fork_${Math.random().toString(36).slice(2, 8)}`,
+      session_id: nextSessionId,
+      record_type: item.record_type,
+      role: item.role ?? undefined,
+      content: item.content ?? undefined,
+      payload_json: item.payload_json ?? undefined,
+    });
+  }
+
+  for (const checkpoint of checkpoints) {
+    addSessionCheckpoint({
+      id: `${checkpoint.id}_fork_${Math.random().toString(36).slice(2, 8)}`,
+      session_id: nextSessionId,
+      checkpoint_type: checkpoint.checkpoint_type,
+      summary: checkpoint.summary,
+      payload_json: checkpoint.payload_json ?? undefined,
+    });
+  }
+
+  return cloned;
 };
 
 // ========== Manuscript Embedding Cache ==========

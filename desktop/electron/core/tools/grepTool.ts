@@ -42,6 +42,10 @@ export class GrepTool extends DeclarativeTool<typeof GrepToolParamsSchema> {
         return `Grep "${params.pattern}" in ${params.path || '.'}`;
     }
 
+    isConcurrencySafe(_params: GrepToolParams): boolean {
+        return true;
+    }
+
     async execute(params: GrepToolParams, signal: AbortSignal): Promise<ToolResult> {
         try {
             if (!this.rgPath) {

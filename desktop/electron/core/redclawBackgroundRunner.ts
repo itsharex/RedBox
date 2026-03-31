@@ -14,6 +14,8 @@ import { getRedClawProject, listRedClawProjects } from './redclawStore';
 import { PiChatService } from '../pi/PiChatService';
 import { getTaskGraphRuntime } from './ai/taskGraphRuntime';
 import type { IntentRoute, RoleId, RuntimeMode } from './ai/types';
+import { nextCronRunMs } from './backgroundCron';
+import { findMissedScheduledTasks } from './backgroundScheduledTasks';
 
 type RunResult = 'success' | 'error' | 'skipped';
 type ScheduleMode = 'interval' | 'daily' | 'weekly' | 'once';
@@ -205,6 +207,25 @@ function parseTimeHHmm(value?: string): { hour: number; minute: number } | null 
 
 function nextIsoFromMinutes(baseMs: number, minutes: number): string {
   return new Date(baseMs + minutes * 60 * 1000).toISOString();
+}
+
+function buildCronExpressionForScheduledTask(task: RedClawScheduledTask): string | null {
+  const time = parseTimeHHmm(task.time);
+  if (!time) return null;
+  const minute = String(time.minute);
+  const hour = String(time.hour);
+
+  if (task.mode === 'daily') {
+    return `${minute} ${hour} * * *`;
+  }
+
+  if (task.mode === 'weekly') {
+    const weekdays = sanitizeWeekdays(task.weekdays);
+    const days = weekdays.length > 0 ? weekdays : [1];
+    return `${minute} ${hour} * * ${days.join(',')}`;
+  }
+
+  return null;
 }
 
 function generateTaskId(prefix: string): string {
@@ -437,33 +458,10 @@ function computeNextRunForScheduledTask(task: RedClawScheduledTask, referenceMs:
     if (runAtMs === null) return null;
     return new Date(runAtMs).toISOString();
   }
-
-  const time = parseTimeHHmm(task.time);
-  if (!time) return null;
-
-  const now = new Date(referenceMs);
-
-  if (mode === 'daily') {
-    const candidate = new Date(referenceMs);
-    candidate.setHours(time.hour, time.minute, 0, 0);
-    if (candidate.getTime() <= referenceMs) {
-      candidate.setDate(candidate.getDate() + 1);
-    }
-    return candidate.toISOString();
-  }
-
-  const weekdays = sanitizeWeekdays(task.weekdays);
-  const days = weekdays.length > 0 ? weekdays : [1];
-  for (let offset = 0; offset <= 7; offset += 1) {
-    const candidate = new Date(now);
-    candidate.setDate(now.getDate() + offset);
-    candidate.setHours(time.hour, time.minute, 0, 0);
-    if (!days.includes(candidate.getDay())) continue;
-    if (candidate.getTime() <= referenceMs) continue;
-    return candidate.toISOString();
-  }
-
-  return null;
+  const cronExpr = buildCronExpressionForScheduledTask(task);
+  if (!cronExpr) return null;
+  const nextMs = nextCronRunMs(cronExpr, referenceMs);
+  return nextMs === null ? null : new Date(nextMs).toISOString();
 }
 
 function ensureScheduledTaskNextRun(task: RedClawScheduledTask, nowMs: number): void {
@@ -536,6 +534,7 @@ export class RedClawBackgroundRunner extends EventEmitter {
   private maintenanceTimer: NodeJS.Timeout | null = null;
   private currentProjectId: string | null = null;
   private currentAutomationTaskId: string | null = null;
+  private readonly pendingCatchUpTaskIds = new Set<string>();
   private lastTickAt: string | null = null;
   private nextTickAt: string | null = null;
   private nextMaintenanceAt: string | null = null;
@@ -619,6 +618,13 @@ export class RedClawBackgroundRunner extends EventEmitter {
     }
   }
 
+  private refreshCatchUpQueue(nowMs: number): void {
+    const missed = findMissedScheduledTasks(Object.values(this.config.scheduledTasks), nowMs);
+    for (const task of missed) {
+      this.pendingCatchUpTaskIds.add(task.id);
+    }
+  }
+
   private async loadConfig(): Promise<void> {
     const configPath = this.getConfigPath();
     try {
@@ -631,6 +637,7 @@ export class RedClawBackgroundRunner extends EventEmitter {
     }
 
     this.normalizeSchedules(Date.now());
+    this.refreshCatchUpQueue(Date.now());
     this.isLoaded = true;
     this.emitStatus();
   }
@@ -701,6 +708,7 @@ export class RedClawBackgroundRunner extends EventEmitter {
   async reloadForWorkspaceChange(): Promise<void> {
     await this.stop({ persist: false });
     this.isLoaded = false;
+    this.pendingCatchUpTaskIds.clear();
     await this.ensureLoaded();
     if (this.config.enabled) {
       this.scheduleNextTick();
@@ -887,6 +895,7 @@ export class RedClawBackgroundRunner extends EventEmitter {
     }
 
     ensureScheduledTaskNextRun(task, Date.now());
+    this.pendingCatchUpTaskIds.delete(task.id);
     this.config.scheduledTasks[task.id] = task;
     await this.persistConfig();
     this.emitStatus();
@@ -972,6 +981,7 @@ export class RedClawBackgroundRunner extends EventEmitter {
     current.updatedAt = nowIso();
     current.nextRunAt = undefined;
     ensureScheduledTaskNextRun(current, Date.now());
+    this.pendingCatchUpTaskIds.delete(current.id);
 
     await this.persistConfig();
     this.emitStatus();
@@ -983,6 +993,7 @@ export class RedClawBackgroundRunner extends EventEmitter {
     const id = String(taskId || '').trim();
     if (!id) throw new Error('taskId is required');
     delete this.config.scheduledTasks[id];
+    this.pendingCatchUpTaskIds.delete(id);
     await this.persistConfig();
     this.emitStatus();
     return this.getStatus();
@@ -998,6 +1009,9 @@ export class RedClawBackgroundRunner extends EventEmitter {
     task.updatedAt = nowIso();
     if (task.enabled) {
       ensureScheduledTaskNextRun(task, Date.now());
+      this.refreshCatchUpQueue(Date.now());
+    } else {
+      this.pendingCatchUpTaskIds.delete(task.id);
     }
     await this.persistConfig();
     this.emitStatus();
@@ -1463,6 +1477,7 @@ export class RedClawBackgroundRunner extends EventEmitter {
     try {
       if (!task.enabled) {
         task.lastResult = 'skipped';
+        this.pendingCatchUpTaskIds.delete(task.id);
         return;
       }
 
@@ -1497,6 +1512,7 @@ export class RedClawBackgroundRunner extends EventEmitter {
       task.updatedAt = nowIso();
       runtime.completeNode(runtimeTaskId, 'execute_tools', '定时任务执行完成');
       runtime.completeTask(runtimeTaskId, `scheduled:${task.id}:success`);
+      this.pendingCatchUpTaskIds.delete(task.id);
       this.emit('log', { level: 'info', message: `Scheduled task completed: ${task.id}`, reason, at: nowIso() });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -1508,6 +1524,7 @@ export class RedClawBackgroundRunner extends EventEmitter {
         task.nextRunAt = computeNextRunForScheduledTask(task, Date.now()) || undefined;
       }
       this.lastError = message;
+      this.pendingCatchUpTaskIds.delete(task.id);
       runtime.failTask(runtimeTaskId, message, 'execute_tools');
       this.emit('log', { level: 'error', message: `Scheduled task failed: ${task.id}: ${message}`, reason, at: nowIso() });
     } finally {
@@ -1785,13 +1802,30 @@ export class RedClawBackgroundRunner extends EventEmitter {
     try {
       const nowMs = Date.now();
       this.normalizeSchedules(nowMs);
+      this.refreshCatchUpQueue(nowMs);
 
       const dueScheduled = Object.values(this.config.scheduledTasks)
         .filter((task) => {
           ensureScheduledTaskNextRun(task, nowMs);
           return isScheduledTaskDue(task, nowMs);
         })
-        .sort((a, b) => (parseIsoMs(a.nextRunAt || '') || 0) - (parseIsoMs(b.nextRunAt || '') || 0));
+        .sort((a, b) => {
+          const aCatchUp = this.pendingCatchUpTaskIds.has(a.id) ? 0 : 1;
+          const bCatchUp = this.pendingCatchUpTaskIds.has(b.id) ? 0 : 1;
+          if (aCatchUp !== bCatchUp) return aCatchUp - bCatchUp;
+          return (parseIsoMs(a.nextRunAt || '') || 0) - (parseIsoMs(b.nextRunAt || '') || 0);
+        });
+
+      for (const task of dueScheduled) {
+        if (this.pendingCatchUpTaskIds.has(task.id)) {
+          this.emit('log', {
+            level: 'info',
+            message: `Scheduled task catch-up queued: ${task.id}`,
+            reason,
+            at: nowIso(),
+          });
+        }
+      }
 
       const dueLongCycle = Object.values(this.config.longCycleTasks)
         .filter((task) => {

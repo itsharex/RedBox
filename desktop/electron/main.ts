@@ -36,6 +36,8 @@ import {
   clearChatMessages,
   updateChatSessionTitle,
   getChatSessionByContext,
+  listSessionTranscriptRecords,
+  listSessionCheckpoints,
   getDocumentKnowledgeIndexSummary,
   listDocumentKnowledgeIndexEntries,
   replaceDocumentKnowledgeIndexForSource,
@@ -99,6 +101,8 @@ import {
   runDirectToolDiagnostic,
 } from './core/toolDiagnosticsService';
 import { getAgentRuntime, getTaskGraphRuntime, listRoleSpecs, type RuntimeMode } from './core/ai';
+import { getSessionRuntimeStore } from './core/sessionRuntimeStore';
+import { listRuntimeHooks, registerRuntimeHook, unregisterRuntimeHook } from './core/runtimeHooks';
 
 if (typeof (globalThis as any).Blob === 'undefined' && typeof NodeBlob !== 'undefined') {
   (globalThis as any).Blob = NodeBlob;
@@ -1124,6 +1128,161 @@ ipcMain.handle('tools:diagnostics:run-ai', async (_event, payload?: { toolName?:
   return runAiToolDiagnostic(toolName);
 });
 
+ipcMain.handle('tools:hooks:list', () => {
+  return listRuntimeHooks();
+});
+
+ipcMain.handle('tools:hooks:register', (_event, payload?: Record<string, unknown>) => {
+  const id = String(payload?.id || `hook_${Date.now()}`).trim();
+  const event = String(payload?.event || '').trim() as 'query.before' | 'query.after' | 'tool.before' | 'tool.after' | 'stop.failure';
+  const type = String(payload?.type || '').trim() as 'command' | 'prompt' | 'http' | 'agent';
+  if (!id || !event || !type) {
+    return { success: false, error: 'id, event and type are required' };
+  }
+  return {
+    success: true,
+    hook: registerRuntimeHook({
+      id,
+      event,
+      type,
+      matcher: typeof payload?.matcher === 'string' ? payload.matcher : undefined,
+      command: typeof payload?.command === 'string' ? payload.command : undefined,
+      prompt: typeof payload?.prompt === 'string' ? payload.prompt : undefined,
+      url: typeof payload?.url === 'string' ? payload.url : undefined,
+      headers: payload?.headers && typeof payload.headers === 'object' ? payload.headers as Record<string, string> : undefined,
+      timeoutMs: Number.isFinite(Number(payload?.timeoutMs)) ? Number(payload?.timeoutMs) : undefined,
+      enabled: payload?.enabled === undefined ? true : Boolean(payload.enabled),
+    }),
+  };
+});
+
+ipcMain.handle('tools:hooks:remove', (_event, payload?: { id?: string }) => {
+  const id = String(payload?.id || '').trim();
+  if (!id) {
+    return { success: false, error: 'id is required' };
+  }
+  unregisterRuntimeHook(id);
+  return { success: true };
+});
+
+ipcMain.handle('sessions:list', () => {
+  return getSessionRuntimeStore().listSessions().map((session) => ({
+    ...session,
+    chatSession: getChatSession(session.id),
+  }));
+});
+
+ipcMain.handle('sessions:get', (_event, payload?: { sessionId?: string }) => {
+  const sessionId = String(payload?.sessionId || '').trim();
+  if (!sessionId) return null;
+  return {
+    chatSession: getChatSession(sessionId),
+    transcript: listSessionTranscriptRecords(sessionId),
+    checkpoints: listSessionCheckpoints(sessionId),
+  };
+});
+
+ipcMain.handle('sessions:resume', (_event, payload?: { sessionId?: string }) => {
+  const sessionId = String(payload?.sessionId || '').trim();
+  if (!sessionId) return null;
+  const checkpoints = listSessionCheckpoints(sessionId, 1);
+  return {
+    chatSession: getChatSession(sessionId),
+    lastCheckpoint: checkpoints[0] || null,
+  };
+});
+
+ipcMain.handle('sessions:fork', (_event, payload?: { sessionId?: string; title?: string }) => {
+  const sessionId = String(payload?.sessionId || '').trim();
+  if (!sessionId) {
+    return { success: false, error: 'sessionId is required' };
+  }
+  const session = getSessionRuntimeStore().forkSession(sessionId, typeof payload?.title === 'string' ? payload.title : undefined);
+  return {
+    success: true,
+    session,
+  };
+});
+
+ipcMain.handle('sessions:get-transcript', (_event, payload?: { sessionId?: string }) => {
+  const sessionId = String(payload?.sessionId || '').trim();
+  if (!sessionId) return [];
+  return listSessionTranscriptRecords(sessionId).map((record) => ({
+    id: record.id,
+    sessionId: record.session_id,
+    recordType: record.record_type,
+    role: record.role,
+    content: record.content,
+    payload: record.payload_json ? JSON.parse(record.payload_json) : null,
+    createdAt: record.created_at,
+  }));
+});
+
+ipcMain.handle('runtime:get-trace', (_event, payload?: { sessionId?: string }) => {
+  const sessionId = String(payload?.sessionId || '').trim();
+  if (!sessionId) return [];
+  return listSessionTranscriptRecords(sessionId);
+});
+
+ipcMain.handle('runtime:get-checkpoints', (_event, payload?: { sessionId?: string }) => {
+  const sessionId = String(payload?.sessionId || '').trim();
+  if (!sessionId) return [];
+  return listSessionCheckpoints(sessionId).map((record) => ({
+    id: record.id,
+    sessionId: record.session_id,
+    checkpointType: record.checkpoint_type,
+    summary: record.summary,
+    payload: record.payload_json ? JSON.parse(record.payload_json) : null,
+    createdAt: record.created_at,
+  }));
+});
+
+ipcMain.handle('runtime:resume', (_event, payload?: { sessionId?: string }) => {
+  const sessionId = String(payload?.sessionId || '').trim();
+  if (!sessionId) return null;
+  const checkpoints = listSessionCheckpoints(sessionId, 1);
+  return {
+    sessionId,
+    checkpoint: checkpoints[0] || null,
+  };
+});
+
+ipcMain.handle('runtime:fork-session', (_event, payload?: { sessionId?: string; title?: string }) => {
+  const sessionId = String(payload?.sessionId || '').trim();
+  if (!sessionId) {
+    return { success: false, error: 'sessionId is required' };
+  }
+  return {
+    success: true,
+    session: getSessionRuntimeStore().forkSession(sessionId, typeof payload?.title === 'string' ? payload.title : undefined),
+  };
+});
+
+ipcMain.handle('runtime:query', async (event, payload?: { sessionId?: string; message?: string }) => {
+  const message = String(payload?.message || '').trim();
+  if (!message) {
+    return { success: false, error: 'message is required' };
+  }
+  let sessionId = String(payload?.sessionId || '').trim();
+  if (!sessionId) {
+    sessionId = `session_${Date.now()}`;
+    createChatSession(sessionId, 'New Chat');
+  }
+
+  addChatMessage({
+    id: `msg_${Date.now()}`,
+    session_id: sessionId,
+    role: 'user',
+    content: message,
+  });
+  const service = getOrCreateChatService(sessionId, event.sender);
+  await service.sendMessage(message, sessionId);
+  return {
+    success: true,
+    sessionId,
+  };
+});
+
 ipcMain.handle('tasks:create', async (_event, payload?: {
   runtimeMode?: RuntimeMode;
   sessionId?: string;
@@ -1181,6 +1340,16 @@ ipcMain.handle('tasks:trace', async (_event, payload?: { taskId?: string; limit?
   const taskId = String(payload?.taskId || '').trim();
   if (!taskId) return [];
   return getTaskGraphRuntime().listTraces(taskId, payload?.limit);
+});
+
+ipcMain.handle('tasks:resume-from-session', async (_event, payload?: { sessionId?: string }) => {
+  const sessionId = String(payload?.sessionId || '').trim();
+  if (!sessionId) return null;
+  const tasks = getTaskGraphRuntime().listTasks({
+    ownerSessionId: sessionId,
+    limit: 20,
+  });
+  return tasks.find((task) => task.status === 'running' || task.status === 'paused') || tasks[0] || null;
 });
 
 ipcMain.handle('ai:roles:list', async () => {

@@ -38,6 +38,10 @@ export class WebSearchTool extends DeclarativeTool<typeof SearchParamsSchema> {
         return `Search the web for: "${params.query}"`;
     }
 
+    isConcurrencySafe(_params: SearchParams): boolean {
+        return true;
+    }
+
     async execute(params: SearchParams, signal: AbortSignal): Promise<ToolResult> {
         if (signal.aborted) {
             return createErrorResult('Search cancelled', ToolErrorType.CANCELLED);

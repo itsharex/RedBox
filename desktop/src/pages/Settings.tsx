@@ -66,6 +66,44 @@ const DEFAULT_CHAT_MAX_TOKENS_DEEPSEEK = 131072;
 const DEVELOPER_MODE_UNLOCK_TAP_COUNT = 7;
 const DEVELOPER_MODE_TTL_MS = 24 * 60 * 60 * 1000;
 
+type RuntimeSessionListItem = {
+  id: string;
+  transcriptCount: number;
+  checkpointCount: number;
+  chatSession?: {
+    id: string;
+    title?: string;
+    updatedAt?: string;
+  } | null;
+};
+
+type RuntimeSessionTranscriptItem = {
+  id: number;
+  sessionId: string;
+  recordType: string;
+  role: string;
+  content: string;
+  payload?: unknown;
+  createdAt: number;
+};
+
+type RuntimeSessionCheckpointItem = {
+  id: string;
+  sessionId: string;
+  checkpointType: string;
+  summary: string;
+  payload?: unknown;
+  createdAt: number;
+};
+
+type RuntimeHookDefinition = {
+  id: string;
+  event: string;
+  type: string;
+  matcher?: string;
+  enabled?: boolean;
+};
+
 const sanitizeChatMaxTokensInput = (value: string, fallback: number): string => {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < MIN_CHAT_MAX_TOKENS) {
@@ -136,12 +174,18 @@ export function Settings() {
   const [toolDiagnosticRunning, setToolDiagnosticRunning] = useState<Record<string, 'direct' | 'ai' | undefined>>({});
   const [runtimeTasks, setRuntimeTasks] = useState<AgentTaskSnapshot[]>([]);
   const [runtimeRoles, setRuntimeRoles] = useState<RoleSpec[]>([]);
+  const [runtimeSessions, setRuntimeSessions] = useState<RuntimeSessionListItem[]>([]);
   const [selectedRuntimeTaskId, setSelectedRuntimeTaskId] = useState('');
+  const [selectedRuntimeSessionId, setSelectedRuntimeSessionId] = useState('');
   const [runtimeTaskTraces, setRuntimeTaskTraces] = useState<AgentTaskTrace[]>([]);
+  const [runtimeSessionTranscript, setRuntimeSessionTranscript] = useState<RuntimeSessionTranscriptItem[]>([]);
+  const [runtimeSessionCheckpoints, setRuntimeSessionCheckpoints] = useState<RuntimeSessionCheckpointItem[]>([]);
+  const [runtimeHooks, setRuntimeHooks] = useState<RuntimeHookDefinition[]>([]);
   const [runtimeDraftInput, setRuntimeDraftInput] = useState('');
   const [runtimeDraftMode, setRuntimeDraftMode] = useState<'redclaw' | 'knowledge' | 'chatroom' | 'advisor-discussion' | 'background-maintenance'>('redclaw');
   const [isRuntimeLoading, setIsRuntimeLoading] = useState(false);
   const [isRuntimeTraceLoading, setIsRuntimeTraceLoading] = useState(false);
+  const [isRuntimeSessionLoading, setIsRuntimeSessionLoading] = useState(false);
   const [isRuntimeCreating, setIsRuntimeCreating] = useState(false);
   const [runtimeTaskActionRunning, setRuntimeTaskActionRunning] = useState<Record<string, 'resume' | 'cancel' | undefined>>({});
   const [status, setStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
@@ -524,6 +568,7 @@ export function Settings() {
       void loadRuntimeDeveloperData();
       runtimePollTimer = window.setInterval(() => {
         void loadRuntimeTasks();
+        void loadRuntimeSessions();
       }, 8000);
     }
 
@@ -541,6 +586,11 @@ export function Settings() {
     if (activeTab !== 'tools' || !formData.developer_mode_enabled) return;
     void loadRuntimeTaskTraces(selectedRuntimeTaskId);
   }, [activeTab, formData.developer_mode_enabled, selectedRuntimeTaskId]);
+
+  useEffect(() => {
+    if (activeTab !== 'tools' || !formData.developer_mode_enabled) return;
+    void loadRuntimeSessionDetails(selectedRuntimeSessionId);
+  }, [activeTab, formData.developer_mode_enabled, selectedRuntimeSessionId]);
 
   useEffect(() => {
     setTestStatus('idle');
@@ -1261,6 +1311,26 @@ export function Settings() {
     }
   };
 
+  const loadRuntimeSessions = async (preserveSelection = true) => {
+    try {
+      const result = await window.ipcRenderer.sessions.list();
+      const sessionList = Array.isArray(result) ? result as RuntimeSessionListItem[] : [];
+      setRuntimeSessions(sessionList);
+      setSelectedRuntimeSessionId((prev) => {
+        if (preserveSelection && prev && sessionList.some((session) => session.id === prev)) {
+          return prev;
+        }
+        return sessionList[0]?.id || '';
+      });
+    } catch (e) {
+      console.error('Failed to load runtime sessions', e);
+      setRuntimeSessions([]);
+      if (!preserveSelection) {
+        setSelectedRuntimeSessionId('');
+      }
+    }
+  };
+
   const loadRuntimeTaskTraces = async (taskId: string) => {
     const normalizedTaskId = String(taskId || '').trim();
     if (!normalizedTaskId) {
@@ -1279,10 +1349,46 @@ export function Settings() {
     }
   };
 
+  const loadRuntimeSessionDetails = async (sessionId: string) => {
+    const normalizedSessionId = String(sessionId || '').trim();
+    if (!normalizedSessionId) {
+      setRuntimeSessionTranscript([]);
+      setRuntimeSessionCheckpoints([]);
+      return;
+    }
+    setIsRuntimeSessionLoading(true);
+    try {
+      const [transcript, checkpoints] = await Promise.all([
+        window.ipcRenderer.sessions.getTranscript(normalizedSessionId, 120),
+        window.ipcRenderer.runtime.getCheckpoints({ sessionId: normalizedSessionId, limit: 80 }),
+      ]);
+      setRuntimeSessionTranscript(Array.isArray(transcript) ? transcript as RuntimeSessionTranscriptItem[] : []);
+      setRuntimeSessionCheckpoints(Array.isArray(checkpoints) ? checkpoints as RuntimeSessionCheckpointItem[] : []);
+    } catch (e) {
+      console.error('Failed to load runtime session details', e);
+      setRuntimeSessionTranscript([]);
+      setRuntimeSessionCheckpoints([]);
+    } finally {
+      setIsRuntimeSessionLoading(false);
+    }
+  };
+
+  const loadRuntimeHooks = async () => {
+    try {
+      const result = await window.ipcRenderer.toolHooks.list();
+      setRuntimeHooks(Array.isArray(result) ? result as RuntimeHookDefinition[] : []);
+    } catch (e) {
+      console.error('Failed to load runtime hooks', e);
+      setRuntimeHooks([]);
+    }
+  };
+
   const loadRuntimeDeveloperData = async () => {
     await Promise.all([
       loadRuntimeRoles(),
       loadRuntimeTasks(),
+      loadRuntimeSessions(),
+      loadRuntimeHooks(),
     ]);
   };
 
@@ -2545,15 +2651,22 @@ export function Settings() {
                 handleRunAllAiToolDiagnostics={() => runAllToolDiagnostics('ai')}
                 runtimeTasks={runtimeTasks}
                 runtimeRoles={runtimeRoles}
+                runtimeSessions={runtimeSessions}
                 selectedRuntimeTaskId={selectedRuntimeTaskId}
                 setSelectedRuntimeTaskId={setSelectedRuntimeTaskId}
+                selectedRuntimeSessionId={selectedRuntimeSessionId}
+                setSelectedRuntimeSessionId={setSelectedRuntimeSessionId}
                 runtimeTaskTraces={runtimeTaskTraces}
+                runtimeSessionTranscript={runtimeSessionTranscript}
+                runtimeSessionCheckpoints={runtimeSessionCheckpoints}
+                runtimeHooks={runtimeHooks}
                 runtimeDraftInput={runtimeDraftInput}
                 setRuntimeDraftInput={setRuntimeDraftInput}
                 runtimeDraftMode={runtimeDraftMode}
                 setRuntimeDraftMode={setRuntimeDraftMode}
                 isRuntimeLoading={isRuntimeLoading}
                 isRuntimeTraceLoading={isRuntimeTraceLoading}
+                isRuntimeSessionLoading={isRuntimeSessionLoading}
                 isRuntimeCreating={isRuntimeCreating}
                 runtimeTaskActionRunning={runtimeTaskActionRunning}
                 handleRefreshRuntimeData={loadRuntimeDeveloperData}

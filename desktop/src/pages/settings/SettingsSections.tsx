@@ -645,15 +645,48 @@ interface ToolsSettingsSectionProps {
     handleRunAllAiToolDiagnostics: () => Promise<void>;
     runtimeTasks: AgentTaskSnapshot[];
     runtimeRoles: RoleSpec[];
+    runtimeSessions: Array<{
+        id: string;
+        transcriptCount: number;
+        checkpointCount: number;
+        chatSession?: { id: string; title?: string; updatedAt?: string } | null;
+    }>;
     selectedRuntimeTaskId: string;
     setSelectedRuntimeTaskId: Dispatch<SetStateAction<string>>;
+    selectedRuntimeSessionId: string;
+    setSelectedRuntimeSessionId: Dispatch<SetStateAction<string>>;
     runtimeTaskTraces: AgentTaskTrace[];
+    runtimeSessionTranscript: Array<{
+        id: number;
+        sessionId: string;
+        recordType: string;
+        role: string;
+        content: string;
+        payload?: unknown;
+        createdAt: number;
+    }>;
+    runtimeSessionCheckpoints: Array<{
+        id: string;
+        sessionId: string;
+        checkpointType: string;
+        summary: string;
+        payload?: unknown;
+        createdAt: number;
+    }>;
+    runtimeHooks: Array<{
+        id: string;
+        event: string;
+        type: string;
+        matcher?: string;
+        enabled?: boolean;
+    }>;
     runtimeDraftInput: string;
     setRuntimeDraftInput: Dispatch<SetStateAction<string>>;
     runtimeDraftMode: 'redclaw' | 'knowledge' | 'chatroom' | 'advisor-discussion' | 'background-maintenance';
     setRuntimeDraftMode: Dispatch<SetStateAction<'redclaw' | 'knowledge' | 'chatroom' | 'advisor-discussion' | 'background-maintenance'>>;
     isRuntimeLoading: boolean;
     isRuntimeTraceLoading: boolean;
+    isRuntimeSessionLoading: boolean;
     isRuntimeCreating: boolean;
     runtimeTaskActionRunning: Record<string, 'resume' | 'cancel' | undefined>;
     handleRefreshRuntimeData: () => Promise<void>;
@@ -697,15 +730,22 @@ export function ToolsSettingsSection({
     handleRunAllAiToolDiagnostics,
     runtimeTasks,
     runtimeRoles,
+    runtimeSessions,
     selectedRuntimeTaskId,
     setSelectedRuntimeTaskId,
+    selectedRuntimeSessionId,
+    setSelectedRuntimeSessionId,
     runtimeTaskTraces,
+    runtimeSessionTranscript,
+    runtimeSessionCheckpoints,
+    runtimeHooks,
     runtimeDraftInput,
     setRuntimeDraftInput,
     runtimeDraftMode,
     setRuntimeDraftMode,
     isRuntimeLoading,
     isRuntimeTraceLoading,
+    isRuntimeSessionLoading,
     isRuntimeCreating,
     runtimeTaskActionRunning,
     handleRefreshRuntimeData,
@@ -729,6 +769,7 @@ export function ToolsSettingsSection({
     };
 
     const selectedRuntimeTask = runtimeTasks.find((task) => task.id === selectedRuntimeTaskId) || null;
+    const selectedRuntimeSession = runtimeSessions.find((session) => session.id === selectedRuntimeSessionId) || null;
 
     const availabilityLabel = (tool: ToolDiagnosticDescriptor) => {
         switch (tool.availabilityStatus) {
@@ -1277,6 +1318,148 @@ export function ToolsSettingsSection({
                                                         ))}
                                                     </div>
                                                 )}
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="bg-surface-secondary/30 rounded-lg border border-border p-4 space-y-4">
+                        <div className="flex items-start justify-between gap-3">
+                            <div>
+                                <h3 className="text-sm font-medium text-text-primary">Runtime Session / Transcript</h3>
+                                <p className="text-xs text-text-tertiary mt-1">
+                                    查看统一运行时的会话 transcript、checkpoint 和当前已注册 hooks，确认会话恢复与 compact 语义是否正常。
+                                </p>
+                            </div>
+                            <div className="flex items-center gap-2 text-[11px] text-text-tertiary">
+                                <span>sessions {runtimeSessions.length}</span>
+                                <span>hooks {runtimeHooks.length}</span>
+                            </div>
+                        </div>
+
+                        <div className="grid grid-cols-1 xl:grid-cols-[340px_minmax(0,1fr)] gap-4">
+                            <div className="space-y-4">
+                                <div className="rounded-lg border border-border bg-surface-primary/50 p-3 space-y-3">
+                                    <div className="flex items-center justify-between gap-2">
+                                        <div className="text-xs font-medium text-text-primary">运行时会话</div>
+                                        <span className="text-[11px] text-text-tertiary">共 {runtimeSessions.length} 条</span>
+                                    </div>
+                                    {runtimeSessions.length === 0 ? (
+                                        <div className="text-[11px] text-text-tertiary">暂无 runtime session。</div>
+                                    ) : (
+                                        <div className="space-y-2 max-h-80 overflow-auto pr-1">
+                                            {runtimeSessions.map((session) => (
+                                                <button
+                                                    key={session.id}
+                                                    type="button"
+                                                    onClick={() => setSelectedRuntimeSessionId(session.id)}
+                                                    className={clsx(
+                                                        'w-full text-left rounded border p-3 transition-colors',
+                                                        selectedRuntimeSessionId === session.id
+                                                            ? 'border-accent-primary bg-accent-primary/5'
+                                                            : 'border-border bg-surface-secondary/20 hover:bg-surface-secondary/30'
+                                                    )}
+                                                >
+                                                    <div className="text-xs font-medium text-text-primary truncate">
+                                                        {session.chatSession?.title || session.id}
+                                                    </div>
+                                                    <div className="text-[11px] text-text-tertiary mt-1 font-mono truncate">
+                                                        {session.id}
+                                                    </div>
+                                                    <div className="flex flex-wrap gap-2 mt-2 text-[11px] text-text-tertiary">
+                                                        <span>transcript: {session.transcriptCount}</span>
+                                                        <span>checkpoint: {session.checkpointCount}</span>
+                                                    </div>
+                                                </button>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+
+                                <div className="rounded-lg border border-border bg-surface-primary/50 p-3 space-y-3">
+                                    <div className="text-xs font-medium text-text-primary">Hook 注册表</div>
+                                    {runtimeHooks.length === 0 ? (
+                                        <div className="text-[11px] text-text-tertiary">暂无 runtime hook。</div>
+                                    ) : (
+                                        <div className="space-y-2 max-h-80 overflow-auto pr-1">
+                                            {runtimeHooks.map((hook) => (
+                                                <div key={hook.id} className="rounded border border-border bg-surface-secondary/20 p-2">
+                                                    <div className="flex items-center justify-between gap-2">
+                                                        <div className="text-[11px] font-medium text-text-primary">{hook.id}</div>
+                                                        <span className={clsx(
+                                                            'text-[10px] px-1.5 py-0.5 rounded',
+                                                            hook.enabled === false ? 'bg-red-500/10 text-red-600' : 'bg-green-500/10 text-green-600'
+                                                        )}>
+                                                            {hook.enabled === false ? 'disabled' : 'enabled'}
+                                                        </span>
+                                                    </div>
+                                                    <div className="flex flex-wrap gap-2 mt-2 text-[11px] text-text-tertiary">
+                                                        <span>{hook.event}</span>
+                                                        <span>{hook.type}</span>
+                                                        {hook.matcher ? <span>match: {hook.matcher}</span> : null}
+                                                    </div>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+
+                            <div className="space-y-4">
+                                <div className="rounded-lg border border-border bg-surface-primary/50 p-3 space-y-3">
+                                    <div className="flex items-center justify-between gap-2">
+                                        <div className="text-xs font-medium text-text-primary">Session Transcript / Checkpoints</div>
+                                        {selectedRuntimeSession ? (
+                                            <span className="text-[11px] text-text-tertiary font-mono truncate">{selectedRuntimeSession.id}</span>
+                                        ) : null}
+                                    </div>
+                                    {!selectedRuntimeSession ? (
+                                        <div className="text-[11px] text-text-tertiary">请选择左侧一条 runtime session。</div>
+                                    ) : isRuntimeSessionLoading ? (
+                                        <div className="text-[11px] text-text-tertiary">加载中...</div>
+                                    ) : (
+                                        <div className="space-y-3">
+                                            <div className="rounded border border-border bg-surface-secondary/20 p-3">
+                                                <div className="text-[11px] font-medium text-text-primary">最近 Checkpoints</div>
+                                                <div className="mt-2 space-y-2">
+                                                    {runtimeSessionCheckpoints.length === 0 ? (
+                                                        <div className="text-[11px] text-text-tertiary">暂无 checkpoint。</div>
+                                                    ) : runtimeSessionCheckpoints.map((checkpoint) => (
+                                                        <div key={checkpoint.id} className="rounded border border-border bg-surface-primary/60 p-2">
+                                                            <div className="flex items-center justify-between gap-2">
+                                                                <span className="text-[11px] font-medium text-text-primary">{checkpoint.summary}</span>
+                                                                <span className="text-[10px] text-text-tertiary">{checkpoint.checkpointType}</span>
+                                                            </div>
+                                                            <div className="text-[10px] text-text-tertiary mt-1">
+                                                                {new Date(checkpoint.createdAt).toLocaleString()}
+                                                            </div>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            </div>
+
+                                            <div className="rounded border border-border bg-surface-secondary/20 p-3">
+                                                <div className="text-[11px] font-medium text-text-primary">最近 Transcript</div>
+                                                <div className="mt-2 max-h-[32rem] overflow-auto space-y-2 pr-1">
+                                                    {runtimeSessionTranscript.length === 0 ? (
+                                                        <div className="text-[11px] text-text-tertiary">暂无 transcript。</div>
+                                                    ) : runtimeSessionTranscript.map((item) => (
+                                                        <details key={item.id} className="rounded border border-border bg-surface-primary/60 p-2">
+                                                            <summary className="cursor-pointer flex items-center justify-between gap-2 text-[11px]">
+                                                                <span className="font-medium text-text-primary">
+                                                                    {item.recordType} · {item.role}
+                                                                </span>
+                                                                <span className="text-text-tertiary">{new Date(item.createdAt).toLocaleString()}</span>
+                                                            </summary>
+                                                            <pre className="mt-2 whitespace-pre-wrap break-all text-[11px] leading-5 text-text-secondary">
+                                                                {item.content || '(empty)'}
+                                                            </pre>
+                                                        </details>
+                                                    ))}
+                                                </div>
                                             </div>
                                         </div>
                                     )}
