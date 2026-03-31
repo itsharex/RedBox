@@ -218,6 +218,48 @@ declare global {
         register: (hook: unknown) => Promise<{ success: boolean; hookId: string }>;
         remove: (hookId: string) => Promise<{ success: boolean }>;
       };
+      backgroundTasks: {
+        list: () => Promise<Array<{
+          id: string;
+          kind: 'redclaw-project' | 'scheduled-task' | 'long-cycle' | 'heartbeat' | 'memory-maintenance' | 'headless-runtime';
+          title: string;
+          status: 'running' | 'completed' | 'failed' | 'cancelled';
+          sessionId?: string;
+          contextId?: string;
+          error?: string;
+          summary?: string;
+          latestText?: string;
+          createdAt: string;
+          updatedAt: string;
+          completedAt?: string;
+          turns: Array<{
+            id: string;
+            at: string;
+            text: string;
+            source: 'thought' | 'tool' | 'response' | 'system';
+          }>;
+        }>>;
+        get: (taskId: string) => Promise<{
+          id: string;
+          kind: 'redclaw-project' | 'scheduled-task' | 'long-cycle' | 'heartbeat' | 'memory-maintenance' | 'headless-runtime';
+          title: string;
+          status: 'running' | 'completed' | 'failed' | 'cancelled';
+          sessionId?: string;
+          contextId?: string;
+          error?: string;
+          summary?: string;
+          latestText?: string;
+          createdAt: string;
+          updatedAt: string;
+          completedAt?: string;
+          turns: Array<{
+            id: string;
+            at: string;
+            text: string;
+            source: 'thought' | 'tool' | 'response' | 'system';
+          }>;
+        } | null>;
+      };
       tasks: {
         create: (payload?: { runtimeMode?: string; sessionId?: string; userInput?: string; metadata?: Record<string, unknown> }) => Promise<AgentTaskSnapshot>;
         list: (payload?: { status?: string; ownerSessionId?: string; limit?: number }) => Promise<AgentTaskSnapshot[]>;

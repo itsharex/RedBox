@@ -23,6 +23,8 @@ import {
   releaseBackgroundRuntimeLock,
   tryAcquireBackgroundRuntimeLock,
 } from './backgroundRuntimeLock';
+import { getBackgroundTaskRegistry } from './backgroundTaskRegistry';
+import { getHeadlessAgentRunner } from './headlessAgentRunner';
 
 const MAINTENANCE_PROMPT_PATH = 'runtime/memory/maintenance_manager.txt';
 const DEFAULT_MODEL_FALLBACK = 'gpt-4o-mini';
@@ -208,69 +210,6 @@ function buildPromptPayload(params: {
     history_json: JSON.stringify(params.history.slice(0, MAX_HISTORY_PROMPT_ITEMS), null, 2),
     recent_conversations_json: JSON.stringify(params.recentConversations, null, 2),
   }, 'You are a memory maintenance manager. Output strict JSON only.');
-}
-
-async function requestMaintenancePlan(input: {
-  model: string;
-  apiKey: string;
-  baseURL: string;
-  prompt: string;
-  timeoutMs?: number;
-}): Promise<MaintenanceResponse> {
-  const controller = new AbortController();
-  const timeoutMs = Math.max(15000, Number(input.timeoutMs || 90000));
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  const payload = {
-    model: input.model,
-    temperature: 0.1,
-    response_format: { type: 'json_object' },
-    messages: [
-      { role: 'system', content: input.prompt },
-      { role: 'user', content: 'Return the memory maintenance actions now.' },
-    ],
-  };
-
-  console.log('[MemoryMaintenance] request', {
-    model: input.model,
-    baseURL: input.baseURL,
-    timeoutMs,
-    payloadPreview: JSON.stringify(payload).slice(0, 4000),
-  });
-
-  try {
-    const response = await fetch(safeUrlJoin(input.baseURL, '/chat/completions'), {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${input.apiKey}`,
-      },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
-
-    const rawText = await response.text().catch(() => '');
-    console.log('[MemoryMaintenance] response', {
-      status: response.status,
-      statusText: response.statusText,
-      bodyPreview: rawText.slice(0, 8000),
-    });
-
-    if (!response.ok) {
-      throw new Error(`Memory maintenance failed (${response.status}): ${rawText || response.statusText}`);
-    }
-
-    let parsed: any;
-    try {
-      parsed = JSON.parse(rawText);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      throw new Error(`Memory maintenance invalid JSON response: ${message}`);
-    }
-    const content = parsed?.choices?.[0]?.message?.content || '';
-    return parseJsonResponse(String(content || ''));
-  } finally {
-    clearTimeout(timeout);
-  }
 }
 
 export class MemoryMaintenanceService {
@@ -492,12 +431,29 @@ export class MemoryMaintenanceService {
         recentConversations,
       });
 
-      const plan = await requestMaintenancePlan({
+      const backgroundTask = await getBackgroundTaskRegistry().registerTask({
+        kind: 'memory-maintenance',
+        title: `记忆维护 · ${reason}`,
+        contextId: `memory-maintenance:${reason}`,
+      });
+      const planResult = await getHeadlessAgentRunner().runJsonRuntimeTask({
+        taskId: backgroundTask.id,
+        title: `Memory Maintenance ${reason}`,
+        contextId: `memory-maintenance:${reason}`,
+        systemPrompt: prompt,
+        userInput: 'Return the memory maintenance actions now as strict JSON.',
         model,
         apiKey,
         baseURL,
-        prompt,
+        maxTurns: 6,
+        temperature: 0.1,
       });
+      if (planResult.error) {
+        await getBackgroundTaskRegistry().failTask(backgroundTask.id, planResult.error);
+        throw new Error(planResult.error);
+      }
+      const plan = parseJsonResponse(planResult.response);
+      await getBackgroundTaskRegistry().completeTask(backgroundTask.id, String(plan.summary || '').trim() || 'memory maintenance completed');
       if (taskId) {
         runtime.addTrace(taskId, 'memory.plan_received', {
           summary: plan.summary || '',

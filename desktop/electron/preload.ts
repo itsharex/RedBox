@@ -63,6 +63,10 @@ contextBridge.exposeInMainWorld('ipcRenderer', {
     register: (hook: unknown) => ipcRenderer.invoke('tools:hooks:register', hook),
     remove: (hookId: string) => ipcRenderer.invoke('tools:hooks:remove', { hookId }),
   },
+  backgroundTasks: {
+    list: () => ipcRenderer.invoke('background-tasks:list'),
+    get: (taskId: string) => ipcRenderer.invoke('background-tasks:get', { taskId }),
+  },
   tasks: {
     create: (payload?: { runtimeMode?: string; sessionId?: string; userInput?: string; metadata?: Record<string, unknown> }) => ipcRenderer.invoke('tasks:create', payload || {}),
     list: (payload?: { status?: string; ownerSessionId?: string; limit?: number }) => ipcRenderer.invoke('tasks:list', payload || {}),

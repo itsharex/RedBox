@@ -17,6 +17,8 @@ import type { IntentRoute, RoleId, RuntimeMode } from './ai/types';
 import { nextCronRunMs } from './backgroundCron';
 import { findMissedScheduledTasks } from './backgroundScheduledTasks';
 import { BackgroundCronScheduler } from './backgroundCronScheduler';
+import { getHeadlessAgentRunner } from './headlessAgentRunner';
+import { getBackgroundTaskRegistry } from './backgroundTaskRegistry';
 import {
   releaseBackgroundRuntimeLock,
   tryAcquireBackgroundRuntimeLock,
@@ -1439,41 +1441,47 @@ export class RedClawBackgroundRunner extends EventEmitter {
   }
 
   private async runAgentPrompt(params: {
+    taskId?: string;
+    taskKind?: 'redclaw-project' | 'scheduled-task' | 'long-cycle' | 'heartbeat';
     contextId: string;
     title: string;
     prompt: string;
     contextContent: string;
     displayContent?: string;
   }): Promise<{ sessionId: string }> {
-    const contextType = 'redclaw';
-    let session = getChatSessionByContext(params.contextId, contextType);
-    if (!session) {
-      const sid = `session_${params.contextId.replace(/[^a-zA-Z0-9_:-]/g, '_')}`;
-      session = createChatSession(sid, params.title, {
-        contextId: params.contextId,
-        contextType,
-        contextContent: params.contextContent,
-        isContextBound: true,
-      });
-    }
+    const registeredTask = params.taskId
+      ? null
+      : await getBackgroundTaskRegistry().registerTask({
+          kind: params.taskKind || 'headless-runtime',
+          title: params.title,
+          contextId: params.contextId,
+        });
+    const taskId = params.taskId || registeredTask?.id;
 
-    addChatMessage({
-      id: `msg_bg_user_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-      session_id: session.id,
-      role: 'user',
-      content: params.prompt,
-      display_content: params.displayContent || '[后台自动任务]',
-    });
-
-    const service = new PiChatService();
-    this.currentService = service;
     try {
-      await service.sendMessage(params.prompt, session.id);
-      return { sessionId: session.id };
-    } finally {
-      if (this.currentService === service) {
-        this.currentService = null;
+      const service = new PiChatService();
+      this.currentService = service;
+      const result = await getHeadlessAgentRunner().runRedClawTask({
+        taskId: taskId || `bg_fallback_${Date.now()}`,
+        title: params.title,
+        contextId: params.contextId,
+        contextContent: params.contextContent,
+        prompt: params.prompt,
+        displayContent: params.displayContent || '[后台自动任务]',
+        service,
+      });
+      if (taskId) {
+        await getBackgroundTaskRegistry().completeTask(taskId, 'headless redclaw task completed');
       }
+      return { sessionId: result.sessionId };
+    } catch (error) {
+      if (taskId) {
+        const message = error instanceof Error ? error.message : String(error);
+        await getBackgroundTaskRegistry().failTask(taskId, message);
+      }
+      throw error;
+    } finally {
+      this.currentService = null;
     }
   }
 

@@ -87,6 +87,7 @@ import { getAdvisorYoutubeBackgroundRunner, getDefaultAdvisorYoutubeChannelConfi
 import { detectAiProtocol, fetchModelsForAiSource, testAiSourceConnection } from './core/aiSourceService';
 import { loadOfficialFeatureModule } from './officialFeatureBridge';
 import { getMemoryMaintenanceService } from './core/memoryMaintenanceService';
+import { getBackgroundTaskRegistry } from './core/backgroundTaskRegistry';
 import { generateAdvisorPersonaDocument } from './core/advisorPersonaGenerator';
 import {
   getDebugLogDirectory,
@@ -198,6 +199,7 @@ process.env.VITE_PUBLIC = app.isPackaged ? process.env.DIST : path.join(process.
 let win: BrowserWindow | null
 const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL']
 let redClawRunnerListenersAttached = false;
+let backgroundTaskRegistryListenersAttached = false;
 let advisorYoutubeRunnerListenersAttached = false;
 const DOWNLOAD_RETRY_DELAYS_MS = [0, 600, 1600];
 const XHS_ASSET_REQUEST_HEADERS = {
@@ -933,6 +935,16 @@ async function initializeRedClawBackgroundRunner() {
   await runner.init();
 }
 
+async function initializeBackgroundTaskRegistry() {
+  const registry = getBackgroundTaskRegistry();
+  if (!backgroundTaskRegistryListenersAttached) {
+    registry.on('task-updated', (task) => {
+      win?.webContents.send('background:task-updated', task);
+    });
+    backgroundTaskRegistryListenersAttached = true;
+  }
+}
+
 app.whenReady().then(async () => {
   const officialFeatureModule = await loadOfficialFeatureModule();
   if (officialFeatureModule?.registerOfficialFeatures) {
@@ -984,6 +996,12 @@ app.whenReady().then(async () => {
       await initializeRedClawBackgroundRunner();
     } catch (e) {
       console.error('[RedClawRunner] Init failed:', e);
+    }
+
+    try {
+      await initializeBackgroundTaskRegistry();
+    } catch (e) {
+      console.error('[BackgroundTasks] Init failed:', e);
     }
 
     try {
@@ -1523,6 +1541,14 @@ ipcMain.handle('memory:maintenance-status', async () => {
 
 ipcMain.handle('memory:maintenance-run', async () => {
   return getMemoryMaintenanceService().runNow();
+});
+
+ipcMain.handle('background-tasks:list', async () => {
+  return getBackgroundTaskRegistry().listTasks();
+});
+
+ipcMain.handle('background-tasks:get', async (_, payload?: { taskId?: string }) => {
+  return getBackgroundTaskRegistry().getTask(String(payload?.taskId || ''));
 });
 
 ipcMain.handle('memory:add', async (_, { content, type, tags }) => {
