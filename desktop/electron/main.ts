@@ -49,7 +49,6 @@ import {
   type AgentConfig,
   getAllKnowledgeItems
 } from './core'
-import { WANDER_BRAINSTORM_PROMPT } from './prompts'
 import { loadPrompt, renderPrompt } from './prompts/runtime';
 import { fileWatcher } from './core/FileWatcherService'
 import matter from 'gray-matter'
@@ -5590,7 +5589,27 @@ const buildWanderLongTermContext = async (): Promise<string> => {
 const buildWanderDeepAgentPrompt = (params: {
   itemsText: string;
   longTermContextSection: string;
+  multiChoice: boolean;
 }): string => {
+  const outputRequirement = params.multiChoice
+    ? [
+      '硬性输出要求（多选题模式）：',
+      '1) 仅输出 JSON，不要输出 Markdown、解释、前后缀文本；',
+      '2) JSON 顶层必须包含：thinking_process, options；',
+      '3) options 必须是长度为 3 的数组；',
+      '4) 每个 option 必须包含：content_direction, topic；',
+      '5) topic 必须包含：title, connections（数组，取值只能是 1-3）；',
+      '6) thinking_process 为 3-6 条简洁思考要点。',
+    ].join('\n')
+    : [
+      '硬性输出要求（单选题模式）：',
+      '1) 仅输出 JSON，不要输出 Markdown、解释、前后缀文本；',
+      '2) JSON 顶层必须包含：content_direction, thinking_process, topic；',
+      '3) topic 必须包含：title, connections（数组，取值只能是 1-3）；',
+      '4) thinking_process 为 3-6 条简洁思考要点；',
+      '5) content_direction 必须是可直接创作的内容方向说明。',
+    ].join('\n');
+
   return [
     '你现在处于 RedBox 的「漫步深度思考」Agent 模式。',
     '你需要自主完成：分析素材 -> 发散选题 -> 收敛方向 -> 产出最终结构化结果。',
@@ -5602,12 +5621,7 @@ const buildWanderDeepAgentPrompt = (params: {
     '3) 如果 app_cli 不可用，可回退 read_file / grep；',
     '4) 未发生工具调用时，不允许直接输出最终结论。',
     '',
-    '硬性输出要求：',
-    '1) 仅输出 JSON，不要输出 Markdown、解释、前后缀文本；',
-    '2) JSON 顶层必须包含：content_direction, thinking_process, topic；',
-    '3) topic 必须包含：title, connections（数组，取值只能是 1-3）；',
-    '4) thinking_process 为 3-6 条简洁思考要点；',
-    '5) content_direction 必须是可直接创作的内容方向说明。',
+    outputRequirement,
     '',
     '你收到的随机素材如下：',
     params.itemsText,
@@ -5620,6 +5634,7 @@ const runWanderDeepThinkWithAgent = async (params: {
   requestId: string;
   items: any[];
   longTermContextSection: string;
+  multiChoice: boolean;
   reportProgress: (status: string) => void;
 }): Promise<string> => {
   const safeRequestId = params.requestId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64) || `${Date.now()}`;
@@ -5629,6 +5644,7 @@ const runWanderDeepThinkWithAgent = async (params: {
   const prompt = buildWanderDeepAgentPrompt({
     itemsText,
     longTermContextSection: params.longTermContextSection,
+    multiChoice: params.multiChoice,
   });
 
   const existingSession = getChatSession(sessionId);
@@ -5661,7 +5677,7 @@ const runWanderDeepThinkWithAgent = async (params: {
   let sawAnyToolCall = false;
   let toolCallCount = 0;
   const startedAt = Date.now();
-  params.reportProgress('深度思考 Agent 已启动...');
+  params.reportProgress(params.multiChoice ? '多选题 Agent 已启动...' : '漫步 Agent 已启动...');
 
   addChatMessage({
     id: `msg_wander_user_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
@@ -5769,6 +5785,68 @@ const runWanderDeepThinkWithAgent = async (params: {
     responseLength: finalContent.length,
   });
   return finalContent;
+};
+
+const normalizeWanderConnections = (raw: unknown): number[] => {
+  if (!Array.isArray(raw)) return [1];
+  const normalized = raw
+    .map((item) => Number(item))
+    .filter((item) => Number.isFinite(item))
+    .map((item) => Math.max(1, Math.min(3, Math.floor(item))));
+  const unique = Array.from(new Set(normalized));
+  return unique.length ? unique : [1];
+};
+
+const normalizeWanderOption = (raw: any): { content_direction: string; topic: { title: string; connections: number[] } } => {
+  const topic = raw?.topic && typeof raw.topic === 'object' ? raw.topic : {};
+  const title = String(topic?.title || raw?.title || '').trim() || '未命名选题';
+  const contentDirection = String(raw?.content_direction || raw?.direction || raw?.contentDirection || '').trim()
+    || '围绕素材提炼一个可执行的内容方向。';
+  return {
+    content_direction: contentDirection,
+    topic: {
+      title,
+      connections: normalizeWanderConnections(topic?.connections || raw?.connections),
+    },
+  };
+};
+
+const normalizeWanderResult = (raw: any, multiChoice: boolean) => {
+  const thinkingProcess = Array.isArray(raw?.thinking_process)
+    ? raw.thinking_process.map((item: unknown) => String(item || '').trim()).filter(Boolean).slice(0, 6)
+    : [];
+
+  if (multiChoice) {
+    const candidateOptions = Array.isArray(raw?.options)
+      ? raw.options
+      : Array.isArray(raw?.choices)
+        ? raw.choices
+        : [];
+    const normalizedOptions = candidateOptions
+      .map((item: unknown) => normalizeWanderOption(item))
+      .filter((item: { content_direction: string; topic: { title: string } }) => Boolean(item.topic.title))
+      .slice(0, 3);
+    if (!normalizedOptions.length) {
+      normalizedOptions.push(normalizeWanderOption(raw));
+    }
+    while (normalizedOptions.length < 3) {
+      normalizedOptions.push({ ...normalizedOptions[normalizedOptions.length - 1] });
+    }
+    return {
+      thinking_process: thinkingProcess,
+      options: normalizedOptions,
+      content_direction: normalizedOptions[0].content_direction,
+      topic: normalizedOptions[0].topic,
+      selected_index: 0,
+    };
+  }
+
+  const single = normalizeWanderOption(raw);
+  return {
+    content_direction: single.content_direction,
+    thinking_process: thinkingProcess,
+    topic: single.topic,
+  };
 };
 
 const requestWanderCompletion = async ({
@@ -5947,7 +6025,7 @@ const requestWanderCompletion = async ({
   }
 };
 
-ipcMain.handle('wander:brainstorm', async (event, items: any[], options?: { deepThink?: boolean; requestId?: string }) => {
+ipcMain.handle('wander:brainstorm', async (event, items: any[], options?: { multiChoice?: boolean; deepThink?: boolean; requestId?: string }) => {
   const requestId = String(options?.requestId || '').trim() || `wander-${Date.now()}`;
   const reportProgress = (status: string) => {
     event.sender.send('wander:progress', {
@@ -5971,12 +6049,15 @@ ipcMain.handle('wander:brainstorm', async (event, items: any[], options?: { deep
 
     const baseURL = normalizeApiBaseUrl(settings.api_endpoint || 'https://api.openai.com/v1', 'https://api.openai.com/v1');
     const model = resolveScopedModelName((settings || {}) as Record<string, unknown>, 'wander', 'gpt-4o');
-    const deepThink = typeof options?.deepThink === 'boolean'
-      ? options.deepThink
+    const multiChoice = typeof options?.multiChoice === 'boolean'
+      ? options.multiChoice
+      : typeof options?.deepThink === 'boolean'
+        ? options.deepThink
       : Boolean(settings.wander_deep_think_enabled);
 
     console.log('[wander:brainstorm] mode', {
-      deepThink,
+      runtime: 'agent',
+      multiChoice,
       itemCount: Array.isArray(items) ? items.length : 0,
       model,
       baseURL,
@@ -5990,42 +6071,21 @@ ipcMain.handle('wander:brainstorm', async (event, items: any[], options?: { deep
     const longTermContextSection = longTermContext
       ? `\n\n## 用户长期上下文（供你参考）\n${longTermContext}\n\n使用要求：\n- 与长期定位保持一致；\n- 若素材与长期定位冲突，优先选择可落地、可执行的方向。`
       : '';
-    let content = '';
-
-    if (!deepThink) {
-      reportProgress('正在生成漫步结果...');
-      content = await requestWanderCompletion({
-        baseURL,
-        apiKey: settings.api_key,
-        model,
-        temperature: 0.85,
-        requireJson: true,
-        allowJsonFallback: true,
-        enableThinking: false,
-        timeoutMs: 90000,
-        retryOnTimeout: true,
-        retryTimeoutMs: 135000,
-        messages: [
-          { role: 'system', content: `${WANDER_BRAINSTORM_PROMPT}${longTermContextSection}\n\n补充要求：直接给出最终 JSON，不要进行长时间思考循环或分阶段推演。` },
-          { role: 'user', content: `这里是 3 个条目：\n\n${itemsText}` },
-        ],
-      });
-    } else {
-      content = await runWanderDeepThinkWithAgent({
-        requestId,
-        items,
-        longTermContextSection,
-        reportProgress,
-      });
-    }
+    const content = await runWanderDeepThinkWithAgent({
+      requestId,
+      items,
+      longTermContextSection,
+      multiChoice,
+      reportProgress,
+    });
 
     reportProgress('正在解析结果并写入历史...');
     // 解析 JSON 结果
-    let result;
+    let result: any;
     try {
-      result = JSON.parse(content);
+      result = normalizeWanderResult(JSON.parse(content), multiChoice);
     } catch {
-      result = { content_direction: content, thinking_process: [], topic: { title: '', connections: [] } };
+      result = normalizeWanderResult({ content_direction: content }, multiChoice);
     }
 
     // 保存到历史记录

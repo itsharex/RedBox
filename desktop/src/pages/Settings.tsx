@@ -2433,9 +2433,9 @@ export function Settings() {
                     <div className="bg-surface-secondary/30 rounded-lg border border-border p-4">
                       <div className="flex items-start justify-between gap-4">
                         <div>
-                          <h4 className="text-sm font-medium text-text-primary">漫步深度思考</h4>
+                          <h4 className="text-sm font-medium text-text-primary">多选题模式</h4>
                           <p className="text-xs text-text-tertiary mt-1.5 leading-relaxed">
-                            默认关闭（单次调用，返回更快）。开启后会进行多轮深度推演，再收敛成最终选题，耗时会明显增加。
+                            漫步默认使用 Agent Runtime。关闭时每次生成 1 个方向；开启后每次基于同样素材一次性生成 3 个方向供选择。
                           </p>
                         </div>
                         <button

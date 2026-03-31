@@ -16,6 +16,11 @@ interface WanderResult {
   content_direction: string;
   thinking_process: string[];
   topic: { title: string; connections: number[] };
+  options?: Array<{
+    content_direction: string;
+    topic: { title: string; connections: number[] };
+  }>;
+  selected_index?: number;
 }
 
 interface WanderHistoryRecord {
@@ -48,9 +53,10 @@ interface WanderProps {
 export function Wander({ onNavigateToManuscript, onNavigateToRedClaw }: WanderProps) {
   const [items, setItems] = useState<WanderItem[]>([]);
   const [loading, setLoading] = useState(false);
-  const [deepThinkEnabled, setDeepThinkEnabled] = useState(false);
+  const [multiChoiceEnabled, setMultiChoiceEnabled] = useState(false);
   const [isSavingMode, setIsSavingMode] = useState(false);
   const [parsedResult, setParsedResult] = useState<WanderResult | null>(null);
+  const [selectedOptionIndex, setSelectedOptionIndex] = useState(0);
   const [parseError, setParseError] = useState<string | null>(null);
   const [phase, setPhase] = useState<'idle' | 'running' | 'done'>('idle');
   const [showFinal, setShowFinal] = useState(false);
@@ -117,9 +123,12 @@ export function Wander({ onNavigateToManuscript, onNavigateToRedClaw }: WanderPr
   // 去创作：创建稿件并跳转
   const goCreate = async () => {
     if (!parsedResult || !onNavigateToManuscript) return;
-    const title = parsedResult.topic.title;
+    const selectedOption = parsedResult.options?.[selectedOptionIndex];
+    const activeTopic = selectedOption?.topic || parsedResult.topic;
+    const activeDirection = selectedOption?.content_direction || parsedResult.content_direction;
+    const title = activeTopic.title;
     // 兼容旧字段名 connections 和新字段名 content_direction
-    const direction = parsedResult.content_direction || (parsedResult as any).connections || '';
+    const direction = activeDirection || (parsedResult as any).connections || '';
     const content = `# ${title}\n\n## 内容方向\n\n${direction}\n\n## 正文\n\n`;
 
     const result = await window.ipcRenderer.invoke('manuscripts:create-file', {
@@ -137,9 +146,12 @@ export function Wander({ onNavigateToManuscript, onNavigateToRedClaw }: WanderPr
 
   const startCreateInRedClaw = () => {
     if (!parsedResult || !onNavigateToRedClaw) return;
-    const suggestedManuscriptPath = buildSuggestedManuscriptPath(parsedResult.topic.title);
+    const selectedOption = parsedResult.options?.[selectedOptionIndex];
+    const activeTopic = selectedOption?.topic || parsedResult.topic;
+    const activeDirection = selectedOption?.content_direction || parsedResult.content_direction;
+    const suggestedManuscriptPath = buildSuggestedManuscriptPath(activeTopic.title);
 
-    const connectedSet = new Set(parsedResult.topic.connections || []);
+    const connectedSet = new Set(activeTopic.connections || []);
     const referenceCards = items.map((item, index) => {
       const folderRef = buildKnowledgeFolderReference(item);
       return {
@@ -178,8 +190,8 @@ export function Wander({ onNavigateToManuscript, onNavigateToRedClaw }: WanderPr
       '请优先读取每个素材目录下的 meta.json，并按需要继续读取正文/转录文件。',
       '',
       '## 灵感选题',
-      `标题：${parsedResult.topic.title}`,
-      `内容方向：${parsedResult.content_direction || ''}`,
+      `标题：${activeTopic.title}`,
+      `内容方向：${activeDirection || ''}`,
       `建议保存稿件路径：${suggestedManuscriptPath}`,
       '',
       '## 需要先读取的素材文件夹（当前工作空间下）',
@@ -223,6 +235,9 @@ export function Wander({ onNavigateToManuscript, onNavigateToRedClaw }: WanderPr
       const parsedRes = JSON.parse(record.result) as WanderResult;
       setItems(parsedItems);
       setParsedResult(parsedRes);
+      setSelectedOptionIndex(
+        Number.isFinite(Number(parsedRes.selected_index)) ? Math.max(0, Number(parsedRes.selected_index)) : 0
+      );
       setParseError(null);
       setPhase('done');
       setShowFinal(true);
@@ -257,7 +272,7 @@ export function Wander({ onNavigateToManuscript, onNavigateToRedClaw }: WanderPr
     (async () => {
       try {
         const settings = await window.ipcRenderer.getSettings();
-        setDeepThinkEnabled(Boolean(settings?.wander_deep_think_enabled));
+        setMultiChoiceEnabled(Boolean(settings?.wander_deep_think_enabled));
       } catch (error) {
         console.error('Failed to load wander mode setting:', error);
       }
@@ -295,10 +310,10 @@ export function Wander({ onNavigateToManuscript, onNavigateToRedClaw }: WanderPr
     };
   }, []);
 
-  const handleToggleDeepThink = async () => {
+  const handleToggleMultiChoice = async () => {
     if (isSavingMode || loading) return;
-    const nextValue = !deepThinkEnabled;
-    setDeepThinkEnabled(nextValue);
+    const nextValue = !multiChoiceEnabled;
+    setMultiChoiceEnabled(nextValue);
     setIsSavingMode(true);
 
     try {
@@ -332,7 +347,7 @@ export function Wander({ onNavigateToManuscript, onNavigateToRedClaw }: WanderPr
       });
     } catch (error) {
       console.error('Failed to persist wander mode setting:', error);
-      setDeepThinkEnabled(!nextValue);
+      setMultiChoiceEnabled(!nextValue);
     } finally {
       setIsSavingMode(false);
     }
@@ -372,6 +387,7 @@ export function Wander({ onNavigateToManuscript, onNavigateToRedClaw }: WanderPr
     setLoading(true);
       setLiveStatus(toStableTwoLineText('正在初始化漫步...'));
     setParsedResult(null);
+    setSelectedOptionIndex(0);
     setParseError(null);
     setItems([]);
     setShowFinal(false);
@@ -386,7 +402,7 @@ export function Wander({ onNavigateToManuscript, onNavigateToRedClaw }: WanderPr
         return;
       }
       const response = await window.ipcRenderer.invoke('wander:brainstorm', randomItems, {
-        deepThink: deepThinkEnabled,
+        multiChoice: multiChoiceEnabled,
         requestId,
       }) as { result: string; historyId?: string; error?: string };
       if (response.error) {
@@ -397,6 +413,9 @@ export function Wander({ onNavigateToManuscript, onNavigateToRedClaw }: WanderPr
         const parsed = parseJsonPayload<WanderResult>(response.result);
         if (parsed && parsed.topic) {
           setParsedResult(parsed);
+          setSelectedOptionIndex(
+            Number.isFinite(Number(parsed.selected_index)) ? Math.max(0, Number(parsed.selected_index)) : 0
+          );
           setLiveStatus(toStableTwoLineText('漫步完成'));
           if (response.historyId) {
             setCurrentHistoryId(response.historyId);
@@ -466,22 +485,22 @@ export function Wander({ onNavigateToManuscript, onNavigateToRedClaw }: WanderPr
           )}
           <div className={clsx('flex items-center gap-2.5', phase !== 'idle' && 'ml-1 pl-3 border-l border-border')}>
             <div className="text-[11px] text-text-tertiary whitespace-nowrap">
-              {deepThinkEnabled ? '深度思考' : '单次调用'}
+              多选题模式
             </div>
             <button
               type="button"
-              onClick={() => void handleToggleDeepThink()}
+              onClick={() => void handleToggleMultiChoice()}
               disabled={isSavingMode || loading}
               className={clsx(
                 'relative w-11 h-6 rounded-full transition-colors shrink-0 disabled:opacity-50',
-                deepThinkEnabled ? 'bg-accent-primary' : 'bg-border'
+                multiChoiceEnabled ? 'bg-accent-primary' : 'bg-border'
               )}
-              title={deepThinkEnabled ? '已开启深度思考' : '已关闭深度思考'}
+              title={multiChoiceEnabled ? '已开启：一次生成 3 个方向' : '已关闭：一次生成 1 个方向'}
             >
               <div
                 className={clsx(
                   'absolute top-1 w-4 h-4 bg-white rounded-full shadow transition-transform',
-                  deepThinkEnabled ? 'translate-x-6' : 'translate-x-1'
+                  multiChoiceEnabled ? 'translate-x-6' : 'translate-x-1'
                 )}
               />
             </button>
@@ -541,6 +560,38 @@ export function Wander({ onNavigateToManuscript, onNavigateToRedClaw }: WanderPr
 
               {showFinal && parsedResult && (
                 <div className="space-y-8 animate-in fade-in slide-in-from-bottom-2 duration-500">
+                  {Array.isArray(parsedResult.options) && parsedResult.options.length > 1 && (
+                    <div className="bg-surface-primary border border-border rounded-xl p-5 shadow-sm">
+                      <div className="text-sm font-medium text-text-primary mb-3">请选择一个选题方向</div>
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                        {parsedResult.options.slice(0, 3).map((option, index) => {
+                          const selected = index === selectedOptionIndex;
+                          return (
+                            <button
+                              key={`${option.topic.title}-${index}`}
+                              type="button"
+                              onClick={() => setSelectedOptionIndex(index)}
+                              className={clsx(
+                                'text-left rounded-lg border p-3 transition-colors',
+                                selected
+                                  ? 'border-accent-primary bg-accent-primary/5'
+                                  : 'border-border hover:bg-surface-secondary/40'
+                              )}
+                            >
+                              <div className="text-xs text-text-tertiary mb-1">方向 {index + 1}</div>
+                              <div className="text-sm font-medium text-text-primary line-clamp-2 mb-1.5">
+                                {option.topic.title}
+                              </div>
+                              <div className="text-xs text-text-secondary line-clamp-3">
+                                {option.content_direction}
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
                   {/* 选题结果 */}
                   <div className="bg-surface-primary border border-border rounded-xl p-6 shadow-sm">
                     <div className="flex items-start justify-between mb-4">
@@ -568,13 +619,13 @@ export function Wander({ onNavigateToManuscript, onNavigateToRedClaw }: WanderPr
                     </div>
 
                     <h2 className="text-xl font-bold text-text-primary mb-4 leading-tight">
-                      {parsedResult.topic.title}
+                      {(parsedResult.options?.[selectedOptionIndex]?.topic.title || parsedResult.topic.title)}
                     </h2>
 
                     <div className="bg-surface-secondary/50 rounded-lg p-4 border border-border/50">
                       <div className="text-sm text-text-secondary leading-relaxed">
                         <span className="text-text-primary font-medium mr-2">内容方向:</span>
-                        {parsedResult.content_direction}
+                        {(parsedResult.options?.[selectedOptionIndex]?.content_direction || parsedResult.content_direction)}
                       </div>
                     </div>
 
@@ -592,7 +643,8 @@ export function Wander({ onNavigateToManuscript, onNavigateToRedClaw }: WanderPr
                     </h3>
                     <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                       {items.map((item, index) => {
-                        const isConnected = parsedResult.topic.connections.includes(index + 1);
+                        const activeConnections = parsedResult.options?.[selectedOptionIndex]?.topic.connections || parsedResult.topic.connections || [];
+                        const isConnected = activeConnections.includes(index + 1);
                         const isDocItem = (item.meta as Record<string, unknown> | undefined)?.sourceType === 'document';
                         const itemBadge = item.type === 'video' ? '视频' : (isDocItem ? '文档' : '笔记');
                         return (
