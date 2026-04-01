@@ -40,7 +40,7 @@ export const ROLE_SEQUENCE_BY_INTENT: Record<string, RoleId[]> = {
   automation: ['planner', 'ops-coordinator', 'reviewer'],
 };
 
-const DEFAULT_TIMEOUT_MS = 30000;
+const DEFAULT_TIMEOUT_MS = 90000;
 
 function parseStructuredContent(raw: string): Record<string, unknown> {
   const text = String(raw || '').trim();
@@ -91,6 +91,7 @@ export async function runStructuredSubagent(input: {
   taskId: string;
   userInput: string;
   priorOutputs: SubagentOutput[];
+  signal?: AbortSignal;
 }): Promise<SubagentOutput> {
   const role = getRoleSpec(input.roleId);
   console.log('[SubagentRuntime] start', {
@@ -133,8 +134,18 @@ export async function runStructuredSubagent(input: {
   };
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), Math.max(15000, Number(input.llm.timeoutMs || DEFAULT_TIMEOUT_MS)));
+  const effectiveTimeoutMs = Math.max(30000, Number(input.llm.timeoutMs || DEFAULT_TIMEOUT_MS));
+  let timedOut = false;
+  const onExternalAbort = () => controller.abort();
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, effectiveTimeoutMs);
   try {
+    if (input.signal?.aborted) {
+      throw new Error(`subagent ${input.roleId} cancelled before start`);
+    }
+    input.signal?.addEventListener('abort', onExternalAbort, { once: true });
     const response = await fetch(safeUrlJoin(normalizeApiBaseUrl(input.llm.baseURL), '/chat/completions'), {
       method: 'POST',
       headers: {
@@ -158,8 +169,19 @@ export async function runStructuredSubagent(input: {
       summary: sanitized.summary.slice(0, 160),
     });
     return sanitized;
+  } catch (error) {
+    if (controller.signal.aborted) {
+      if (timedOut) {
+        throw new Error(`subagent ${input.roleId} timed out after ${effectiveTimeoutMs}ms`);
+      }
+      if (input.signal?.aborted) {
+        throw new Error(`subagent ${input.roleId} cancelled by coordinator`);
+      }
+    }
+    throw error;
   } finally {
     clearTimeout(timeout);
+    input.signal?.removeEventListener('abort', onExternalAbort);
   }
 }
 

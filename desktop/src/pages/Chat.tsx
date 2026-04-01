@@ -114,6 +114,17 @@ function mergeAssistantContent(currentContent: string, incomingContent: string):
   return `${current}${incoming}`;
 }
 
+function mergeThoughtDelta(currentThought: string, incomingThought: string): string {
+  const current = String(currentThought || '');
+  const incoming = String(incomingThought || '');
+  if (!incoming) return current;
+  if (!current) return incoming;
+  if (current === incoming) return current;
+  if (current.endsWith(incoming)) return current;
+  if (incoming.startsWith(current)) return incoming;
+  return `${current}${incoming}`;
+}
+
 function deriveChatErrorPresentation(payload: ChatErrorEventPayload | string | null | undefined): { formatted: string; notice: string } {
   const data = typeof payload === 'string' ? { message: payload } : (payload || {});
   const title = String(data.message || 'AI 请求失败').trim();
@@ -843,7 +854,7 @@ export function Chat({
             // Update existing thought
             newTimeline[lastItemIndex] = {
                 ...lastItem,
-                content: (lastItem.content || '') + content
+                content: mergeThoughtDelta(String(lastItem.content || ''), content)
             };
         } else {
             // No running thought? Create one (fallback)
@@ -856,7 +867,11 @@ export function Chat({
             });
         }
 
-        return [...prev.slice(0, -1), { ...lastMsg, timeline: newTimeline, thinking: (lastMsg.thinking || '') + content }];
+        return [...prev.slice(0, -1), {
+          ...lastMsg,
+          timeline: newTimeline,
+          thinking: mergeThoughtDelta(lastMsg.thinking || '', content),
+        }];
       });
     };
 
@@ -890,7 +905,7 @@ export function Chat({
         setMessages(prev => {
             const lastMsg = prev[prev.length - 1];
             if (!lastMsg || lastMsg.role !== 'ai') return prev;
-            return [...prev.slice(0, -1), { ...lastMsg, thinking: content }];
+            return [...prev.slice(0, -1), { ...lastMsg, thinking: mergeThoughtDelta(lastMsg.thinking || '', content) }];
         });
     };
 

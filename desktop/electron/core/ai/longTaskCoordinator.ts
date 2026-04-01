@@ -1,6 +1,7 @@
 import {
   addChatMessage,
   createChatSession,
+  getChatMessages,
   getChatSession,
   getSettings,
 } from '../../db';
@@ -15,6 +16,7 @@ import {
 } from '../toolRegistry';
 import { createBuiltinTools } from '../tools';
 import { normalizeApiBaseUrl } from '../urlUtils';
+import { getSessionRuntimeStore } from '../sessionRuntimeStore';
 import { assembleRuntimeSystemPrompt } from './contextAssembler';
 import { getRoleSpec } from './roleRegistry';
 import { ROLE_SEQUENCE_BY_INTENT, runStructuredSubagent, type SubagentOutput } from './subagentRuntime';
@@ -55,6 +57,12 @@ type CoordinatorRunOptions = {
   emitChatEvent?: (channel: string, data: unknown) => void;
   onRuntimeEvent?: (event: RuntimeEvent) => void;
   baseSystemPrompt?: string;
+};
+
+type BatchSubagentInput = {
+  sourceContext: string;
+  batchIndex: number;
+  batchRoles: RoleId[];
 };
 
 type LlmConfig = {
@@ -112,10 +120,58 @@ const shouldUseCoordinator = (task: AgentTaskSnapshot): boolean => {
   return Boolean(task.route?.requiresLongRunningTask || task.route?.requiresMultiAgent);
 };
 
-const buildExecutionPrompt = (task: AgentTaskSnapshot, outputs: SubagentOutput[]): string => {
+const buildCoordinatorSourceContext = (sessionId: string): string => {
+  const messages = getChatMessages(sessionId);
+  const latestUser = [...messages].reverse().find((item) => item.role === 'user' && String(item.content || '').trim());
+  if (!latestUser) return '';
+
+  const sections: string[] = [];
+  const userContent = String(latestUser.content || '').trim();
+  if (userContent) {
+    sections.push('## Original User Request');
+    sections.push(userContent.slice(0, 6000));
+  }
+
+  const attachmentRaw = String(latestUser.attachment || '').trim();
+  if (attachmentRaw) {
+    try {
+      const attachment = JSON.parse(attachmentRaw) as Record<string, unknown>;
+      if (attachment?.type === 'wander-references' && Array.isArray(attachment.items)) {
+        const items = attachment.items as Array<Record<string, unknown>>;
+        sections.push('');
+        sections.push('## Attached Reference Materials');
+        sections.push(...items.map((item, index) => [
+          `${index + 1}. ${String(item.title || '(无标题)')}`,
+          `- type: ${String(item.itemType || 'unknown')}`,
+          `- tag: ${String(item.tag || '') || '未标记'}`,
+          `- folderPath: ${String(item.folderPath || '').trim() || '(missing)'}`,
+          `- summary: ${String(item.summary || '').trim() || '(none)'}`,
+        ].join('\n')));
+      }
+      if (attachment?.type === 'uploaded-file') {
+        sections.push('');
+        sections.push('## Uploaded File');
+        sections.push(`- name: ${String(attachment.name || '').trim() || '(unknown)'}`);
+        sections.push(`- absolutePath: ${String(attachment.absolutePath || '').trim() || '(missing)'}`);
+        sections.push(`- kind: ${String(attachment.kind || '').trim() || 'unknown'}`);
+        if (String(attachment.summary || '').trim()) {
+          sections.push(`- summary: ${String(attachment.summary || '').trim()}`);
+        }
+      }
+    } catch {
+      // ignore invalid attachment payload
+    }
+  }
+
+  return sections.filter(Boolean).join('\n');
+};
+
+const buildExecutionPrompt = (task: AgentTaskSnapshot, outputs: SubagentOutput[], sourceContext?: string): string => {
   const sections = [
     `当前任务目标：${task.goal || task.route?.goal || task.taskType}`,
     '',
+    sourceContext ? sourceContext : '',
+    sourceContext ? '' : '',
     '请严格按照以下多角色协作结果执行，不要跳过落盘和工具回执校验：',
     ...outputs.map((output) => {
       const lines = [
@@ -130,10 +186,52 @@ const buildExecutionPrompt = (task: AgentTaskSnapshot, outputs: SubagentOutput[]
     '',
     '执行要求：',
     '- 先完成当前最关键的执行动作，再给出结果。',
-    '- 如果形成了稿件、配图方案或自动化动作，必须推动保存或给出真实工具回执。',
+    '- 对创作任务，必须优先读取原始素材，不得只依赖子 agent 摘要和推断。',
+    '- 如果用户消息或附件里给了明确文件夹/文件路径，先读取这些路径对应的内容，再开始写作。',
+    '- 如果形成了稿件、配图方案或自动化动作，必须推动保存并给出真实工具回执。',
+    '- 若当前任务是稿件创作且没有 projectId，必须调用 `app_cli(command="manuscripts write --path ...", payload={ content: "完整 markdown" })` 落盘。',
+    '- 未收到工具成功返回前，禁止声称“已经保存”。',
     '- 如果工具没有成功，不得宣称成功。',
   ];
   return sections.join('\n');
+};
+
+
+const buildSubagentUserInput = (task: AgentTaskSnapshot, route: NonNullable<AgentTaskSnapshot['route']>, roleId: RoleId, priorOutputs: SubagentOutput[], input: BatchSubagentInput): string => {
+  const sections = [
+    `Current task intent: ${task.intent || task.taskType}`,
+    `Current role: ${roleId}`,
+    `Goal: ${route.goal}`,
+    `Batch: ${input.batchIndex + 1} / roles=${input.batchRoles.join(',')}`,
+  ];
+
+  if (input.sourceContext.trim()) {
+    sections.push('', input.sourceContext.trim());
+  }
+
+  if (priorOutputs.length > 0) {
+    sections.push('', '## Prior Subagent Outputs');
+    sections.push(...priorOutputs.map((output) => {
+      const lines = [
+        `### ${output.roleId}`,
+        `- summary: ${output.summary}`,
+      ];
+      if (output.artifact) lines.push(`- artifact: ${output.artifact}`);
+      if (output.handoff) lines.push(`- handoff: ${output.handoff}`);
+      if (output.risks?.length) lines.push(`- risks: ${output.risks.join('；')}`);
+      return lines.join('\n');
+    }));
+  }
+
+  sections.push(
+    '',
+    'Hard requirements:',
+    '- You must reason over the original user request and attached file/folder references, not only the short goal line.',
+    '- If explicit file or folder paths are present, treat them as mandatory evidence to read in the later execution chain.',
+    '- Do not claim files are already read or saved unless the later execution agent can prove it via tool results.',
+  );
+
+  return sections.filter(Boolean).join('\n');
 };
 
 const isReviewerApproved = (review: SubagentOutput): boolean => {
@@ -146,6 +244,44 @@ const isReviewerApproved = (review: SubagentOutput): boolean => {
     return false;
   }
   return true;
+};
+
+const hasSuccessfulManuscriptWrite = (sessionId: string): boolean => {
+  const toolResults = getSessionRuntimeStore().listToolResults(sessionId, 20);
+  return [...toolResults].reverse().some((result) => {
+    if (!result.success) return false;
+    if (result.toolName !== 'app_cli') return false;
+    const command = String(result.command || '').trim().toLowerCase();
+    const resultText = String(result.resultText || result.summaryText || result.promptText || '').toLowerCase();
+    return command.startsWith('manuscripts write') || resultText.includes('manuscript saved successfully');
+  });
+};
+
+const buildSaveRepairPrompt = (): string => [
+  'Save repair mode:',
+  '- The manuscript content is already being discussed in the current session context.',
+  '- Do not restart planning or rewrite everything from scratch unless absolutely necessary.',
+  '- Your primary job is to save the current manuscript to the manuscripts workspace now.',
+  '- You must call app_cli manuscripts write and wait for a real success response before claiming completion.',
+  '- After save succeeds, report the real saved path and nothing speculative.',
+].join('\n');
+
+const buildReviewerInput = (executionResponse: string, sessionId: string): string => {
+  const recentToolResults = getSessionRuntimeStore().listToolResults(sessionId, 12).slice(-8);
+  const toolEvidence = recentToolResults.length > 0
+    ? recentToolResults.map((result) => {
+      const command = result.command ? `command=${result.command}` : '';
+      const summary = String(result.summaryText || result.promptText || result.resultText || '').slice(0, 320);
+      return `- ${result.toolName} [${result.success ? 'ok' : 'fail'}] ${command} ${summary}`.trim();
+    }).join('\n')
+    : '(no tool results captured)';
+  return [
+    '请审核以下执行结果是否满足目标：',
+    executionResponse,
+    '',
+    '## Tool Evidence',
+    toolEvidence,
+  ].join('\n');
 };
 
 const forwardRuntimeEventToChat = (event: RuntimeEvent, emit?: (channel: string, data: unknown) => void) => {
@@ -196,7 +332,17 @@ const forwardRuntimeEventToChat = (event: RuntimeEvent, emit?: (channel: string,
   }
 };
 
+const emitCoordinatorThought = (content: string, options: CoordinatorRunOptions) => {
+  if (options.onRuntimeEvent) {
+    options.onRuntimeEvent({ type: 'thinking', phase: 'analyze', content });
+    return;
+  }
+  options.emitChatEvent?.('chat:thought-delta', { content });
+};
+
 export class LongTaskCoordinator {
+  private readonly inflightRuns = new Map<string, Promise<AgentTaskSnapshot | null>>();
+
   private async runSubagentBatchWithRetry(input: {
     llm: LlmConfig;
     task: AgentTaskSnapshot;
@@ -207,6 +353,8 @@ export class LongTaskCoordinator {
     signal: AbortSignal;
     options: CoordinatorRunOptions;
     maxAttempts?: number;
+    sourceContext: string;
+    batchIndex: number;
   }): Promise<SubagentBatchResult[]> {
     const runtime = getTaskGraphRuntime();
     const backgroundRegistry = getBackgroundTaskRegistry();
@@ -228,24 +376,52 @@ export class LongTaskCoordinator {
       });
 
       try {
-        const results = await Promise.all(input.batch.map(async (roleId) => {
+        const batchController = new AbortController();
+        const abortBatch = () => {
+          if (!batchController.signal.aborted) {
+            batchController.abort();
+          }
+        };
+        const onParentAbort = () => abortBatch();
+        input.signal.addEventListener('abort', onParentAbort, { once: true });
+        const batchInput: BatchSubagentInput = {
+          sourceContext: input.sourceContext,
+          batchIndex: input.batchIndex,
+          batchRoles: input.batch,
+        };
+        const rolePromises = input.batch.map(async (roleId) => {
           runtime.addTrace(input.task.id, 'coordinator.role.started', {
             roleId,
             priorOutputs: input.priorOutputs.length,
             batch: input.batch,
             attempt,
           }, input.batch.length === 1 && input.batch[0] === 'planner' ? 'plan' : 'spawn_agents');
-          const output = await runStructuredSubagent({
-            llm: input.llm,
-            roleId,
-            route: input.route,
-            runtimeMode: input.task.runtimeMode,
-            taskId: input.task.id,
-            userInput: input.route.goal,
-            priorOutputs: input.priorOutputs,
-          });
-          return { roleId, output };
-        }));
+          try {
+            const output = await runStructuredSubagent({
+              llm: input.llm,
+              roleId,
+              route: input.route,
+              runtimeMode: input.task.runtimeMode,
+              taskId: input.task.id,
+              userInput: buildSubagentUserInput(input.task, input.route, roleId, input.priorOutputs, batchInput),
+              priorOutputs: input.priorOutputs,
+              signal: batchController.signal,
+            });
+            return { roleId, output };
+          } catch (error) {
+            abortBatch();
+            throw error;
+          }
+        });
+        let results: SubagentBatchResult[];
+        try {
+          results = await Promise.all(rolePromises);
+        } catch (error) {
+          await Promise.allSettled(rolePromises);
+          throw error;
+        } finally {
+          input.signal.removeEventListener('abort', onParentAbort);
+        }
         runtime.addTrace(input.task.id, 'coordinator.batch.succeeded', {
           batch: input.batch,
           attempt,
@@ -265,14 +441,7 @@ export class LongTaskCoordinator {
         if (attempt >= maxAttempts) {
           break;
         }
-        input.options.onRuntimeEvent?.({
-          type: 'thinking',
-          phase: 'analyze',
-          content: `${input.batch.join(' / ')} 失败，正在重试第 ${attempt + 1} 次...`,
-        });
-        input.options.emitChatEvent?.('chat:thought-delta', {
-          content: `${input.batch.join(' / ')} 失败，正在重试第 ${attempt + 1} 次...`,
-        });
+        emitCoordinatorThought(`${input.batch.join(' / ')} 失败，正在重试第 ${attempt + 1} 次...`, input.options);
       }
     }
 
@@ -280,6 +449,20 @@ export class LongTaskCoordinator {
   }
 
   async maybeRun(taskId: string, options: CoordinatorRunOptions = {}): Promise<AgentTaskSnapshot | null> {
+    const existing = this.inflightRuns.get(taskId);
+    if (existing) {
+      return existing;
+    }
+
+    const runPromise = this.runMaybeRun(taskId, options)
+      .finally(() => {
+        this.inflightRuns.delete(taskId);
+      });
+    this.inflightRuns.set(taskId, runPromise);
+    return runPromise;
+  }
+
+  private async runMaybeRun(taskId: string, options: CoordinatorRunOptions = {}): Promise<AgentTaskSnapshot | null> {
     const runtime = getTaskGraphRuntime();
     const task = runtime.getTask(taskId);
     if (!task) return null;
@@ -329,7 +512,7 @@ export class LongTaskCoordinator {
       apiKey,
       baseURL,
       model,
-      timeoutMs: 45000,
+      timeoutMs: 90000,
     };
   }
 
@@ -364,6 +547,7 @@ export class LongTaskCoordinator {
     const prepRoles = normalizeRoleSequence(task);
     const prepRoleBatches = normalizeRoleBatches(task);
     const outputs: SubagentOutput[] = [];
+    const sourceContext = buildCoordinatorSourceContext(sessionId);
 
     runtime.addTrace(task.id, 'coordinator.start', {
       route: task.route,
@@ -372,7 +556,7 @@ export class LongTaskCoordinator {
       runtimeMode: task.runtimeMode,
     }, 'plan');
 
-    for (const batch of prepRoleBatches) {
+    for (const [batchIndex, batch] of prepRoleBatches.entries()) {
       if (signal.aborted) {
         throw new Error('Coordinator cancelled');
       }
@@ -389,9 +573,7 @@ export class LongTaskCoordinator {
           source: 'thought',
           text: `[coordinator] ${roleId} 正在处理`,
         });
-        const roleThinkingEvent: RuntimeEvent = { type: 'thinking', phase: 'analyze', content: `${roleId} 正在规划/处理...` };
-        options.onRuntimeEvent?.(roleThinkingEvent);
-        options.emitChatEvent?.('chat:thought-delta', { content: `${roleId} 正在规划/处理...` });
+        emitCoordinatorThought(`${roleId} 正在规划/处理...`, options);
       }));
 
       const batchOutputs = await this.runSubagentBatchWithRetry({
@@ -403,6 +585,8 @@ export class LongTaskCoordinator {
         backgroundTaskId,
         signal,
         options,
+        sourceContext,
+        batchIndex,
       });
 
       for (const { roleId, output } of batchOutputs) {
@@ -436,7 +620,7 @@ export class LongTaskCoordinator {
       runtime.completeNode(task.id, 'spawn_agents', `subagents=${prepRoles.filter((roleId) => roleId !== 'planner').join(',')}`);
     }
 
-    const executionPrompt = buildExecutionPrompt(task, outputs);
+    const executionPrompt = buildExecutionPrompt(task, outputs, sourceContext);
     const activeRoleId = [...outputs].reverse().find((item) => item.roleId === 'copywriter' || item.roleId === 'image-director' || item.roleId === 'ops-coordinator')?.roleId
       || task.roleId as RoleId
       || task.route.recommendedRole;
@@ -513,6 +697,83 @@ export class LongTaskCoordinator {
       content: execution.response,
     });
 
+    let repairResponse = '';
+    if (task.intent === 'manuscript_creation' && !hasSuccessfulManuscriptWrite(sessionId)) {
+      emitCoordinatorThought('检测到稿件尚未真实落盘，正在执行强制保存步骤...', options);
+      runtime.addTrace(task.id, 'coordinator.save_repair.started', {
+        sessionId,
+        activeRoleId: activeRole.roleId,
+      }, 'save_artifact');
+      await backgroundRegistry.appendTurn(backgroundTaskId, {
+        source: 'system',
+        text: '[coordinator] manuscript save repair started',
+      });
+
+      const repairPrompt = buildSaveRepairPrompt();
+      addChatMessage({
+        id: `coord_repair_user_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        session_id: sessionId,
+        role: 'user',
+        content: repairPrompt,
+      });
+
+      const repairRuntime = new QueryRuntime(
+        toolRegistry,
+        toolExecutor,
+        {
+          onEvent: (event) => {
+            options.onRuntimeEvent?.(event);
+            forwardRuntimeEventToChat(event, options.emitChatEvent);
+            if (event.type === 'thinking') {
+              void backgroundRegistry.appendTurn(backgroundTaskId, { source: 'thought', text: event.content });
+            } else if (event.type === 'tool_start') {
+              void backgroundRegistry.appendTurn(backgroundTaskId, { source: 'tool', text: `调用工具：${event.name}` });
+            } else if (event.type === 'response_chunk') {
+              void backgroundRegistry.appendTurn(backgroundTaskId, { source: 'response', text: event.content });
+            } else if (event.type === 'error') {
+              void backgroundRegistry.appendTurn(backgroundTaskId, { source: 'system', text: `错误：${event.message}` });
+            }
+          },
+        },
+        {
+          sessionId,
+          apiKey: llm.apiKey,
+          baseURL: llm.baseURL,
+          model: llm.model,
+          systemPrompt: `${finalSystemPrompt}
+
+## Save Repair Pass
+You are in a repair-only pass. The manuscript must be saved for real before you can conclude.`,
+          messages: [],
+          signal,
+          maxTurns: 4,
+          maxTimeMinutes: 2,
+          temperature: 0.1,
+          toolPack: executionToolPack,
+          runtimeMode: task.runtimeMode,
+          interactive: true,
+          requiresHumanApproval: task.route.requiresHumanApproval,
+        },
+      );
+      const repair = await repairRuntime.run(repairPrompt);
+      if (repair.error) {
+        runtime.failTask(task.id, repair.error, 'save_artifact');
+        await backgroundRegistry.failTask(backgroundTaskId, repair.error);
+        throw new Error(repair.error);
+      }
+      repairResponse = repair.response;
+      addChatMessage({
+        id: `coord_repair_assistant_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        session_id: sessionId,
+        role: 'assistant',
+        content: repair.response,
+      });
+      runtime.addTrace(task.id, 'coordinator.save_repair.completed', {
+        responseLength: repair.response.length,
+        hasSavedManuscript: hasSuccessfulManuscriptWrite(sessionId),
+      }, 'save_artifact');
+    }
+
     if (task.graph.some((node) => node.type === 'handoff')) {
       runtime.startNode(task.id, 'handoff', '整合下一步交接');
       runtime.completeNode(task.id, 'handoff', outputs.map((item) => `${item.roleId}:${item.handoff || item.summary}`).join(' | '));
@@ -526,7 +787,7 @@ export class LongTaskCoordinator {
         route: task.route,
         runtimeMode: task.runtimeMode,
         taskId: task.id,
-        userInput: `请审核以下执行结果是否满足目标：\n${execution.response}`,
+        userInput: buildReviewerInput([execution.response, repairResponse].filter(Boolean).join('\n\n'), sessionId),
         priorOutputs: [
           ...outputs,
           {
@@ -537,6 +798,7 @@ export class LongTaskCoordinator {
             raw: { executionResponse: execution.response },
           },
         ],
+        signal,
       });
       runtime.addCheckpoint(task.id, 'review', reviewOutput.summary, reviewOutput);
       runtime.addArtifact(task.id, {
@@ -550,6 +812,13 @@ export class LongTaskCoordinator {
         throw new Error(reviewOutput.summary || 'reviewer rejected execution');
       }
       runtime.completeNode(task.id, 'review', reviewOutput.summary);
+    }
+
+    if (task.intent === 'manuscript_creation' && !hasSuccessfulManuscriptWrite(sessionId)) {
+      const saveError = 'coordinator execution missing successful manuscripts write tool result';
+      runtime.failTask(task.id, saveError, 'save_artifact');
+      await backgroundRegistry.failTask(backgroundTaskId, saveError);
+      throw new Error(saveError);
     }
 
     if (task.graph.some((node) => node.type === 'save_artifact')) {
