@@ -74,7 +74,8 @@ export class DirectorAgent extends EventEmitter {
         advisorNames: string[],
         discussionGoal: string = '',
         historyContext: { role: 'user' | 'assistant'; content: string }[] = [],
-        fileContext?: { filePath: string; fileContent: string }
+        fileContext?: { filePath: string; fileContent: string },
+        coordinationBrief?: string,
     ): Promise<string> {
         this.abortController = new AbortController();
         const signal = this.abortController.signal;
@@ -86,6 +87,9 @@ export class DirectorAgent extends EventEmitter {
             let goalContext = discussionGoal
                 ? `\n\n## 🎯 群聊目标\n\n本群的讨论目标是：**${discussionGoal}**\n\n请务必围绕此目标来分析用户的问题，你的开场和引导都应该服务于这个目标。`
                 : '';
+            if (coordinationBrief) {
+                goalContext += `\n\n## 协调规划\n以下是协调代理生成的讨论框架，请在主持时参考：\n${coordinationBrief}`;
+            }
 
             // 构建文件上下文提示
             if (fileContext) {
@@ -128,7 +132,8 @@ export class DirectorAgent extends EventEmitter {
         userMessage: string,
         conversationHistory: ConversationMessage[],
         discussionGoal: string = '',
-        fileContext?: { filePath: string; fileContent: string }
+        fileContext?: { filePath: string; fileContent: string },
+        coordinationBrief?: string,
     ): Promise<string> {
         this.abortController = new AbortController();
         const signal = this.abortController.signal;
@@ -145,6 +150,9 @@ export class DirectorAgent extends EventEmitter {
             let systemPrompt = renderPrompt(DIRECTOR_SUMMARY_PROMPT_TEMPLATE, {
                 goal: discussionGoal || '当前项目',
             });
+            if (coordinationBrief) {
+                systemPrompt += `\n\n## 协调规划\n请结合以下规划对团队观点做最终归纳：\n${coordinationBrief}`;
+            }
             if (fileContext) {
                 systemPrompt += `\n\n## 📄 当前编辑的文件\n用户正在编辑文件：\`${fileContext.filePath}\`\n如果讨论结果包含对文件的具体修改建议，请在总结中明确指出。`;
             }

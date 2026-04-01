@@ -570,6 +570,8 @@ export interface ToolCallRequest {
     callId: string;
     name: string;
     params: unknown;
+    forceConfirmation?: boolean;
+    confirmationDetails?: ToolConfirmationDetails | null;
 }
 
 /**
@@ -632,23 +634,34 @@ export class ToolExecutor {
         }
 
         // 检查是否需要确认
-        if (tool.requiresConfirmation && !this.autoConfirmTools.has(name)) {
-            const confirmDetails = tool.getConfirmationDetails?.(params);
-            if (confirmDetails && this.onConfirmRequest) {
-                const outcome = await this.onConfirmRequest(callId, tool, params, confirmDetails);
+        const requiresConfirmation = (tool.requiresConfirmation || request.forceConfirmation) && !this.autoConfirmTools.has(name);
+        if (requiresConfirmation) {
+            const confirmDetails = request.confirmationDetails || tool.getConfirmationDetails?.(params) || null;
+            if (!confirmDetails || !this.onConfirmRequest) {
+                return {
+                    callId,
+                    name,
+                    result: createErrorResult(
+                        `Tool "${name}" requires confirmation but no confirmation handler is available`,
+                        ToolErrorType.PERMISSION_DENIED,
+                    ),
+                    durationMs: Date.now() - startTime,
+                };
+            }
 
-                if (outcome === ToolConfirmationOutcome.Cancel) {
-                    return {
-                        callId,
-                        name,
-                        result: createErrorResult('Tool execution cancelled by user', ToolErrorType.CANCELLED),
-                        durationMs: Date.now() - startTime,
-                    };
-                }
+            const outcome = await this.onConfirmRequest(callId, tool, params, confirmDetails);
 
-                if (outcome === ToolConfirmationOutcome.ProceedAlways) {
-                    this.autoConfirmTools.add(name);
-                }
+            if (outcome === ToolConfirmationOutcome.Cancel) {
+                return {
+                    callId,
+                    name,
+                    result: createErrorResult('Tool execution cancelled by user', ToolErrorType.CANCELLED),
+                    durationMs: Date.now() - startTime,
+                };
+            }
+
+            if (outcome === ToolConfirmationOutcome.ProceedAlways) {
+                this.autoConfirmTools.add(name);
             }
         }
 

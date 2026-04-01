@@ -35,6 +35,11 @@ interface WanderProps {
   onNavigateToRedClaw?: (payload: {
     content: string;
     displayContent?: string;
+    taskHints?: {
+      intent?: string;
+      forceMultiAgent?: boolean;
+      forceLongRunningTask?: boolean;
+    };
     attachment?: {
       type: 'wander-references';
       title?: string;
@@ -213,6 +218,10 @@ export function Wander({ onNavigateToManuscript, onNavigateToRedClaw }: WanderPr
     onNavigateToRedClaw({
       content,
       displayContent: `基于漫步灵感开始创作：${parsedResult.topic.title}`,
+      taskHints: {
+        intent: 'manuscript_creation',
+        forceMultiAgent: true,
+      },
       attachment: {
         type: 'wander-references',
         title: '漫步参考素材',

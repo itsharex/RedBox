@@ -3,6 +3,7 @@ import { normalizeApiBaseUrl, safeUrlJoin } from '../urlUtils';
 import { getTaskGraphRuntime } from './taskGraphRuntime';
 import { getRoleSpec } from './roleRegistry';
 import type { IntentRoute, RoleId, RuntimeMode } from './types';
+import { ROLE_OUTPUT_SCHEMA_HINT, validateSubagentOutput } from './subagentSchemas';
 
 type RuntimeLlmConfig = {
   apiKey: string;
@@ -11,23 +12,25 @@ type RuntimeLlmConfig = {
   timeoutMs?: number;
 };
 
-type SubagentOutput = {
+export type SubagentOutput = {
   roleId: RoleId;
   summary: string;
   artifact?: string;
   handoff?: string;
   risks?: string[];
+  approved?: boolean;
+  issues?: string[];
   raw?: unknown;
 };
 
-type SubagentOrchestrationResult = {
+export type SubagentOrchestrationResult = {
   outputs: SubagentOutput[];
   promptSection: string;
 };
 
 const ORCHESTRATION_PROMPT_PATH = 'runtime/ai/subagent_orchestrator.txt';
 
-const ROLE_SEQUENCE_BY_INTENT: Record<string, RoleId[]> = {
+export const ROLE_SEQUENCE_BY_INTENT: Record<string, RoleId[]> = {
   manuscript_creation: ['planner', 'researcher', 'copywriter', 'reviewer'],
   advisor_persona: ['planner', 'researcher', 'copywriter', 'reviewer'],
   cover_generation: ['planner', 'researcher', 'image-director', 'reviewer'],
@@ -54,20 +57,33 @@ function parseStructuredContent(raw: string): Record<string, unknown> {
 }
 
 function sanitizeOutput(roleId: RoleId, parsed: Record<string, unknown>): SubagentOutput {
+  const summary = String(parsed.summary || '').trim();
+  const artifact = typeof parsed.artifact === 'string' ? parsed.artifact.trim() : undefined;
+  const handoff = typeof parsed.handoff === 'string' ? parsed.handoff.trim() : undefined;
   const risks = Array.isArray(parsed.risks)
     ? parsed.risks.map((item) => String(item || '').trim()).filter(Boolean).slice(0, 8)
     : [];
-  return {
+  const issues = Array.isArray(parsed.issues)
+    ? parsed.issues.map((item) => String(item || '').trim()).filter(Boolean).slice(0, 12)
+    : [];
+  const approved = typeof parsed.approved === 'boolean'
+    ? parsed.approved
+    : (typeof parsed.pass === 'boolean' ? parsed.pass : undefined);
+  const output: SubagentOutput = {
     roleId,
-    summary: String(parsed.summary || '').trim() || `role=${roleId}`,
-    artifact: typeof parsed.artifact === 'string' ? parsed.artifact.trim() : undefined,
-    handoff: typeof parsed.handoff === 'string' ? parsed.handoff.trim() : undefined,
+    summary,
+    artifact,
+    handoff,
     risks,
+    approved,
+    issues,
     raw: parsed,
   };
+  validateSubagentOutput(roleId, output);
+  return output;
 }
 
-async function callSubagentLlm(input: {
+export async function runStructuredSubagent(input: {
   llm: RuntimeLlmConfig;
   roleId: RoleId;
   route: IntentRoute;
@@ -109,7 +125,8 @@ async function callSubagentLlm(input: {
         content: [
           `用户请求：${input.userInput}`,
           `任务目标：${input.route.goal}`,
-          '请输出严格 JSON，字段允许包含 summary / artifact / handoff / risks。',
+          ROLE_OUTPUT_SCHEMA_HINT[input.roleId],
+          '不要输出 markdown，不要输出解释，只输出一个合法 JSON 对象。',
         ].join('\n'),
       },
     ],
@@ -165,7 +182,7 @@ export async function runSubagentOrchestration(input: {
   try {
     for (const roleId of roleSequence) {
       runtime.addTrace(input.taskId, 'subagent.start', { roleId, priorOutputs: outputs.length }, 'spawn_agents');
-      const output = await callSubagentLlm({
+      const output = await runStructuredSubagent({
         llm: input.llm,
         roleId,
         route: input.route,

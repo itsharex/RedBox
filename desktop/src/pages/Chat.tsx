@@ -443,7 +443,8 @@ export function Chat({
         sessionId: sessionId,
         message: pendingMessage.content,
         displayContent: pendingMessage.displayContent,
-        attachment: pendingMessage.attachment
+        attachment: pendingMessage.attachment,
+        taskHints: pendingMessage.taskHints,
       });
 
       // 标记消息已消费
@@ -855,7 +856,7 @@ export function Chat({
             });
         }
 
-        return [...prev.slice(0, -1), { ...lastMsg, timeline: newTimeline }];
+        return [...prev.slice(0, -1), { ...lastMsg, timeline: newTimeline, thinking: (lastMsg.thinking || '') + content }];
       });
     };
 
@@ -877,7 +878,7 @@ export function Chat({
             };
         }
 
-        return [...prev.slice(0, -1), { ...lastMsg, timeline: newTimeline }];
+        return [...prev.slice(0, -1), { ...lastMsg, timeline: newTimeline, thinking: lastMsg.thinking || '' }];
       });
     };
 
@@ -1277,6 +1278,7 @@ export function Chat({
       message: normalizedContent || displayText,
       displayContent: displayText,
       attachment,
+      taskHints: undefined,
     });
   };
 

@@ -261,6 +261,15 @@ export const MessageItem = memo(({
     : Boolean(msg.content || (msg.isStreaming && !msg.thinking));
   const showTimeline = !isUser && msg.timeline && msg.timeline.length > 0;
   const showLegacyWorkflow = !isUser && (!msg.timeline || msg.timeline.length === 0) && (msg.thinking || msg.tools.length > 0 || msg.activatedSkill);
+  const latestTimelineThought = !isUser
+    ? [...(msg.timeline || [])]
+        .reverse()
+        .find((item) => item.type === 'thought' && String(item.content || '').trim())
+    : undefined;
+  const thoughtBubbleContent = !isUser
+    ? (latestTimelineThought?.content || msg.thinking || '')
+    : '';
+  const showThoughtBubble = !isUser && Boolean(thoughtBubbleContent);
   const showWorkflowOnTop = workflowPlacement === 'top';
 
   useEffect(() => {
@@ -434,6 +443,15 @@ export const MessageItem = memo(({
       )}
 
       {/* AI 工作流可视化 (新版 Timeline) */}
+      {showWorkflowOnTop && showThoughtBubble && (
+        <div className="mb-3 w-full max-w-3xl">
+          <ThinkingBubble
+            content={thoughtBubbleContent}
+            isActive={Boolean(msg.isStreaming && latestTimelineThought?.status === 'running')}
+          />
+        </div>
+      )}
+
       {showWorkflowOnTop && showTimeline && (
         <ProcessTimeline items={msg.timeline} isStreaming={!!msg.isStreaming} variant={workflowVariant} />
       )}
@@ -553,6 +571,15 @@ export const MessageItem = memo(({
       {/* AI 工作流可视化 (底部渲染) */}
       {!showWorkflowOnTop && showTimeline && (
         <ProcessTimeline items={msg.timeline} isStreaming={!!msg.isStreaming} variant={workflowVariant} />
+      )}
+
+      {!showWorkflowOnTop && showThoughtBubble && (
+        <div className="mt-3 w-full max-w-3xl">
+          <ThinkingBubble
+            content={thoughtBubbleContent}
+            isActive={Boolean(msg.isStreaming && latestTimelineThought?.status === 'running')}
+          />
+        </div>
       )}
 
       {!showWorkflowOnTop && showLegacyWorkflow && (

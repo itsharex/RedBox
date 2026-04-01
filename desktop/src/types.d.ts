@@ -397,7 +397,18 @@ declare global {
 
       // Chat Service API
       chat: {
-        send: (data: { sessionId?: string; message: string; displayContent?: string; attachment?: unknown; modelConfig?: unknown }) => void;
+      send: (data: {
+        sessionId?: string;
+        message: string;
+        displayContent?: string;
+        attachment?: unknown;
+        modelConfig?: unknown;
+        taskHints?: {
+          intent?: string;
+          forceMultiAgent?: boolean;
+          forceLongRunningTask?: boolean;
+        };
+      }) => void;
         pickAttachment: (payload?: { sessionId?: string }) => Promise<{ success?: boolean; canceled?: boolean; error?: string; attachment?: unknown }>;
         cancel: (data?: { sessionId?: string } | string) => void;
         confirmTool: (callId: string, confirmed: boolean) => void;

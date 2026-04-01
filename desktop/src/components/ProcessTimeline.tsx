@@ -397,8 +397,12 @@ export function ProcessTimeline({ items, isStreaming, variant = 'default' }: Pro
           {filteredItems.map(item => {
             const inputText = item.type === 'tool-call' ? truncateText(stringifyValue(item.toolData?.input)) : '';
             const outputText = item.type === 'tool-call' ? truncateText(item.toolData?.output || '') : '';
+            const thoughtText = item.type === 'thought' ? truncateText(item.content || '', 2400) : '';
+            const phaseText = item.type === 'phase' ? truncateText(item.content || item.title || '', 1200) : '';
             const durationText = formatDuration(item.duration);
             const isTool = item.type === 'tool-call';
+            const isThought = item.type === 'thought';
+            const isPhase = item.type === 'phase';
             const title =
               item.title ||
               (isTool ? item.toolData?.name || 'tool_call' : item.type === 'thought' ? '思考' : item.type === 'skill' ? '技能' : '阶段');
@@ -432,6 +436,16 @@ export function ProcessTimeline({ items, isStreaming, variant = 'default' }: Pro
                       {isTool && (
                         <span className="rounded-full border border-border/60 bg-surface-secondary/55 px-1.5 py-0 text-[10px] text-text-tertiary">
                           tool
+                        </span>
+                      )}
+                      {isThought && (
+                        <span className="rounded-full border border-amber-500/35 bg-amber-500/10 px-1.5 py-0 text-[10px] text-amber-600">
+                          thought
+                        </span>
+                      )}
+                      {isPhase && (
+                        <span className="rounded-full border border-sky-500/30 bg-sky-500/10 px-1.5 py-0 text-[10px] text-sky-600">
+                          phase
                         </span>
                       )}
                       <span className={clsx(
@@ -485,7 +499,7 @@ export function ProcessTimeline({ items, isStreaming, variant = 'default' }: Pro
                   </div>
                 </div>
 
-                {isTool && !isCompact && (inputText || outputText) && (
+                {(isTool && !isCompact && (inputText || outputText)) && (
                   <details className="border-t border-border/70 px-3 py-2 bg-surface-secondary/30" open={expandAllOutputs || item.status === 'running' || item.status === 'failed'}>
                     <summary className="text-xs text-text-tertiary cursor-pointer select-none hover:text-text-primary">
                       查看参数与输出
@@ -506,6 +520,28 @@ export function ProcessTimeline({ items, isStreaming, variant = 'default' }: Pro
                         </pre>
                       </div>
                     )}
+                  </details>
+                )}
+
+                {!isCompact && isThought && thoughtText && (
+                  <details className="border-t border-border/70 px-3 py-2 bg-amber-500/5" open={item.status === 'running'}>
+                    <summary className="text-xs text-amber-700/80 cursor-pointer select-none hover:text-amber-700">
+                      查看思考内容
+                    </summary>
+                    <pre className="mt-2 text-xs whitespace-pre-wrap break-words rounded bg-surface-primary p-2 text-text-secondary max-h-52 overflow-auto">
+                      {thoughtText}
+                    </pre>
+                  </details>
+                )}
+
+                {!isCompact && isPhase && phaseText && (
+                  <details className="border-t border-border/70 px-3 py-2 bg-sky-500/5" open={item.status === 'running'}>
+                    <summary className="text-xs text-sky-700/80 cursor-pointer select-none hover:text-sky-700">
+                      查看阶段说明
+                    </summary>
+                    <pre className="mt-2 text-xs whitespace-pre-wrap break-words rounded bg-surface-primary p-2 text-text-secondary max-h-40 overflow-auto">
+                      {phaseText}
+                    </pre>
                   </details>
                 )}
               </div>

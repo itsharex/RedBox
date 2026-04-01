@@ -116,6 +116,8 @@ export class HeadlessAgentRunner {
         messages: prepared.runtimeMessages,
         userInput: input.prompt,
         toolPack: 'redclaw',
+        runtimeMode: prepared.runtimeMode,
+        requiresHumanApproval: prepared.preparedExecution.route.requiresHumanApproval,
         temperature: prepared.temperature,
         maxTurns: prepared.maxTurns,
         maxTimeMinutes: prepared.maxTimeMinutes,

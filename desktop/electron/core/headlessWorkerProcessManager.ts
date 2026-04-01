@@ -2,10 +2,13 @@ import { app } from 'electron';
 import path from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { getBackgroundTaskRegistry } from './backgroundTaskRegistry';
+import { evaluateRuntimeToolPermission } from './runtimePermissions';
 import { applyToolResultBudget } from './toolResultBudget';
 import { getSessionRuntimeStore } from './sessionRuntimeStore';
 import { getToolResultStore } from './toolResultStore';
 import {
+  createErrorResult,
+  ToolErrorType,
   ToolConfirmationOutcome,
   ToolExecutor,
   ToolRegistry,
@@ -48,6 +51,8 @@ type PendingRuntimeRun = {
   taskId: string;
   sessionId: string;
   toolPack: BuiltinToolPack;
+  runtimeMode?: string;
+  requiresHumanApproval?: boolean;
   rollback?: () => Promise<void> | void;
   attemptSignal?: AbortSignal;
   toolAbortController: AbortController;
@@ -588,6 +593,8 @@ export class HeadlessWorkerProcessManager {
     messages: Array<{ role: 'user' | 'assistant'; content: string }>;
     userInput: string;
     toolPack: BuiltinToolPack;
+    runtimeMode?: string;
+    requiresHumanApproval?: boolean;
     temperature?: number;
     maxTurns?: number;
     maxTimeMinutes?: number;
@@ -608,6 +615,8 @@ export class HeadlessWorkerProcessManager {
             taskId: input.taskId,
             sessionId: input.sessionId,
             toolPack: input.toolPack,
+            runtimeMode: input.runtimeMode,
+            requiresHumanApproval: input.requiresHumanApproval,
             rollback: input.rollback,
             attemptSignal: input.attemptSignal,
             toolAbortController: new AbortController(),
@@ -722,12 +731,103 @@ export class HeadlessWorkerProcessManager {
         source: 'tool',
         text: `调用工具：${call.name}`,
       });
-      const response = await executor.execute({
-        callId: call.id,
-        name: call.name,
-        params: call.args,
-      } satisfies ToolCallRequest, run.toolAbortController.signal);
-      responses.push(response);
+      const tool = registry.getTool(call.name);
+      if (!tool) {
+        const missingResult = createErrorResult(`Tool "${call.name}" not found`, ToolErrorType.EXECUTION_FAILED);
+        responses.push({
+          callId: call.id,
+          name: call.name,
+          result: missingResult,
+          durationMs: 0,
+        });
+        await getBackgroundTaskRegistry().appendTurn(run.taskId, {
+          source: 'system',
+          text: `${call.name}: error | tool not found`,
+        });
+        continue;
+      }
+      const permission = evaluateRuntimeToolPermission({
+        tool,
+        toolName: call.name,
+        args: call.args,
+        context: {
+          sessionId: run.sessionId,
+          toolPack: run.toolPack,
+          runtimeMode: run.runtimeMode,
+          interactive: false,
+          requiresHumanApproval: run.requiresHumanApproval,
+        },
+      });
+      if (permission.outcome === 'deny') {
+        this.runtimeStore.appendTranscript({
+          sessionId: run.sessionId,
+          recordType: 'tool.permission',
+          role: 'system',
+          content: `${call.name}: deny - ${permission.reason}`,
+          payload: {
+            kind: 'tool.permission',
+            data: {
+              callId: call.id,
+              toolName: call.name,
+              outcome: 'deny',
+              workerMode: 'child-runtime-worker',
+            },
+          },
+        });
+        this.runtimeStore.addCheckpoint({
+          sessionId: run.sessionId,
+          checkpointType: 'tool.permission.denied',
+          summary: `${call.name}: ${permission.reason}`,
+          payload: {
+            callId: call.id,
+            toolName: call.name,
+            workerMode: 'child-runtime-worker',
+          },
+        });
+        const deniedResult = createErrorResult(permission.reason, ToolErrorType.PERMISSION_DENIED);
+        const deniedResponse: ToolCallResponse = {
+          callId: call.id,
+          name: call.name,
+          result: deniedResult,
+          durationMs: 0,
+        };
+        responses.push(deniedResponse);
+        await getBackgroundTaskRegistry().appendTurn(run.taskId, {
+          source: 'system',
+          text: `${call.name}: permission denied | ${permission.reason}`,
+        });
+      } else {
+        if (permission.outcome === 'confirm') {
+          this.runtimeStore.appendTranscript({
+            sessionId: run.sessionId,
+            recordType: 'tool.permission',
+            role: 'system',
+            content: `${call.name}: confirm - ${permission.reason}`,
+            payload: {
+              kind: 'tool.permission',
+              data: {
+                callId: call.id,
+                toolName: call.name,
+                outcome: 'confirm',
+                workerMode: 'child-runtime-worker',
+              },
+            },
+          });
+          await getBackgroundTaskRegistry().appendTurn(run.taskId, {
+            source: 'system',
+            text: `${call.name}: auto-approved in hosted worker | ${permission.reason}`,
+          });
+        }
+        const response = await executor.execute({
+          callId: call.id,
+          name: call.name,
+          params: call.args,
+          forceConfirmation: permission.outcome === 'confirm',
+          confirmationDetails: permission.details || null,
+        } satisfies ToolCallRequest, run.toolAbortController.signal);
+        responses.push(response);
+      }
+      const response = responses[responses.length - 1];
       const resultText = String(response.result.llmContent || response.result.display || response.result.error?.message || '').trim();
       const summaryText = resultText.length > 4_000
         ? `${resultText.slice(0, 4_000)}\n\n[tool result summarized for runtime event]`

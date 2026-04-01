@@ -1,9 +1,19 @@
 import { CompactManager } from './compactManager';
 import { executeRuntimeHooks } from './runtimeHooks';
+import { evaluateRuntimeToolPermission } from './runtimePermissions';
 import { getSessionRuntimeStore } from './sessionRuntimeStore';
 import { getToolResultStore } from './toolResultStore';
 import { applyToolResultBudget } from './toolResultBudget';
-import { ToolKind, ToolRegistry, ToolExecutor, type ToolCallRequest, type ToolCallResponse, type ToolResult } from './toolRegistry';
+import {
+  createErrorResult,
+  ToolErrorType,
+  ToolKind,
+  ToolRegistry,
+  ToolExecutor,
+  type ToolCallRequest,
+  type ToolCallResponse,
+  type ToolResult,
+} from './toolRegistry';
 import { normalizeApiBaseUrl, safeUrlJoin } from './urlUtils';
 import type { RuntimeAdapter, RuntimeConfig, RuntimeMessage } from './runtimeTypes';
 
@@ -504,6 +514,109 @@ export class QueryRuntime {
   private async executeSingleToolCall(toolCall: LlmToolCall): Promise<ToolCallResponse> {
     const tool = this.registry.getTool(toolCall.name);
     const description = tool?.getDescription(toolCall.args) || `Executing ${toolCall.name}`;
+    const startedAt = now();
+
+    if (!tool) {
+      return {
+        callId: toolCall.id,
+        name: toolCall.name,
+        result: createErrorResult(`Tool "${toolCall.name}" not found`, ToolErrorType.EXECUTION_FAILED),
+        durationMs: 0,
+      };
+    }
+
+    const permission = evaluateRuntimeToolPermission({
+      tool,
+      toolName: toolCall.name,
+      args: toolCall.args,
+      context: {
+        sessionId: this.config.sessionId,
+        toolPack: this.config.toolPack,
+        runtimeMode: this.config.runtimeMode,
+        interactive: this.config.interactive !== false,
+        requiresHumanApproval: this.config.requiresHumanApproval,
+      },
+    });
+
+    if (permission.outcome !== 'allow') {
+      this.adapter.onEvent({
+        type: 'tool_summary',
+        toolName: toolCall.name,
+        content: `permission ${permission.outcome}: ${permission.reason}`,
+      });
+      this.store.appendTranscript({
+        sessionId: this.config.sessionId,
+        recordType: 'tool.permission',
+        role: 'system',
+        content: `${toolCall.name}: ${permission.outcome} - ${permission.reason}`,
+        payload: {
+          kind: 'tool.permission',
+          data: {
+            callId: toolCall.id,
+            toolName: toolCall.name,
+            outcome: permission.outcome,
+            source: permission.source,
+          },
+        },
+      });
+      this.store.addCheckpoint({
+        sessionId: this.config.sessionId,
+        checkpointType: permission.outcome === 'deny' ? 'tool.permission.denied' : 'tool.permission.confirm',
+        summary: `${toolCall.name}: ${permission.reason}`,
+        payload: {
+          callId: toolCall.id,
+          toolName: toolCall.name,
+          outcome: permission.outcome,
+        },
+      });
+    }
+
+    if (permission.outcome === 'deny') {
+      const deniedResult = createErrorResult(permission.reason, ToolErrorType.PERMISSION_DENIED);
+      const persistedToolResult = this.toolResults.add({
+        sessionId: this.config.sessionId,
+        callId: toolCall.id,
+        toolName: toolCall.name,
+        command: this.extractCommand(toolCall.args),
+        result: deniedResult,
+        summaryText: deniedResult.llmContent,
+        payload: {
+          deniedByRuntimePermission: true,
+          source: permission.source,
+        },
+      });
+      this.adapter.onEvent({
+        type: 'tool_end',
+        callId: toolCall.id,
+        name: toolCall.name,
+        result: deniedResult,
+        durationMs: now() - startedAt,
+      });
+      this.store.appendTranscript({
+        sessionId: this.config.sessionId,
+        recordType: 'tool.result',
+        role: 'tool',
+        content: deniedResult.llmContent,
+        payload: {
+          kind: 'tool.result',
+          data: {
+            toolResultId: persistedToolResult.id,
+            callId: toolCall.id,
+            toolName: toolCall.name,
+            success: false,
+            deniedByRuntimePermission: true,
+            durationMs: now() - startedAt,
+          },
+        },
+      });
+      this.adapter.onToolResult?.(toolCall.name, deniedResult, this.extractCommand(toolCall.args));
+      return {
+        callId: toolCall.id,
+        name: toolCall.name,
+        result: deniedResult,
+        durationMs: now() - startedAt,
+      };
+    }
 
     await executeRuntimeHooks({
       event: 'tool.before',
@@ -535,6 +648,8 @@ export class QueryRuntime {
       callId: toolCall.id,
       name: toolCall.name,
       params: toolCall.args,
+      forceConfirmation: permission.outcome === 'confirm',
+      confirmationDetails: permission.details || null,
     };
     const response = await this.executor.execute(
       request,

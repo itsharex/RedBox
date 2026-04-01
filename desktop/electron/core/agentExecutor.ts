@@ -95,6 +95,9 @@ export class AgentExecutor {
                 maxTimeMinutes: this.config.maxTimeMinutes,
                 temperature: this.config.temperature,
                 toolPack: 'full',
+                runtimeMode: 'chatroom',
+                interactive: true,
+                requiresHumanApproval: false,
             },
         );
 

@@ -32,6 +32,11 @@ export type ViewType = 'chat' | 'creative-chat' | 'skills' | 'knowledge' | 'advi
 export interface PendingChatMessage {
   content: string;          // 实际发送给 AI 的完整内容
   displayContent?: string;  // UI 上显示的简短内容
+  taskHints?: {
+    intent?: string;
+    forceMultiAgent?: boolean;
+    forceLongRunningTask?: boolean;
+  };
   attachment?: {
     type: 'youtube-video';
     title: string;

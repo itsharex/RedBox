@@ -102,7 +102,7 @@ import {
   runAiToolDiagnostic,
   runDirectToolDiagnostic,
 } from './core/toolDiagnosticsService';
-import { getAgentRuntime, getTaskGraphRuntime, listRoleSpecs, type RuntimeMode } from './core/ai';
+import { getAgentRuntime, getLongTaskCoordinator, getTaskGraphRuntime, listRoleSpecs, type RuntimeMode } from './core/ai';
 import { getSessionRuntimeStore } from './core/sessionRuntimeStore';
 import { listRuntimeHooks, registerRuntimeHook, unregisterRuntimeHook } from './core/runtimeHooks';
 
@@ -1353,6 +1353,10 @@ ipcMain.handle('tasks:get', async (_event, payload?: { taskId?: string }) => {
 ipcMain.handle('tasks:resume', async (_event, payload?: { taskId?: string }) => {
   const taskId = String(payload?.taskId || '').trim();
   if (!taskId) return null;
+  const task = getTaskGraphRuntime().getTask(taskId);
+  if (task?.route && (task.route.requiresLongRunningTask || task.route.requiresMultiAgent)) {
+    return getLongTaskCoordinator().maybeRun(taskId);
+  }
   return getTaskGraphRuntime().resumeTask(taskId);
 });
 
@@ -2687,7 +2691,15 @@ ipcMain.handle('chat:pick-attachment', async (_, payload?: { sessionId?: string 
 });
 
 // 开始聊天（使用 ChatServiceV2）
-ipcMain.on('chat:send-message', async (event, { sessionId, message, displayContent, attachment, modelConfig }) => {
+ipcMain.on('chat:send-message', async (event, { sessionId, message, displayContent, attachment, modelConfig, taskHints }) => {
+  const resolveRuntimeModeForSession = (value: string): RuntimeMode => {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (normalized === 'redclaw') return 'redclaw';
+    if (normalized === 'knowledge' || normalized === 'note' || normalized === 'video' || normalized === 'youtube' || normalized === 'document' || normalized === 'link-article' || normalized === 'wechat-article') return 'knowledge';
+    if (normalized === 'advisor-discussion') return 'advisor-discussion';
+    if (normalized === 'background-maintenance') return 'background-maintenance';
+    return 'chatroom';
+  };
   const sender = event.sender;
   const settings = (getSettings() || {}) as Record<string, unknown>;
   const rawAttachment = (attachment && typeof attachment === 'object')
@@ -2754,6 +2766,63 @@ ipcMain.on('chat:send-message', async (event, { sessionId, message, displayConte
   });
 
   try {
+    const sessionMeta = (() => {
+      try {
+        const session = getChatSession(sessionId);
+        if (!session?.metadata) return {} as Record<string, unknown>;
+        return JSON.parse(session.metadata) as Record<string, unknown>;
+      } catch {
+        return {} as Record<string, unknown>;
+      }
+    })();
+
+    const runtimeMode = resolveRuntimeModeForSession(String(sessionMeta.contextType || ''));
+    const routeAnalysis = getAgentRuntime().analyzeRuntimeContext({
+      runtimeContext: {
+        sessionId,
+        runtimeMode,
+        userInput: outgoingMessage,
+        metadata: {
+          ...sessionMeta,
+          attachmentType: rawAttachment?.type || null,
+          ...(taskHints && typeof taskHints === 'object' ? taskHints : {}),
+        },
+      },
+    });
+
+    if (routeAnalysis.shouldUseCoordinator && runtimeMode !== 'background-maintenance') {
+      console.log('[chat:send-message] routed-to-coordinator', {
+        sessionId,
+        runtimeMode,
+        intent: routeAnalysis.route.intent,
+        requiresMultiAgent: routeAnalysis.route.requiresMultiAgent,
+        requiresLongRunningTask: routeAnalysis.route.requiresLongRunningTask,
+      });
+      const prepared = await getAgentRuntime().prepareExecution({
+        runtimeContext: {
+          sessionId,
+          runtimeMode,
+          userInput: outgoingMessage,
+          metadata: {
+            ...sessionMeta,
+            attachmentType: rawAttachment?.type || null,
+            ...(taskHints && typeof taskHints === 'object' ? taskHints : {}),
+          },
+        },
+        baseSystemPrompt: '',
+        llm: {
+          apiKey: String(settings.api_key || '').trim(),
+          baseURL: normalizeApiBaseUrl(String(settings.api_endpoint || '').trim()),
+          model: String(resolveScopedModelName(settings, 'redclaw', String(settings.model_name || 'gpt-4o-mini'))).trim(),
+        },
+      });
+      await getLongTaskCoordinator().maybeRun(prepared.task.id, {
+        emitChatEvent: (channel, data) => sender.send(channel, data),
+      });
+      console.log('[chat:send-message] coordinator-completed', { sessionId, taskId: prepared.task.id });
+      return;
+    }
+
     const service = getOrCreateChatService(sessionId, sender);
 
     // 发送消息
@@ -4616,6 +4685,7 @@ ipcMain.handle('chatrooms:send', async (_, { roomId, message, context, clientMes
       apiKey: resolvedApiKey,
       baseURL: resolvedBaseUrl,
       model: resolvedModelName,
+      roomName: String(room.name || '').trim() || roomId,
     }, win);
 
     // 执行讨论流程

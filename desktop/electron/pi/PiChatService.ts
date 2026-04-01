@@ -583,6 +583,9 @@ export class PiChatService {
           maxTimeMinutes,
           temperature,
           toolPack: 'redclaw',
+          runtimeMode,
+          interactive: true,
+          requiresHumanApproval: preparedExecution.route.requiresHumanApproval,
         },
       );
       const runResult = await runtime.run(content);

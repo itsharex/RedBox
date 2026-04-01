@@ -204,12 +204,15 @@ export class ChatService extends EventEmitter {
                     }),
                     messages: this.historyToRuntimeMessages(),
                     signal: this.abortController.signal,
-                    maxTurns: this.config.maxTurns,
-                    maxTimeMinutes: this.config.maxTimeMinutes,
-                    temperature: this.config.temperature,
-                    toolPack: 'full',
-                },
-            );
+                maxTurns: this.config.maxTurns,
+                maxTimeMinutes: this.config.maxTimeMinutes,
+                temperature: this.config.temperature,
+                toolPack: 'full',
+                runtimeMode: 'chatroom',
+                interactive: true,
+                requiresHumanApproval: false,
+            },
+        );
 
             const result = await runtime.run(message);
             if (result.error && !this.abortController.signal.aborted) {

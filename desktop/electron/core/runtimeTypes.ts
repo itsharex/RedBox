@@ -59,6 +59,9 @@ export interface RuntimeConfig {
   maxTimeMinutes?: number;
   temperature?: number;
   toolPack: string;
+  runtimeMode?: string;
+  interactive?: boolean;
+  requiresHumanApproval?: boolean;
 }
 
 export interface RuntimeAdapter {

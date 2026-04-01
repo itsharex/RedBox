@@ -26,6 +26,7 @@ import { WriteFileTool } from './tools/writeFileTool';
 import { EditTool } from './tools/editTool';
 import { embeddingService } from './vector/EmbeddingService';
 import { QueryRuntime } from './queryRuntime';
+import { getAgentRuntime, getLongTaskCoordinator } from './ai';
 
 // ========== Types ==========
 
@@ -304,6 +305,88 @@ ${ragContext.context}
     ): Promise<string> {
         let fullResponse = '';
 
+        const analysis = getAgentRuntime().analyzeRuntimeContext({
+            runtimeContext: {
+                sessionId: this.sessionId,
+                runtimeMode: 'advisor-discussion',
+                userInput: message,
+                metadata: {
+                    contextType: 'advisor-discussion',
+                    contextId: this.config.advisorId,
+                },
+            },
+        });
+
+        if (analysis.shouldUseCoordinator) {
+            const prepared = await getAgentRuntime().prepareExecution({
+                runtimeContext: {
+                    sessionId: this.sessionId,
+                    runtimeMode: 'advisor-discussion',
+                    userInput: message,
+                    metadata: {
+                        contextType: 'advisor-discussion',
+                        contextId: this.config.advisorId,
+                    },
+                },
+                baseSystemPrompt: systemPrompt,
+                llm: {
+                    apiKey: this.config.apiKey,
+                    baseURL: this.config.baseURL,
+                    model: this.config.model,
+                    timeoutMs: 45000,
+                },
+            });
+
+            await getLongTaskCoordinator().maybeRun(prepared.task.id, {
+                baseSystemPrompt: systemPrompt,
+                onRuntimeEvent: (event) => {
+                    switch (event.type) {
+                        case 'thinking':
+                            this.emitEvent({
+                                type: 'thinking_chunk',
+                                content: event.content,
+                            });
+                            break;
+                        case 'tool_start':
+                            this.emitEvent({
+                                type: 'tool_start',
+                                tool: { name: event.name, params: event.params },
+                            });
+                            break;
+                        case 'tool_end':
+                            this.emitEvent({
+                                type: 'tool_end',
+                                tool: {
+                                    name: event.name,
+                                    result: {
+                                        success: event.result.success,
+                                        content: event.result.display || event.result.llmContent || '',
+                                    },
+                                },
+                            });
+                            break;
+                        case 'response_chunk':
+                            fullResponse = event.content;
+                            this.emitEvent({ type: 'response_chunk', content: event.content });
+                            break;
+                        case 'response_end':
+                            fullResponse = event.content;
+                            this.emitEvent({ type: 'response_end', content: event.content });
+                            break;
+                        case 'error':
+                            this.emitEvent({ type: 'error', content: event.message });
+                            break;
+                        case 'done':
+                            this.emitEvent({ type: 'done' });
+                            break;
+                        default:
+                            break;
+                    }
+                },
+            });
+            return fullResponse;
+        }
+
         const runtime = new QueryRuntime(
             this.toolRegistry,
             this.toolExecutor,
@@ -365,6 +448,9 @@ ${ragContext.context}
                 maxTimeMinutes: 6,
                 temperature: this.config.temperature ?? 0.7,
                 toolPack: 'chatroom',
+                runtimeMode: 'advisor-discussion',
+                interactive: true,
+                requiresHumanApproval: Boolean(analysis.route.requiresHumanApproval),
             },
         );
 
