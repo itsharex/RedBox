@@ -26,29 +26,34 @@ const MULTI_AGENT_TRIGGER_PARTS = [
   '多人协作',
 ];
 
-const REDCLAW_MULTI_AGENT_PARTS = [
-  '开始创作',
-  '完整文案',
-  '完整的小红书文案',
-  '文案包',
-  '标题包',
-  '封面文案',
-  '配图',
+const END_TO_END_TRIGGER_PARTS = [
+  '从选题到发布',
+  '从0到1',
+  '一条龙',
+  '全流程',
+  '完整流程',
+  '整套',
+  '全案',
+  '全套',
+  '全部做完',
+];
+
+const BUNDLED_DELIVERABLE_PARTS = [
+  '标题',
+  '正文',
+  '文案',
   '封面',
-  '生成图片',
-  '选题',
-  '策划',
-  '调研',
-  '研究',
-  '创作',
+  '配图',
+  '图片',
+  '发布',
   '复盘',
-  '项目',
-  '方案',
+  '选题',
 ];
 
 const LONG_RUNNING_TRIGGER_PARTS = [
   '长期',
-  '持续',
+  '持续执行',
+  '持续推进',
   '自动化',
   '定时',
   '周期',
@@ -56,11 +61,10 @@ const LONG_RUNNING_TRIGGER_PARTS = [
   '每周',
   '30天',
   '7天',
-  '项目推进',
   '后台',
   '跟进',
-  '计划',
-  '路线图',
+  '轮询',
+  '值守',
 ];
 
 const DANGEROUS_ACTION_PARTS = ['删除', '覆盖', '批量', '清空', '重置'];
@@ -77,7 +81,7 @@ const DEFAULT_ROLE_BY_MODE: Record<RuntimeMode, RoleId> = {
   redclaw: 'copywriter',
   knowledge: 'researcher',
   chatroom: 'planner',
-  'advisor-discussion': 'planner',
+  'advisor-discussion': 'researcher',
   'background-maintenance': 'ops-coordinator',
 };
 
@@ -85,11 +89,14 @@ const DEFAULT_CAPABILITIES_BY_MODE: Record<RuntimeMode, string[]> = {
   redclaw: ['planning', 'writing', 'artifact-save'],
   knowledge: ['knowledge-retrieval', 'evidence-synthesis'],
   chatroom: ['multi-agent-discussion'],
-  'advisor-discussion': ['multi-agent-discussion'],
+  'advisor-discussion': ['advisor-response', 'knowledge-retrieval'],
   'background-maintenance': ['task-graph', 'background-runner', 'artifact-save'],
 };
 
 const containsAny = (text: string, parts: string[]): boolean => parts.some((part) => text.includes(part));
+const countMatches = (text: string, parts: string[]): number => parts.reduce((count, part) => (
+  text.includes(part) ? count + 1 : count
+), 0);
 
 const normalizeIntentHint = (value: unknown): IntentName | null => {
   const normalized = String(value || '').trim() as IntentName;
@@ -143,7 +150,7 @@ const inferIntent = (runtimeMode: RuntimeMode, normalizedInput: string, hints: R
   if (containsAny(normalizedInput, ['自动化', '定时', '后台运行', '周期'])) {
     return 'automation';
   }
-  if (containsAny(normalizedInput, ['长期', '持续推进', '路线图', '项目推进'])) {
+  if (containsAny(normalizedInput, LONG_RUNNING_TRIGGER_PARTS)) {
     return 'long_running_task';
   }
   if (containsAny(normalizedInput, ['知识库', '读取素材', '阅读素材', '调研', '研究', '检索'])) {
@@ -170,21 +177,58 @@ const inferRoleForIntent = (runtimeMode: RuntimeMode, intent: IntentName): RoleI
   }
 };
 
+const isBundledRedclawRequest = (normalizedInput: string): boolean => {
+  const bundledDeliverables = countMatches(normalizedInput, BUNDLED_DELIVERABLE_PARTS);
+  if (containsAny(normalizedInput, END_TO_END_TRIGGER_PARTS) && bundledDeliverables >= 2) {
+    return true;
+  }
+  if (bundledDeliverables >= 3 && containsAny(normalizedInput, ['同时', '一起', '都要', '打包'])) {
+    return true;
+  }
+  return false;
+};
+
+const shouldTriggerMultiAgent = (params: {
+  runtimeMode: RuntimeMode;
+  normalizedInput: string;
+  hints: ReturnType<typeof extractHints>;
+}): boolean => {
+  if (params.hints.forceMultiAgent) return true;
+  if (params.runtimeMode === 'chatroom') return true;
+  if (containsAny(params.normalizedInput, MULTI_AGENT_TRIGGER_PARTS)) return true;
+  if (params.runtimeMode === 'redclaw' && isBundledRedclawRequest(params.normalizedInput)) return true;
+  return false;
+};
+
+const shouldTriggerLongRunning = (params: {
+  runtimeMode: RuntimeMode;
+  intent: IntentName;
+  normalizedInput: string;
+  hints: ReturnType<typeof extractHints>;
+}): boolean => {
+  if (params.hints.forceLongRunningTask) return true;
+  if (params.runtimeMode === 'background-maintenance') return true;
+  if (params.intent === 'long_running_task' || params.intent === 'automation') return true;
+  return containsAny(params.normalizedInput, LONG_RUNNING_TRIGGER_PARTS);
+};
+
 const buildDirectRoute = (context: RuntimeContext): IntentRoute => {
   const normalizedInput = String(context.userInput || '').toLowerCase();
   const runtimeMode = context.runtimeMode;
   const hints = extractHints(context);
   const intent = inferIntent(runtimeMode, normalizedInput, hints);
   const recommendedRole = inferRoleForIntent(runtimeMode, intent);
-  const requiresMultiAgent = hints.forceMultiAgent
-    || runtimeMode === 'advisor-discussion'
-    || containsAny(normalizedInput, MULTI_AGENT_TRIGGER_PARTS)
-    || (runtimeMode === 'redclaw' && containsAny(normalizedInput, REDCLAW_MULTI_AGENT_PARTS));
-  const requiresLongRunningTask = hints.forceLongRunningTask
-    || runtimeMode === 'background-maintenance'
-    || intent === 'long_running_task'
-    || intent === 'automation'
-    || containsAny(normalizedInput, LONG_RUNNING_TRIGGER_PARTS);
+  const requiresMultiAgent = shouldTriggerMultiAgent({
+    runtimeMode,
+    normalizedInput,
+    hints,
+  });
+  const requiresLongRunningTask = shouldTriggerLongRunning({
+    runtimeMode,
+    intent,
+    normalizedInput,
+    hints,
+  });
 
   return {
     intent,
@@ -207,23 +251,21 @@ const resolveThinkingBudget = (runtimeMode: RuntimeMode, route: IntentRoute): Th
   if (route.requiresMultiAgent) return 'medium';
   if (runtimeMode === 'redclaw') return 'medium';
   if (runtimeMode === 'knowledge') return 'medium';
-  if (runtimeMode === 'advisor-discussion') return 'medium';
+  if (runtimeMode === 'advisor-discussion') return 'low';
   return 'low';
 };
 
 const shouldRunSubagentOrchestration = (params: {
   runtimeMode: RuntimeMode;
-  userInput: string;
   route: IntentRoute;
 }): boolean => {
-  if (params.runtimeMode === 'advisor-discussion') {
+  if (params.runtimeMode === 'background-maintenance') {
     return true;
   }
-  if (params.route.requiresMultiAgent || params.route.requiresLongRunningTask) {
+  if (params.route.intent === 'automation' || params.route.intent === 'long_running_task') {
     return true;
   }
-  const normalized = String(params.userInput || '').toLowerCase();
-  return containsAny(normalized, MULTI_AGENT_TRIGGER_PARTS);
+  return params.route.requiresMultiAgent;
 };
 
 export class AgentRuntime {
@@ -233,7 +275,6 @@ export class AgentRuntime {
     const thinkingBudget = resolveThinkingBudget(params.runtimeContext.runtimeMode, route);
     const orchestrationEnabled = shouldRunSubagentOrchestration({
       runtimeMode: params.runtimeContext.runtimeMode,
-      userInput: params.runtimeContext.userInput,
       route,
     });
     return {
@@ -241,7 +282,12 @@ export class AgentRuntime {
       role,
       thinkingBudget,
       orchestrationEnabled,
-      shouldUseCoordinator: Boolean(route.requiresLongRunningTask || route.requiresMultiAgent),
+      shouldUseCoordinator: Boolean(
+        params.runtimeContext.runtimeMode === 'background-maintenance'
+        || route.intent === 'automation'
+        || route.intent === 'long_running_task'
+        || route.requiresMultiAgent
+      ),
     };
   }
 
