@@ -95,6 +95,25 @@ interface AgentRunResult {
   streamedChunks: boolean;
 }
 
+export interface PreparedPiRuntimeTask {
+  sessionId: string;
+  apiKey: string;
+  baseURL: string;
+  modelName: string;
+  runtimeMode: RuntimeMode;
+  metadata: SessionMetadata;
+  systemPrompt: string;
+  runtimeMessages: Array<{ role: 'user' | 'assistant'; content: string }>;
+  preparedExecution: PreparedRuntimeExecution;
+  temperature: number;
+  maxTurns: number;
+  maxTimeMinutes: number;
+}
+
+type PreparePiRuntimeOutcome =
+  | { kind: 'handled'; localResponse: string }
+  | ({ kind: 'prepared' } & PreparedPiRuntimeTask);
+
 interface ToolMarkupCleanupResult {
   hasLeakedToolMarkup: boolean;
   cleanedText: string;
@@ -458,150 +477,55 @@ export class PiChatService {
       partialResponse: '',
     });
 
-    const settings = (getSettings() || {}) as Record<string, unknown>;
-    const apiKey = (settings.api_key as string) || (settings.openaiApiKey as string) || process.env.OPENAI_API_KEY || '';
-    const baseURL = normalizeApiBaseUrl(
-      (settings.api_endpoint as string) || (settings.openaiApiBase as string) || 'https://api.openai.com/v1',
-      'https://api.openai.com/v1',
-    );
-    let metadata = this.getSessionMetadata(sessionId);
-    const modelScope = resolveModelScopeFromContextType(String(metadata.contextType || ''));
-    const modelName = resolveScopedModelName(settings, modelScope, (settings.openaiModel as string) || 'gpt-4o');
-    const runtimeMode = this.resolveRuntimeMode(metadata);
-
-    const workspacePaths = getWorkspacePaths();
-    const workspace = workspacePaths.base;
-    Instance.init(workspace);
-    this.emitDebugLog('info', 'sendMessage:start', {
-      messageLength: String(content || '').length,
-      modelName,
-      baseURL,
-      workspace,
-      contextType: String(metadata.contextType || ''),
-      contextId: String(metadata.contextId || ''),
-    });
-
+    let preparedOutcome: PreparePiRuntimeOutcome;
     try {
-      await this.ensureSkillsDiscovered(workspace);
+      preparedOutcome = await this.prepareRuntimeExecutionInput({
+        content,
+        sessionId,
+        allowInteractiveOnboarding: true,
+        emitSkillActivation: true,
+      });
     } catch (error) {
-      console.warn('[PiChatService] Failed to load skills:', error);
-    }
-
-    try {
-      const preactivatedSkills = await this.skillManager.preactivateMentionedSkills(content);
-      for (const item of preactivatedSkills) {
-        this.sendToUI('chat:skill-activated', {
-          name: item.skill.name,
-          description: item.skill.description,
-        });
-      }
-    } catch (error) {
-      console.warn('[PiChatService] Failed to preactivate mentioned skills:', error);
-    }
-
-    let redClawProfileBundle: RedClawProfilePromptBundle | null = null;
-
-    if (this.shouldHandleRedClawOnboarding(metadata)) {
-      try {
-        redClawProfileBundle = await loadRedClawProfilePromptBundle();
-        const isFirstRedClawTurn = this.isFirstAssistantTurn(sessionId);
-        if (isFirstRedClawTurn) {
-          const onboarding = await handleRedClawOnboardingTurn(content);
-          if (onboarding.handled) {
-            const onboardingResponse = (onboarding.responseText || '').trim();
-            if (onboardingResponse) {
-              this.emitLocalAssistantResponse(sessionId, onboardingResponse);
-            }
-            this.abortController = null;
-            this.setRuntimeState({ isProcessing: false });
-            return;
-          }
-        } else if (!redClawProfileBundle.onboardingState.completedAt) {
-          await ensureRedClawOnboardingCompletedWithDefaults();
-        }
-        redClawProfileBundle = await loadRedClawProfilePromptBundle();
-      } catch (error) {
-        console.warn('[PiChatService] RedClaw onboarding/profile failed:', error);
-      }
-    } else if (metadata.contextType === 'redclaw') {
-      try {
-        redClawProfileBundle = await loadRedClawProfilePromptBundle();
-      } catch (error) {
-        console.warn('[PiChatService] Failed to load RedClaw profile bundle for non-primary session:', error);
-      }
-    }
-
-    if (!apiKey) {
-      this.emitDebugLog('error', 'sendMessage:missing-api-key');
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      this.emitDebugLog('error', 'sendMessage:prepare-failed', { error: errorMessage });
       this.abortController = null;
       this.setRuntimeState({ isProcessing: false });
-      this.sendToUI('chat:error', {
-        message: 'AI 请求失败（API Key 未配置）',
-        category: 'auth',
-        hint: '请先在设置页填写并保存 API Key。',
-        raw: 'API Key 未配置',
-      } satisfies ChatErrorPayload);
+      this.sendToUI('chat:error', this.buildChatErrorPayload(errorMessage));
+      return;
+    }
+    if (preparedOutcome.kind === 'handled') {
+      const onboardingResponse = preparedOutcome.localResponse.trim();
+      if (onboardingResponse) {
+        this.emitLocalAssistantResponse(sessionId, onboardingResponse);
+      }
+      this.abortController = null;
+      this.setRuntimeState({ isProcessing: false });
       return;
     }
 
-    const model = this.createModelWithBaseUrl(modelName, baseURL, settings);
-    const redClawCompactTargetTokens = this.getRedClawCompactTargetTokens(settings);
-    metadata = await this.maybeCompactContext({
-      sessionId,
-      currentInput: content,
-      metadata,
+    const {
       apiKey,
       baseURL,
       modelName,
-      contextWindow: this.getModelContextWindow(model),
-      redClawCompactTargetTokens,
-    });
-    const longTermMemory = await this.loadLongTermMemoryContext();
-    const redClawProjectContext = await this.loadRedClawProjectContext(metadata);
-    if (metadata.contextType === 'redclaw' && !redClawProfileBundle) {
-      try {
-        redClawProfileBundle = await loadRedClawProfilePromptBundle();
-      } catch (error) {
-        console.warn('[PiChatService] Failed to reload RedClaw profile bundle:', error);
-      }
-    }
-    const baseSystemPrompt = this.buildSystemPrompt(
-      workspacePaths,
       metadata,
-      longTermMemory,
-      redClawProjectContext,
-      redClawProfileBundle,
-    );
-    const preparedExecution = await getAgentRuntime().prepareExecution({
-      runtimeContext: {
-        sessionId,
-        runtimeMode,
-        userInput: content,
-        metadata: metadata as Record<string, unknown>,
-        workspaceRoot: workspacePaths.workspaceRoot,
-        currentSpaceRoot: workspacePaths.base,
-      },
-      baseSystemPrompt,
-      llm: {
-        apiKey,
-        baseURL,
-        model: modelName,
-      },
-    });
+      runtimeMode,
+      systemPrompt,
+      runtimeMessages,
+      preparedExecution,
+      maxTurns,
+      maxTimeMinutes,
+      temperature,
+    } = preparedOutcome;
     this.activeRuntimeExecution = preparedExecution;
-    const systemPrompt = preparedExecution.systemPrompt;
-    const history = this.historyToAgentMessages(sessionId, content, metadata);
+
     console.log('[PiChatService] sendMessage', {
       sessionId,
       modelName,
       baseURL,
       hasApiKey: Boolean(apiKey),
-      historyCount: history.length,
+      historyCount: runtimeMessages.length,
       isContextBound: Boolean(metadata.isContextBound),
       compacted: Boolean(metadata.compactSummary),
-      workspaceBase: workspacePaths.base,
-      manuscriptsPath: workspacePaths.manuscripts,
-      redClawCompactTargetTokens,
       taskId: preparedExecution.task.id,
       route: preparedExecution.route.intent,
       role: preparedExecution.role.roleId,
@@ -610,7 +534,7 @@ export class PiChatService {
     this.emitDebugLog('info', 'sendMessage:prepared', {
       modelName,
       baseURL,
-      historyCount: history.length,
+      historyCount: runtimeMessages.length,
       isContextBound: Boolean(metadata.isContextBound),
       compacted: Boolean(metadata.compactSummary),
       taskId: preparedExecution.task.id,
@@ -621,12 +545,11 @@ export class PiChatService {
     this.traceActiveExecution('runtime.prepared', {
       modelName,
       baseURL,
-      modelScope,
       runtimeMode,
       route: preparedExecution.route,
       role: preparedExecution.role.roleId,
       thinkingBudget: preparedExecution.thinkingBudget,
-      historyCount: history.length,
+      historyCount: runtimeMessages.length,
     }, 'plan');
 
     try {
@@ -654,11 +577,11 @@ export class PiChatService {
           baseURL,
           model: modelName,
           systemPrompt,
-          messages: this.historyToRuntimeMessages(sessionId, content, metadata),
+          messages: runtimeMessages,
           signal,
-          maxTurns: 24,
-          maxTimeMinutes: 12,
-          temperature: 0.6,
+          maxTurns,
+          maxTimeMinutes,
+          temperature,
           toolPack: 'redclaw',
         },
       );
@@ -727,6 +650,179 @@ export class PiChatService {
       });
       this.emitDebugLog('info', 'sendMessage:done');
     }
+  }
+
+  async prepareBackgroundRuntimeTask(content: string, sessionId: string): Promise<PreparedPiRuntimeTask> {
+    this.sessionId = sessionId;
+    const prepared = await this.prepareRuntimeExecutionInput({
+      content,
+      sessionId,
+      allowInteractiveOnboarding: false,
+      emitSkillActivation: false,
+    });
+    if (prepared.kind === 'handled') {
+      throw new Error('Background runtime task should not enter interactive onboarding path');
+    }
+    return prepared;
+  }
+
+  private async prepareRuntimeExecutionInput(params: {
+    content: string;
+    sessionId: string;
+    allowInteractiveOnboarding: boolean;
+    emitSkillActivation: boolean;
+  }): Promise<PreparePiRuntimeOutcome> {
+    const { content, sessionId, allowInteractiveOnboarding, emitSkillActivation } = params;
+    const settings = (getSettings() || {}) as Record<string, unknown>;
+    const apiKey = (settings.api_key as string) || (settings.openaiApiKey as string) || process.env.OPENAI_API_KEY || '';
+    const baseURL = normalizeApiBaseUrl(
+      (settings.api_endpoint as string) || (settings.openaiApiBase as string) || 'https://api.openai.com/v1',
+      'https://api.openai.com/v1',
+    );
+    let metadata = this.getSessionMetadata(sessionId);
+    const modelScope = resolveModelScopeFromContextType(String(metadata.contextType || ''));
+    const modelName = resolveScopedModelName(settings, modelScope, (settings.openaiModel as string) || 'gpt-4o');
+    const runtimeMode = this.resolveRuntimeMode(metadata);
+
+    const workspacePaths = getWorkspacePaths();
+    const workspace = workspacePaths.base;
+    Instance.init(workspace);
+    this.emitDebugLog('info', 'runtime:prepare:start', {
+      messageLength: String(content || '').length,
+      modelName,
+      baseURL,
+      workspace,
+      contextType: String(metadata.contextType || ''),
+      contextId: String(metadata.contextId || ''),
+      allowInteractiveOnboarding,
+    });
+
+    try {
+      await this.ensureSkillsDiscovered(workspace);
+    } catch (error) {
+      console.warn('[PiChatService] Failed to load skills:', error);
+    }
+
+    try {
+      const preactivatedSkills = await this.skillManager.preactivateMentionedSkills(content);
+      if (emitSkillActivation) {
+        for (const item of preactivatedSkills) {
+          this.sendToUI('chat:skill-activated', {
+            name: item.skill.name,
+            description: item.skill.description,
+          });
+        }
+      }
+    } catch (error) {
+      console.warn('[PiChatService] Failed to preactivate mentioned skills:', error);
+    }
+
+    let redClawProfileBundle: RedClawProfilePromptBundle | null = null;
+
+    if (this.shouldHandleRedClawOnboarding(metadata)) {
+      try {
+        redClawProfileBundle = await loadRedClawProfilePromptBundle();
+        const isFirstRedClawTurn = this.isFirstAssistantTurn(sessionId);
+        if (allowInteractiveOnboarding && isFirstRedClawTurn) {
+          const onboarding = await handleRedClawOnboardingTurn(content);
+          if (onboarding.handled) {
+            return {
+              kind: 'handled',
+              localResponse: (onboarding.responseText || '').trim(),
+            };
+          }
+        }
+        if (!redClawProfileBundle.onboardingState.completedAt) {
+          await ensureRedClawOnboardingCompletedWithDefaults();
+        }
+        redClawProfileBundle = await loadRedClawProfilePromptBundle();
+      } catch (error) {
+        console.warn('[PiChatService] RedClaw onboarding/profile failed:', error);
+      }
+    } else if (metadata.contextType === 'redclaw') {
+      try {
+        redClawProfileBundle = await loadRedClawProfilePromptBundle();
+      } catch (error) {
+        console.warn('[PiChatService] Failed to load RedClaw profile bundle for non-primary session:', error);
+      }
+    }
+
+    if (!apiKey) {
+      this.emitDebugLog('error', 'runtime:prepare:missing-api-key');
+      throw new Error('API Key 未配置');
+    }
+
+    const model = this.createModelWithBaseUrl(modelName, baseURL, settings);
+    const redClawCompactTargetTokens = this.getRedClawCompactTargetTokens(settings);
+    metadata = await this.maybeCompactContext({
+      sessionId,
+      currentInput: content,
+      metadata,
+      apiKey,
+      baseURL,
+      modelName,
+      contextWindow: this.getModelContextWindow(model),
+      redClawCompactTargetTokens,
+    });
+    const longTermMemory = await this.loadLongTermMemoryContext();
+    const redClawProjectContext = await this.loadRedClawProjectContext(metadata);
+    if (metadata.contextType === 'redclaw' && !redClawProfileBundle) {
+      try {
+        redClawProfileBundle = await loadRedClawProfilePromptBundle();
+      } catch (error) {
+        console.warn('[PiChatService] Failed to reload RedClaw profile bundle:', error);
+      }
+    }
+
+    const baseSystemPrompt = this.buildSystemPrompt(
+      workspacePaths,
+      metadata,
+      longTermMemory,
+      redClawProjectContext,
+      redClawProfileBundle,
+    );
+    const preparedExecution = await getAgentRuntime().prepareExecution({
+      runtimeContext: {
+        sessionId,
+        runtimeMode,
+        userInput: content,
+        metadata: metadata as Record<string, unknown>,
+        workspaceRoot: workspacePaths.workspaceRoot,
+        currentSpaceRoot: workspacePaths.base,
+      },
+      baseSystemPrompt,
+      llm: {
+        apiKey,
+        baseURL,
+        model: modelName,
+      },
+    });
+
+    const runtimeMessages = this.historyToRuntimeMessages(sessionId, content, metadata);
+    this.emitDebugLog('info', 'runtime:prepare:done', {
+      sessionId,
+      taskId: preparedExecution.task.id,
+      route: preparedExecution.route.intent,
+      role: preparedExecution.role.roleId,
+      thinkingBudget: preparedExecution.thinkingBudget,
+      historyCount: runtimeMessages.length,
+    });
+
+    return {
+      kind: 'prepared',
+      sessionId,
+      apiKey,
+      baseURL,
+      modelName,
+      runtimeMode,
+      metadata,
+      systemPrompt: preparedExecution.systemPrompt,
+      runtimeMessages,
+      preparedExecution,
+      temperature: 0.6,
+      maxTurns: 24,
+      maxTimeMinutes: 12,
+    };
   }
 
   private emitLocalAssistantResponse(sessionId: string, content: string) {

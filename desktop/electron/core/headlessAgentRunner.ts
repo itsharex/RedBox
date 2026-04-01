@@ -1,10 +1,9 @@
 import { addChatMessage, getChatMessages, getSettings } from '../db';
 import { PiChatService } from '../pi/PiChatService';
-import { QueryRuntime } from './queryRuntime';
-import { ToolConfirmationOutcome, ToolExecutor, ToolRegistry } from './toolRegistry';
-import { normalizeApiBaseUrl } from './urlUtils';
+import { getAgentRuntime } from './ai';
 import { getBackgroundSessionStore } from './backgroundSessionStore';
 import { getBackgroundTaskRegistry } from './backgroundTaskRegistry';
+import { getHeadlessWorkerProcessManager } from './headlessWorkerProcessManager';
 
 type HeadlessRuntimeMode = 'redclaw' | 'background-maintenance';
 
@@ -13,16 +12,19 @@ function createBackgroundEventSink(taskId: string) {
   return async (channel: string, data: unknown) => {
     if (channel === 'chat:thought-delta') {
       const text = typeof (data as any)?.content === 'string' ? (data as any).content : '';
+      await registry.updatePhase(taskId, 'thinking');
       await registry.appendTurn(taskId, { source: 'thought', text });
       return;
     }
     if (channel === 'chat:response-chunk') {
       const text = typeof (data as any)?.content === 'string' ? (data as any).content : '';
+      await registry.updatePhase(taskId, 'responding');
       await registry.appendTurn(taskId, { source: 'response', text });
       return;
     }
     if (channel === 'chat:tool-start') {
       const name = typeof (data as any)?.toolName === 'string' ? (data as any).toolName : 'unknown';
+      await registry.updatePhase(taskId, 'tooling');
       await registry.appendTurn(taskId, { source: 'tool', text: `调用工具：${name}` });
       return;
     }
@@ -43,6 +45,8 @@ export class HeadlessAgentRunner {
     displayContent?: string;
     runtimeMode?: HeadlessRuntimeMode;
     service?: PiChatService;
+    rollback?: () => Promise<void> | void;
+    attemptSignal?: AbortSignal;
   }): Promise<{ sessionId: string; response: string }> {
     const session = getBackgroundSessionStore().ensureSession({
       contextId: input.contextId,
@@ -66,17 +70,78 @@ export class HeadlessAgentRunner {
     });
 
     const service = input.service || new PiChatService();
-    service.setEventSink((channel, data) => {
-      void createBackgroundEventSink(input.taskId)(channel, data);
-    });
-    await service.sendMessage(input.prompt, session.id);
-    const latestAssistant = [...getChatMessages(session.id)]
-      .reverse()
-      .find((msg) => msg.role === 'assistant' && String(msg.content || '').trim());
-    return {
-      sessionId: session.id,
-      response: String(latestAssistant?.content || ''),
-    };
+
+    if (input.service) {
+      const onAttemptAbort = () => service.abort();
+      if (input.attemptSignal) {
+        if (input.attemptSignal.aborted) {
+          service.abort();
+        } else {
+          input.attemptSignal.addEventListener('abort', onAttemptAbort, { once: true });
+        }
+      }
+      registry.registerCancelHandle(input.taskId, {
+        cancel: () => service.abort(),
+        rollback: input.rollback,
+      });
+      service.setEventSink((channel, data) => {
+        void createBackgroundEventSink(input.taskId)(channel, data);
+      });
+      try {
+        await service.sendMessage(input.prompt, session.id);
+        const latestAssistant = [...getChatMessages(session.id)]
+          .reverse()
+          .find((msg) => msg.role === 'assistant' && String(msg.content || '').trim());
+        return {
+          sessionId: session.id,
+          response: String(latestAssistant?.content || ''),
+        };
+      } finally {
+        if (input.attemptSignal) {
+          input.attemptSignal.removeEventListener('abort', onAttemptAbort);
+        }
+        registry.clearCancelHandle(input.taskId);
+      }
+    }
+
+    const prepared = await service.prepareBackgroundRuntimeTask(input.prompt, session.id);
+    try {
+      const result = await getHeadlessWorkerProcessManager().runRuntimeTask({
+        taskId: input.taskId,
+        sessionId: session.id,
+        model: prepared.modelName,
+        apiKey: prepared.apiKey,
+        baseURL: prepared.baseURL,
+        systemPrompt: prepared.systemPrompt,
+        messages: prepared.runtimeMessages,
+        userInput: input.prompt,
+        toolPack: 'redclaw',
+        temperature: prepared.temperature,
+        maxTurns: prepared.maxTurns,
+        maxTimeMinutes: prepared.maxTimeMinutes,
+        rollback: input.rollback,
+        attemptSignal: input.attemptSignal,
+      });
+      addChatMessage({
+        id: `msg_bg_assistant_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        session_id: session.id,
+        role: 'assistant',
+        content: result.response,
+      });
+      getAgentRuntime().completeExecution(prepared.preparedExecution.task.id, {
+        backgroundTaskId: input.taskId,
+        responseLength: result.response.length,
+        workerMode: 'child-runtime-worker',
+      });
+      return {
+        sessionId: session.id,
+        response: result.response,
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      getAgentRuntime().failExecution(prepared.preparedExecution.task.id, message);
+      throw error;
+    }
   }
 
   async runJsonRuntimeTask(input: {
@@ -90,6 +155,8 @@ export class HeadlessAgentRunner {
     apiKey?: string;
     maxTurns?: number;
     temperature?: number;
+    rollback?: () => Promise<void> | void;
+    attemptSignal?: AbortSignal;
   }): Promise<{ sessionId: string; response: string; error?: string }> {
     const session = getBackgroundSessionStore().ensureSession({
       contextId: input.contextId,
@@ -104,47 +171,25 @@ export class HeadlessAgentRunner {
     });
     const registry = getBackgroundTaskRegistry();
     await registry.attachSession(input.taskId, session.id);
-
     const settings = (getSettings() || {}) as Record<string, unknown>;
     const apiKey = input.apiKey || String(settings.api_key || '').trim();
-    const baseURL = normalizeApiBaseUrl(input.baseURL || String(settings.api_endpoint || ''), 'https://api.openai.com/v1');
+    const baseURL = String(input.baseURL || settings.api_endpoint || 'https://api.openai.com/v1');
     const model = input.model || String(settings.model_name || 'gpt-4o-mini');
-    const toolRegistry = new ToolRegistry();
-    const toolExecutor = new ToolExecutor(
-      toolRegistry,
-      async () => ToolConfirmationOutcome.ProceedOnce,
-    );
-
-    const runtime = new QueryRuntime(toolRegistry, toolExecutor, {
-      onEvent: (event) => {
-        if (event.type === 'thinking') {
-          void registry.appendTurn(input.taskId, { source: 'thought', text: event.content });
-        } else if (event.type === 'response_chunk') {
-          void registry.appendTurn(input.taskId, { source: 'response', text: event.content });
-        } else if (event.type === 'tool_start') {
-          void registry.appendTurn(input.taskId, { source: 'tool', text: `调用工具：${event.name}` });
-        } else if (event.type === 'error') {
-          void registry.appendTurn(input.taskId, { source: 'system', text: `错误：${event.message}` });
-        }
-      },
-    }, {
+    const result = await getHeadlessWorkerProcessManager().runJsonTask({
+      taskId: input.taskId,
       sessionId: session.id,
+      model,
       apiKey,
       baseURL,
-      model,
       systemPrompt: input.systemPrompt,
-      messages: [],
-      maxTurns: input.maxTurns || 8,
-      maxTimeMinutes: 5,
+      userInput: input.userInput,
       temperature: input.temperature ?? 0.1,
-      toolPack: 'background-maintenance',
+      rollback: input.rollback,
+      attemptSignal: input.attemptSignal,
     });
-
-    const result = await runtime.run(input.userInput);
     return {
       sessionId: session.id,
       response: result.response,
-      error: result.error,
     };
   }
 }

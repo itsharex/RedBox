@@ -7,6 +7,7 @@ import {
   listSessionCheckpoints,
   listSessionTranscriptRecords,
 } from '../db';
+import { getToolResultStore } from './toolResultStore';
 import type {
   QuerySession,
   RuntimeTranscriptEnvelope,
@@ -21,6 +22,8 @@ const toPayloadJson = (value: Record<string, unknown> | undefined): string | nul
 };
 
 export class SessionRuntimeStore {
+  private readonly toolResults = getToolResultStore();
+
   appendTranscript(params: {
     sessionId: string;
     recordType: string;
@@ -61,15 +64,20 @@ export class SessionRuntimeStore {
     };
   }
 
-  listTranscript(sessionId: string) {
-    return listSessionTranscriptRecords(sessionId).map((record) => ({
-      ...record,
+  listTranscript(sessionId: string, limit?: number) {
+    return listSessionTranscriptRecords(sessionId, limit).map((record) => ({
+      id: record.id,
+      sessionId: record.session_id,
+      recordType: record.record_type,
+      role: record.role,
+      content: record.content,
       payload: record.payload_json ? JSON.parse(record.payload_json) : null,
+      createdAt: record.created_at,
     }));
   }
 
-  listCheckpoints(sessionId: string): SessionCheckpoint[] {
-    return listSessionCheckpoints(sessionId).map((record) => ({
+  listCheckpoints(sessionId: string, limit?: number): SessionCheckpoint[] {
+    return listSessionCheckpoints(sessionId, limit).map((record) => ({
       id: record.id,
       sessionId: record.session_id,
       checkpointType: record.checkpoint_type,
@@ -104,6 +112,10 @@ export class SessionRuntimeStore {
       transcriptCount: listSessionTranscriptRecords(forked.id).length,
       checkpointCount: listSessionCheckpoints(forked.id).length,
     };
+  }
+
+  listToolResults(sessionId: string, limit?: number) {
+    return this.toolResults.list(sessionId, limit);
   }
 }
 

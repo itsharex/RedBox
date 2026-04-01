@@ -18,6 +18,7 @@ import { nextCronRunMs } from './backgroundCron';
 import { findMissedScheduledTasks } from './backgroundScheduledTasks';
 import { BackgroundCronScheduler } from './backgroundCronScheduler';
 import { getHeadlessAgentRunner } from './headlessAgentRunner';
+import { getHeadlessTaskSupervisor } from './headlessTaskSupervisor';
 import { getBackgroundTaskRegistry } from './backgroundTaskRegistry';
 import {
   releaseBackgroundRuntimeLock,
@@ -1461,14 +1462,27 @@ export class RedClawBackgroundRunner extends EventEmitter {
     try {
       const service = new PiChatService();
       this.currentService = service;
-      const result = await getHeadlessAgentRunner().runRedClawTask({
-        taskId: taskId || `bg_fallback_${Date.now()}`,
+      const effectiveTaskId = taskId || `bg_fallback_${Date.now()}`;
+      const result = await getHeadlessTaskSupervisor().run({
+        taskId: effectiveTaskId,
         title: params.title,
-        contextId: params.contextId,
-        contextContent: params.contextContent,
-        prompt: params.prompt,
-        displayContent: params.displayContent || '[后台自动任务]',
-        service,
+        backoff: {
+          initialDelayMs: 1500,
+          maxDelayMs: 30000,
+          maxAttempts: 3,
+          giveUpAfterMs: 8 * 60 * 1000,
+          timeoutMs: 2 * 60 * 1000,
+        },
+        execute: (signal) => getHeadlessAgentRunner().runRedClawTask({
+          taskId: effectiveTaskId,
+          title: params.title,
+          contextId: params.contextId,
+          contextContent: params.contextContent,
+          prompt: params.prompt,
+          displayContent: params.displayContent || '[后台自动任务]',
+          service,
+          attemptSignal: signal,
+        }),
       });
       if (taskId) {
         await getBackgroundTaskRegistry().completeTask(taskId, 'headless redclaw task completed');

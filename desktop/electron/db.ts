@@ -167,6 +167,31 @@ const initDb = () => {
     CREATE INDEX IF NOT EXISTS idx_session_checkpoints_session
       ON session_checkpoints(session_id, created_at DESC);
 
+    CREATE TABLE IF NOT EXISTS session_tool_results (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      call_id TEXT NOT NULL,
+      tool_name TEXT NOT NULL,
+      command TEXT,
+      success INTEGER NOT NULL DEFAULT 1,
+      result_text TEXT,
+      summary_text TEXT,
+      prompt_text TEXT,
+      original_chars INTEGER,
+      prompt_chars INTEGER,
+      truncated INTEGER NOT NULL DEFAULT 0,
+      payload_json TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_session_tool_results_session
+      ON session_tool_results(session_id, created_at ASC);
+
+    CREATE INDEX IF NOT EXISTS idx_session_tool_results_call
+      ON session_tool_results(session_id, call_id);
+
     CREATE TABLE IF NOT EXISTS knowledge_vectors (
       id TEXT PRIMARY KEY,
       source_id TEXT NOT NULL,
@@ -1101,6 +1126,24 @@ export interface SessionCheckpointRecord {
   created_at: number;
 }
 
+export interface SessionToolResultRecord {
+  id: string;
+  session_id: string;
+  call_id: string;
+  tool_name: string;
+  command?: string | null;
+  success: number;
+  result_text?: string | null;
+  summary_text?: string | null;
+  prompt_text?: string | null;
+  original_chars?: number | null;
+  prompt_chars?: number | null;
+  truncated: number;
+  payload_json?: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
 export type AgentTaskStatus = 'pending' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled';
 export type AgentTaskNodeStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
 
@@ -1610,6 +1653,112 @@ export const listSessionCheckpoints = (sessionId: string, limit?: number): Sessi
     WHERE session_id = ?
     ORDER BY created_at DESC
   `).all(sessionId) as SessionCheckpointRecord[];
+};
+
+export const addSessionToolResult = (
+  record: Omit<SessionToolResultRecord, 'created_at' | 'updated_at'> & { created_at?: number; updated_at?: number },
+): SessionToolResultRecord => {
+  const createdAt = record.created_at ?? Date.now();
+  const updatedAt = record.updated_at ?? createdAt;
+  db.prepare(`
+    INSERT INTO session_tool_results (
+      id, session_id, call_id, tool_name, command, success, result_text, summary_text,
+      prompt_text, original_chars, prompt_chars, truncated, payload_json, created_at, updated_at
+    )
+    VALUES (
+      @id, @session_id, @call_id, @tool_name, @command, @success, @result_text, @summary_text,
+      @prompt_text, @original_chars, @prompt_chars, @truncated, @payload_json, @created_at, @updated_at
+    )
+  `).run({
+    id: record.id,
+    session_id: record.session_id,
+    call_id: record.call_id,
+    tool_name: record.tool_name,
+    command: record.command ?? null,
+    success: record.success,
+    result_text: record.result_text ?? null,
+    summary_text: record.summary_text ?? null,
+    prompt_text: record.prompt_text ?? null,
+    original_chars: record.original_chars ?? null,
+    prompt_chars: record.prompt_chars ?? null,
+    truncated: record.truncated,
+    payload_json: record.payload_json ?? null,
+    created_at: createdAt,
+    updated_at: updatedAt,
+  });
+  return {
+    ...record,
+    command: record.command ?? null,
+    result_text: record.result_text ?? null,
+    summary_text: record.summary_text ?? null,
+    prompt_text: record.prompt_text ?? null,
+    original_chars: record.original_chars ?? null,
+    prompt_chars: record.prompt_chars ?? null,
+    payload_json: record.payload_json ?? null,
+    created_at: createdAt,
+    updated_at: updatedAt,
+  };
+};
+
+export const updateSessionToolResult = (
+  sessionId: string,
+  callId: string,
+  patch: Partial<Pick<
+    SessionToolResultRecord,
+    'command' | 'success' | 'result_text' | 'summary_text' | 'prompt_text' | 'original_chars' | 'prompt_chars' | 'truncated' | 'payload_json'
+  >>,
+): SessionToolResultRecord | null => {
+  const existing = db.prepare(`
+    SELECT * FROM session_tool_results
+    WHERE session_id = ? AND call_id = ?
+    ORDER BY created_at DESC
+    LIMIT 1
+  `).get(sessionId, callId) as SessionToolResultRecord | undefined;
+  if (!existing) return null;
+  const next: SessionToolResultRecord = {
+    ...existing,
+    command: patch.command !== undefined ? patch.command ?? null : existing.command,
+    success: patch.success !== undefined ? patch.success : existing.success,
+    result_text: patch.result_text !== undefined ? patch.result_text ?? null : existing.result_text,
+    summary_text: patch.summary_text !== undefined ? patch.summary_text ?? null : existing.summary_text,
+    prompt_text: patch.prompt_text !== undefined ? patch.prompt_text ?? null : existing.prompt_text,
+    original_chars: patch.original_chars !== undefined ? patch.original_chars ?? null : existing.original_chars,
+    prompt_chars: patch.prompt_chars !== undefined ? patch.prompt_chars ?? null : existing.prompt_chars,
+    truncated: patch.truncated !== undefined ? patch.truncated : existing.truncated,
+    payload_json: patch.payload_json !== undefined ? patch.payload_json ?? null : existing.payload_json,
+    updated_at: Date.now(),
+  };
+  db.prepare(`
+    UPDATE session_tool_results
+    SET command = @command,
+        success = @success,
+        result_text = @result_text,
+        summary_text = @summary_text,
+        prompt_text = @prompt_text,
+        original_chars = @original_chars,
+        prompt_chars = @prompt_chars,
+        truncated = @truncated,
+        payload_json = @payload_json,
+        updated_at = @updated_at
+    WHERE id = @id
+  `).run(next);
+  return next;
+};
+
+export const listSessionToolResults = (sessionId: string, limit?: number): SessionToolResultRecord[] => {
+  if (limit && limit > 0) {
+    return db.prepare(`
+      SELECT * FROM session_tool_results
+      WHERE session_id = ?
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(sessionId, Math.floor(limit)) as SessionToolResultRecord[];
+  }
+  return db.prepare(`
+    SELECT * FROM session_tool_results
+    WHERE session_id = ?
+    ORDER BY created_at DESC
+  `).all(sessionId) as SessionToolResultRecord[];
 };
 
 export const cloneChatSession = (sourceSessionId: string, nextSessionId: string, title?: string): ChatSession => {

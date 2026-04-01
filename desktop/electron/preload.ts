@@ -50,6 +50,7 @@ contextBridge.exposeInMainWorld('ipcRenderer', {
     resume: (sessionId: string) => ipcRenderer.invoke('sessions:resume', { sessionId }),
     fork: (sessionId: string) => ipcRenderer.invoke('sessions:fork', { sessionId }),
     getTranscript: (sessionId: string, limit?: number) => ipcRenderer.invoke('sessions:get-transcript', { sessionId, limit }),
+    getToolResults: (sessionId: string, limit?: number) => ipcRenderer.invoke('sessions:get-tool-results', { sessionId, limit }),
   },
   runtime: {
     query: (payload: { sessionId?: string; message: string; modelConfig?: unknown }) => ipcRenderer.invoke('runtime:query', payload),
@@ -57,6 +58,7 @@ contextBridge.exposeInMainWorld('ipcRenderer', {
     forkSession: (payload: { sessionId: string }) => ipcRenderer.invoke('runtime:fork-session', payload),
     getTrace: (payload: { sessionId: string; limit?: number }) => ipcRenderer.invoke('runtime:get-trace', payload),
     getCheckpoints: (payload: { sessionId: string; limit?: number }) => ipcRenderer.invoke('runtime:get-checkpoints', payload),
+    getToolResults: (payload: { sessionId: string; limit?: number }) => ipcRenderer.invoke('runtime:get-tool-results', payload),
   },
   toolHooks: {
     list: () => ipcRenderer.invoke('tools:hooks:list'),
@@ -66,6 +68,7 @@ contextBridge.exposeInMainWorld('ipcRenderer', {
   backgroundTasks: {
     list: () => ipcRenderer.invoke('background-tasks:list'),
     get: (taskId: string) => ipcRenderer.invoke('background-tasks:get', { taskId }),
+    cancel: (taskId: string) => ipcRenderer.invoke('background-tasks:cancel', { taskId }),
   },
   tasks: {
     create: (payload?: { runtimeMode?: string; sessionId?: string; userInput?: string; metadata?: Record<string, unknown> }) => ipcRenderer.invoke('tasks:create', payload || {}),

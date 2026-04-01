@@ -16,6 +16,7 @@ import {
   type AiProtocol,
   type AiPresetGroup,
   type RoleSpec,
+  type BackgroundTaskItem,
   type CreateAiSourceDraft,
   type LocalAiGuide,
   type MemoryHistoryEntry,
@@ -94,6 +95,24 @@ type RuntimeSessionCheckpointItem = {
   summary: string;
   payload?: unknown;
   createdAt: number;
+};
+
+type RuntimeSessionToolResultItem = {
+  id: string;
+  sessionId: string;
+  callId: string;
+  toolName: string;
+  command?: string;
+  success: boolean;
+  resultText?: string;
+  summaryText?: string;
+  promptText?: string;
+  originalChars?: number;
+  promptChars?: number;
+  truncated: boolean;
+  payload?: unknown;
+  createdAt: number;
+  updatedAt: number;
 };
 
 type RuntimeHookDefinition = {
@@ -180,14 +199,19 @@ export function Settings() {
   const [runtimeTaskTraces, setRuntimeTaskTraces] = useState<AgentTaskTrace[]>([]);
   const [runtimeSessionTranscript, setRuntimeSessionTranscript] = useState<RuntimeSessionTranscriptItem[]>([]);
   const [runtimeSessionCheckpoints, setRuntimeSessionCheckpoints] = useState<RuntimeSessionCheckpointItem[]>([]);
+  const [runtimeSessionToolResults, setRuntimeSessionToolResults] = useState<RuntimeSessionToolResultItem[]>([]);
   const [runtimeHooks, setRuntimeHooks] = useState<RuntimeHookDefinition[]>([]);
+  const [backgroundTasks, setBackgroundTasks] = useState<BackgroundTaskItem[]>([]);
+  const [selectedBackgroundTaskId, setSelectedBackgroundTaskId] = useState('');
   const [runtimeDraftInput, setRuntimeDraftInput] = useState('');
   const [runtimeDraftMode, setRuntimeDraftMode] = useState<'redclaw' | 'knowledge' | 'chatroom' | 'advisor-discussion' | 'background-maintenance'>('redclaw');
   const [isRuntimeLoading, setIsRuntimeLoading] = useState(false);
   const [isRuntimeTraceLoading, setIsRuntimeTraceLoading] = useState(false);
   const [isRuntimeSessionLoading, setIsRuntimeSessionLoading] = useState(false);
+  const [isBackgroundTasksLoading, setIsBackgroundTasksLoading] = useState(false);
   const [isRuntimeCreating, setIsRuntimeCreating] = useState(false);
   const [runtimeTaskActionRunning, setRuntimeTaskActionRunning] = useState<Record<string, 'resume' | 'cancel' | undefined>>({});
+  const [backgroundTaskActionRunning, setBackgroundTaskActionRunning] = useState<Record<string, 'cancel' | undefined>>({});
   const [status, setStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [showScopedModelOverrides, setShowScopedModelOverrides] = useState(false);
   const [developerVersionTapCount, setDeveloperVersionTapCount] = useState(0);
@@ -554,6 +578,7 @@ export function Settings() {
   useEffect(() => {
     let memoryPollTimer: number | null = null;
     let runtimePollTimer: number | null = null;
+    let backgroundTaskPollTimer: number | null = null;
     if (activeTab === 'memory') {
       void loadMemories();
       memoryPollTimer = window.setInterval(() => {
@@ -570,6 +595,9 @@ export function Settings() {
         void loadRuntimeTasks();
         void loadRuntimeSessions();
       }, 8000);
+      backgroundTaskPollTimer = window.setInterval(() => {
+        void loadBackgroundTasks();
+      }, 5000);
     }
 
     return () => {
@@ -579,6 +607,31 @@ export function Settings() {
       if (runtimePollTimer) {
         window.clearInterval(runtimePollTimer);
       }
+      if (backgroundTaskPollTimer) {
+        window.clearInterval(backgroundTaskPollTimer);
+      }
+    };
+  }, [activeTab, formData.developer_mode_enabled]);
+
+  useEffect(() => {
+    if (activeTab !== 'tools' || !formData.developer_mode_enabled) return;
+    const onBackgroundTaskUpdated = (_event: unknown, task: BackgroundTaskItem) => {
+      if (!task?.id) return;
+      setBackgroundTasks((prev) => {
+        const next = [...prev];
+        const index = next.findIndex((item) => item.id === task.id);
+        if (index >= 0) {
+          next[index] = task;
+        } else {
+          next.unshift(task);
+        }
+        return next.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()).slice(0, 200);
+      });
+      setSelectedBackgroundTaskId((prev) => prev || task.id);
+    };
+    window.ipcRenderer.on('background:task-updated', onBackgroundTaskUpdated);
+    return () => {
+      window.ipcRenderer.off('background:task-updated', onBackgroundTaskUpdated);
     };
   }, [activeTab, formData.developer_mode_enabled]);
 
@@ -1354,20 +1407,24 @@ export function Settings() {
     if (!normalizedSessionId) {
       setRuntimeSessionTranscript([]);
       setRuntimeSessionCheckpoints([]);
+      setRuntimeSessionToolResults([]);
       return;
     }
     setIsRuntimeSessionLoading(true);
     try {
-      const [transcript, checkpoints] = await Promise.all([
+      const [transcript, checkpoints, toolResults] = await Promise.all([
         window.ipcRenderer.sessions.getTranscript(normalizedSessionId, 120),
         window.ipcRenderer.runtime.getCheckpoints({ sessionId: normalizedSessionId, limit: 80 }),
+        window.ipcRenderer.runtime.getToolResults({ sessionId: normalizedSessionId, limit: 120 }),
       ]);
       setRuntimeSessionTranscript(Array.isArray(transcript) ? transcript as RuntimeSessionTranscriptItem[] : []);
       setRuntimeSessionCheckpoints(Array.isArray(checkpoints) ? checkpoints as RuntimeSessionCheckpointItem[] : []);
+      setRuntimeSessionToolResults(Array.isArray(toolResults) ? toolResults as RuntimeSessionToolResultItem[] : []);
     } catch (e) {
       console.error('Failed to load runtime session details', e);
       setRuntimeSessionTranscript([]);
       setRuntimeSessionCheckpoints([]);
+      setRuntimeSessionToolResults([]);
     } finally {
       setIsRuntimeSessionLoading(false);
     }
@@ -1383,12 +1440,36 @@ export function Settings() {
     }
   };
 
+  const loadBackgroundTasks = async (preserveSelection = true) => {
+    setIsBackgroundTasksLoading(true);
+    try {
+      const result = await window.ipcRenderer.backgroundTasks.list();
+      const taskList = Array.isArray(result) ? result as BackgroundTaskItem[] : [];
+      setBackgroundTasks(taskList);
+      setSelectedBackgroundTaskId((prev) => {
+        if (preserveSelection && prev && taskList.some((task) => task.id === prev)) {
+          return prev;
+        }
+        return taskList[0]?.id || '';
+      });
+    } catch (e) {
+      console.error('Failed to load background tasks', e);
+      setBackgroundTasks([]);
+      if (!preserveSelection) {
+        setSelectedBackgroundTaskId('');
+      }
+    } finally {
+      setIsBackgroundTasksLoading(false);
+    }
+  };
+
   const loadRuntimeDeveloperData = async () => {
     await Promise.all([
       loadRuntimeRoles(),
       loadRuntimeTasks(),
       loadRuntimeSessions(),
       loadRuntimeHooks(),
+      loadBackgroundTasks(),
     ]);
   };
 
@@ -1441,6 +1522,18 @@ export function Settings() {
       console.error('Failed to cancel runtime task', e);
     } finally {
       setRuntimeTaskActionRunning((prev) => ({ ...prev, [taskId]: undefined }));
+    }
+  };
+
+  const handleCancelBackgroundTask = async (taskId: string) => {
+    setBackgroundTaskActionRunning((prev) => ({ ...prev, [taskId]: 'cancel' }));
+    try {
+      await window.ipcRenderer.backgroundTasks.cancel(taskId);
+      await loadBackgroundTasks();
+    } catch (e) {
+      console.error('Failed to cancel background task', e);
+    } finally {
+      setBackgroundTaskActionRunning((prev) => ({ ...prev, [taskId]: undefined }));
     }
   };
 
@@ -2652,13 +2745,17 @@ export function Settings() {
                 runtimeTasks={runtimeTasks}
                 runtimeRoles={runtimeRoles}
                 runtimeSessions={runtimeSessions}
+                backgroundTasks={backgroundTasks}
                 selectedRuntimeTaskId={selectedRuntimeTaskId}
                 setSelectedRuntimeTaskId={setSelectedRuntimeTaskId}
                 selectedRuntimeSessionId={selectedRuntimeSessionId}
                 setSelectedRuntimeSessionId={setSelectedRuntimeSessionId}
+                selectedBackgroundTaskId={selectedBackgroundTaskId}
+                setSelectedBackgroundTaskId={setSelectedBackgroundTaskId}
                 runtimeTaskTraces={runtimeTaskTraces}
                 runtimeSessionTranscript={runtimeSessionTranscript}
                 runtimeSessionCheckpoints={runtimeSessionCheckpoints}
+                runtimeSessionToolResults={runtimeSessionToolResults}
                 runtimeHooks={runtimeHooks}
                 runtimeDraftInput={runtimeDraftInput}
                 setRuntimeDraftInput={setRuntimeDraftInput}
@@ -2667,12 +2764,15 @@ export function Settings() {
                 isRuntimeLoading={isRuntimeLoading}
                 isRuntimeTraceLoading={isRuntimeTraceLoading}
                 isRuntimeSessionLoading={isRuntimeSessionLoading}
+                isBackgroundTasksLoading={isBackgroundTasksLoading}
                 isRuntimeCreating={isRuntimeCreating}
                 runtimeTaskActionRunning={runtimeTaskActionRunning}
+                backgroundTaskActionRunning={backgroundTaskActionRunning}
                 handleRefreshRuntimeData={loadRuntimeDeveloperData}
                 handleCreateRuntimeTask={handleCreateRuntimeTask}
                 handleResumeRuntimeTask={handleResumeRuntimeTask}
                 handleCancelRuntimeTask={handleCancelRuntimeTask}
+                handleCancelBackgroundTask={handleCancelBackgroundTask}
               />
             )}
 

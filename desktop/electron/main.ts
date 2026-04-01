@@ -88,6 +88,7 @@ import { detectAiProtocol, fetchModelsForAiSource, testAiSourceConnection } from
 import { loadOfficialFeatureModule } from './officialFeatureBridge';
 import { getMemoryMaintenanceService } from './core/memoryMaintenanceService';
 import { getBackgroundTaskRegistry } from './core/backgroundTaskRegistry';
+import { getHeadlessWorkerProcessManager } from './core/headlessWorkerProcessManager';
 import { generateAdvisorPersonaDocument } from './core/advisorPersonaGenerator';
 import {
   getDebugLogDirectory,
@@ -626,6 +627,10 @@ app.on('window-all-closed', async () => {
     win = null
   }
 })
+
+app.on('before-quit', () => {
+  void getHeadlessWorkerProcessManager().dispose();
+});
 
 app.on('activate', () => {
   if (BrowserWindow.getAllWindows().length === 0) {
@@ -1195,8 +1200,9 @@ ipcMain.handle('sessions:get', (_event, payload?: { sessionId?: string }) => {
   if (!sessionId) return null;
   return {
     chatSession: getChatSession(sessionId),
-    transcript: listSessionTranscriptRecords(sessionId),
-    checkpoints: listSessionCheckpoints(sessionId),
+    transcript: getSessionRuntimeStore().listTranscript(sessionId),
+    checkpoints: getSessionRuntimeStore().listCheckpoints(sessionId),
+    toolResults: getSessionRuntimeStore().listToolResults(sessionId, 200),
   };
 });
 
@@ -1222,37 +1228,39 @@ ipcMain.handle('sessions:fork', (_event, payload?: { sessionId?: string; title?:
   };
 });
 
-ipcMain.handle('sessions:get-transcript', (_event, payload?: { sessionId?: string }) => {
+ipcMain.handle('sessions:get-transcript', (_event, payload?: { sessionId?: string; limit?: number }) => {
   const sessionId = String(payload?.sessionId || '').trim();
   if (!sessionId) return [];
-  return listSessionTranscriptRecords(sessionId).map((record) => ({
-    id: record.id,
-    sessionId: record.session_id,
-    recordType: record.record_type,
-    role: record.role,
-    content: record.content,
-    payload: record.payload_json ? JSON.parse(record.payload_json) : null,
-    createdAt: record.created_at,
-  }));
+  const limit = Number(payload?.limit || 0);
+  return getSessionRuntimeStore().listTranscript(sessionId, Number.isFinite(limit) && limit > 0 ? limit : undefined);
 });
 
-ipcMain.handle('runtime:get-trace', (_event, payload?: { sessionId?: string }) => {
+ipcMain.handle('sessions:get-tool-results', (_event, payload?: { sessionId?: string; limit?: number }) => {
   const sessionId = String(payload?.sessionId || '').trim();
   if (!sessionId) return [];
-  return listSessionTranscriptRecords(sessionId);
+  const limit = Number(payload?.limit || 0);
+  return getSessionRuntimeStore().listToolResults(sessionId, Number.isFinite(limit) && limit > 0 ? limit : undefined);
 });
 
-ipcMain.handle('runtime:get-checkpoints', (_event, payload?: { sessionId?: string }) => {
+ipcMain.handle('runtime:get-trace', (_event, payload?: { sessionId?: string; limit?: number }) => {
   const sessionId = String(payload?.sessionId || '').trim();
   if (!sessionId) return [];
-  return listSessionCheckpoints(sessionId).map((record) => ({
-    id: record.id,
-    sessionId: record.session_id,
-    checkpointType: record.checkpoint_type,
-    summary: record.summary,
-    payload: record.payload_json ? JSON.parse(record.payload_json) : null,
-    createdAt: record.created_at,
-  }));
+  const limit = Number(payload?.limit || 0);
+  return getSessionRuntimeStore().listTranscript(sessionId, Number.isFinite(limit) && limit > 0 ? limit : undefined);
+});
+
+ipcMain.handle('runtime:get-checkpoints', (_event, payload?: { sessionId?: string; limit?: number }) => {
+  const sessionId = String(payload?.sessionId || '').trim();
+  if (!sessionId) return [];
+  const limit = Number(payload?.limit || 0);
+  return getSessionRuntimeStore().listCheckpoints(sessionId, Number.isFinite(limit) && limit > 0 ? limit : undefined);
+});
+
+ipcMain.handle('runtime:get-tool-results', (_event, payload?: { sessionId?: string; limit?: number }) => {
+  const sessionId = String(payload?.sessionId || '').trim();
+  if (!sessionId) return [];
+  const limit = Number(payload?.limit || 0);
+  return getSessionRuntimeStore().listToolResults(sessionId, Number.isFinite(limit) && limit > 0 ? limit : undefined);
 });
 
 ipcMain.handle('runtime:resume', (_event, payload?: { sessionId?: string }) => {
@@ -1549,6 +1557,10 @@ ipcMain.handle('background-tasks:list', async () => {
 
 ipcMain.handle('background-tasks:get', async (_, payload?: { taskId?: string }) => {
   return getBackgroundTaskRegistry().getTask(String(payload?.taskId || ''));
+});
+
+ipcMain.handle('background-tasks:cancel', async (_, payload?: { taskId?: string }) => {
+  return getBackgroundTaskRegistry().cancelTask(String(payload?.taskId || ''));
 });
 
 ipcMain.handle('memory:add', async (_, { content, type, tags }) => {

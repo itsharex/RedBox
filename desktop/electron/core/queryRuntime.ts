@@ -1,6 +1,7 @@
 import { CompactManager } from './compactManager';
 import { executeRuntimeHooks } from './runtimeHooks';
 import { getSessionRuntimeStore } from './sessionRuntimeStore';
+import { getToolResultStore } from './toolResultStore';
 import { applyToolResultBudget } from './toolResultBudget';
 import { ToolKind, ToolRegistry, ToolExecutor, type ToolCallRequest, type ToolCallResponse, type ToolResult } from './toolRegistry';
 import { normalizeApiBaseUrl, safeUrlJoin } from './urlUtils';
@@ -66,6 +67,7 @@ const extractAssistantText = (content: unknown): string => {
 
 export class QueryRuntime {
   private readonly store = getSessionRuntimeStore();
+  private readonly toolResults = getToolResultStore();
   private readonly compactManager: CompactManager;
 
   constructor(
@@ -276,7 +278,18 @@ export class QueryRuntime {
         messages.push(
           ...budgetedResults.map((toolResult) => toToolFeedbackMessage(toolResult.toolName, toolResult.promptText)),
         );
-        for (const toolResult of budgetedResults) {
+        for (const [index, toolResult] of budgetedResults.entries()) {
+          const response = toolResponses[index];
+          const persisted = response
+            ? this.toolResults.applyBudget({
+                sessionId: this.config.sessionId,
+                callId: response.callId,
+                promptText: toolResult.promptText,
+                originalChars: toolResult.originalChars,
+                promptChars: toolResult.promptChars,
+                truncated: toolResult.truncated,
+              })
+            : null;
           if (!toolResult.truncated) {
             continue;
           }
@@ -293,6 +306,8 @@ export class QueryRuntime {
             payload: {
               kind: 'tool.result.budget',
               data: {
+                callId: response?.callId,
+                toolResultId: persisted?.id,
                 toolName: toolResult.toolName,
                 originalChars: toolResult.originalChars,
                 promptChars: toolResult.promptChars,
@@ -535,6 +550,17 @@ export class QueryRuntime {
     );
 
     const summarized = this.summarizeToolResult(toolCall.name, response.result);
+    const persistedToolResult = this.toolResults.add({
+      sessionId: this.config.sessionId,
+      callId: response.callId,
+      toolName: toolCall.name,
+      command: this.extractCommand(toolCall.args),
+      result: response.result,
+      summaryText: summarized,
+      payload: {
+        durationMs: response.durationMs,
+      },
+    });
     if (summarized) {
       this.adapter.onEvent({
         type: 'tool_summary',
@@ -560,6 +586,8 @@ export class QueryRuntime {
       payload: {
         kind: 'tool.result',
         data: {
+          toolResultId: persistedToolResult.id,
+          callId: response.callId,
           toolName: toolCall.name,
           success: response.result.success,
           durationMs: response.durationMs,

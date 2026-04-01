@@ -1,14 +1,16 @@
 import type { Dispatch, SetStateAction } from 'react';
-import { AlertCircle, Database, Download, FolderOpen, Info, RefreshCw, Save, Search, Trash2 } from 'lucide-react';
+import { Activity, AlertCircle, Database, Download, FolderOpen, Info, RefreshCw, Save, Search, Square, Trash2 } from 'lucide-react';
 import clsx from 'clsx';
 import type {
-    AgentTaskSnapshot,
-    AgentTaskTrace,
-    McpServerConfig,
-    MemoryHistoryEntry,
-    MemoryMaintenanceStatus,
+  AgentTaskSnapshot,
+  AgentTaskTrace,
+  BackgroundTaskItem,
+  McpServerConfig,
+  MemoryHistoryEntry,
+  MemoryMaintenanceStatus,
     MemorySearchResult,
     RoleSpec,
+    RuntimeToolResultItem,
     ToolDiagnosticDescriptor,
     ToolDiagnosticRunResult,
     UserMemory,
@@ -677,10 +679,13 @@ interface ToolsSettingsSectionProps {
         checkpointCount: number;
         chatSession?: { id: string; title?: string; updatedAt?: string } | null;
     }>;
+    backgroundTasks: BackgroundTaskItem[];
     selectedRuntimeTaskId: string;
     setSelectedRuntimeTaskId: Dispatch<SetStateAction<string>>;
     selectedRuntimeSessionId: string;
     setSelectedRuntimeSessionId: Dispatch<SetStateAction<string>>;
+    selectedBackgroundTaskId: string;
+    setSelectedBackgroundTaskId: Dispatch<SetStateAction<string>>;
     runtimeTaskTraces: AgentTaskTrace[];
     runtimeSessionTranscript: Array<{
         id: number;
@@ -699,6 +704,7 @@ interface ToolsSettingsSectionProps {
         payload?: unknown;
         createdAt: number;
     }>;
+    runtimeSessionToolResults: RuntimeToolResultItem[];
     runtimeHooks: Array<{
         id: string;
         event: string;
@@ -713,12 +719,15 @@ interface ToolsSettingsSectionProps {
     isRuntimeLoading: boolean;
     isRuntimeTraceLoading: boolean;
     isRuntimeSessionLoading: boolean;
+    isBackgroundTasksLoading: boolean;
     isRuntimeCreating: boolean;
     runtimeTaskActionRunning: Record<string, 'resume' | 'cancel' | undefined>;
+    backgroundTaskActionRunning: Record<string, 'cancel' | undefined>;
     handleRefreshRuntimeData: () => Promise<void>;
     handleCreateRuntimeTask: () => Promise<void>;
     handleResumeRuntimeTask: (taskId: string) => Promise<void>;
     handleCancelRuntimeTask: (taskId: string) => Promise<void>;
+    handleCancelBackgroundTask: (taskId: string) => Promise<void>;
 }
 
 export function ToolsSettingsSection({
@@ -757,13 +766,17 @@ export function ToolsSettingsSection({
     runtimeTasks,
     runtimeRoles,
     runtimeSessions,
+    backgroundTasks,
     selectedRuntimeTaskId,
     setSelectedRuntimeTaskId,
     selectedRuntimeSessionId,
     setSelectedRuntimeSessionId,
+    selectedBackgroundTaskId,
+    setSelectedBackgroundTaskId,
     runtimeTaskTraces,
     runtimeSessionTranscript,
     runtimeSessionCheckpoints,
+    runtimeSessionToolResults,
     runtimeHooks,
     runtimeDraftInput,
     setRuntimeDraftInput,
@@ -772,12 +785,15 @@ export function ToolsSettingsSection({
     isRuntimeLoading,
     isRuntimeTraceLoading,
     isRuntimeSessionLoading,
+    isBackgroundTasksLoading,
     isRuntimeCreating,
     runtimeTaskActionRunning,
+    backgroundTaskActionRunning,
     handleRefreshRuntimeData,
     handleCreateRuntimeTask,
     handleResumeRuntimeTask,
     handleCancelRuntimeTask,
+    handleCancelBackgroundTask,
 }: ToolsSettingsSectionProps) {
     const availabilityTone = (tool: ToolDiagnosticDescriptor) => {
         switch (tool.availabilityStatus) {
@@ -796,6 +812,7 @@ export function ToolsSettingsSection({
 
     const selectedRuntimeTask = runtimeTasks.find((task) => task.id === selectedRuntimeTaskId) || null;
     const selectedRuntimeSession = runtimeSessions.find((session) => session.id === selectedRuntimeSessionId) || null;
+    const selectedBackgroundTask = backgroundTasks.find((task) => task.id === selectedBackgroundTaskId) || null;
 
     const availabilityLabel = (tool: ToolDiagnosticDescriptor) => {
         switch (tool.availabilityStatus) {
@@ -824,6 +841,42 @@ export function ToolsSettingsSection({
                 return 'bg-slate-500/10 text-slate-600';
             default:
                 return 'bg-amber-500/10 text-amber-600';
+        }
+    };
+
+    const backgroundTaskStatusTone = (status: BackgroundTaskItem['status']) => {
+        switch (status) {
+            case 'completed':
+                return 'bg-green-500/10 text-green-600';
+            case 'running':
+                return 'bg-blue-500/10 text-blue-600';
+            case 'failed':
+                return 'bg-red-500/10 text-red-600';
+            case 'cancelled':
+                return 'bg-slate-500/10 text-slate-600';
+            default:
+                return 'bg-amber-500/10 text-amber-600';
+        }
+    };
+
+    const backgroundTaskPhaseTone = (phase: BackgroundTaskItem['phase']) => {
+        switch (phase) {
+            case 'thinking':
+                return 'bg-violet-500/10 text-violet-600';
+            case 'tooling':
+                return 'bg-sky-500/10 text-sky-600';
+            case 'responding':
+                return 'bg-emerald-500/10 text-emerald-600';
+            case 'updating':
+                return 'bg-amber-500/10 text-amber-600';
+            case 'completed':
+                return 'bg-green-500/10 text-green-600';
+            case 'failed':
+                return 'bg-red-500/10 text-red-600';
+            case 'cancelled':
+                return 'bg-slate-500/10 text-slate-600';
+            default:
+                return 'bg-border text-text-tertiary';
         }
     };
 
@@ -1355,6 +1408,167 @@ export function ToolsSettingsSection({
                     <div className="bg-surface-secondary/30 rounded-lg border border-border p-4 space-y-4">
                         <div className="flex items-start justify-between gap-3">
                             <div>
+                                <h3 className="text-sm font-medium text-text-primary">后台任务中心</h3>
+                                <p className="text-xs text-text-tertiary mt-1">
+                                    对齐 Claude DreamTask / headless runtime 的任务注册表。这里展示后台 Agent 的 running/completed/failed/cancelled 状态、实时过程和取消入口。
+                                </p>
+                            </div>
+                            <div className="flex items-center gap-2 text-[11px] text-text-tertiary">
+                                <span>tasks {backgroundTasks.length}</span>
+                                {isBackgroundTasksLoading ? <span>同步中...</span> : null}
+                            </div>
+                        </div>
+
+                        <div className="grid grid-cols-1 xl:grid-cols-[340px_minmax(0,1fr)] gap-4">
+                            <div className="rounded-lg border border-border bg-surface-primary/50 p-3 space-y-3">
+                                <div className="flex items-center justify-between gap-2">
+                                    <div className="text-xs font-medium text-text-primary">后台任务列表</div>
+                                    <span className="text-[11px] text-text-tertiary">最近 {backgroundTasks.length} 条</span>
+                                </div>
+                                {backgroundTasks.length === 0 ? (
+                                    <div className="text-[11px] text-text-tertiary">暂无后台任务。</div>
+                                ) : (
+                                    <div className="space-y-2 max-h-96 overflow-auto pr-1">
+                                        {backgroundTasks.map((task) => (
+                                            <button
+                                                key={task.id}
+                                                type="button"
+                                                onClick={() => setSelectedBackgroundTaskId(task.id)}
+                                                className={clsx(
+                                                    'w-full text-left rounded border p-3 transition-colors',
+                                                    selectedBackgroundTaskId === task.id
+                                                        ? 'border-accent-primary bg-accent-primary/5'
+                                                        : 'border-border bg-surface-secondary/20 hover:bg-surface-secondary/30'
+                                                )}
+                                            >
+                                                <div className="flex items-center justify-between gap-2">
+                                                    <div className="min-w-0">
+                                                        <div className="text-xs font-medium text-text-primary truncate">{task.title}</div>
+                                                <div className="text-[11px] text-text-tertiary mt-1 truncate">{task.kind}</div>
+                                                    </div>
+                                                    <span className={clsx('text-[10px] px-1.5 py-0.5 rounded', backgroundTaskStatusTone(task.status))}>
+                                                        {task.status}
+                                                    </span>
+                                                </div>
+                                                <div className="mt-2 text-[11px] text-text-tertiary space-y-1">
+                                                    <div className="flex items-center gap-2">
+                                                        <span className={clsx('text-[10px] px-1.5 py-0.5 rounded', backgroundTaskPhaseTone(task.phase))}>
+                                                            {task.phase}
+                                                        </span>
+                                                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-surface-secondary border border-border text-text-tertiary">
+                                                            {task.workerState}
+                                                        </span>
+                                                        {task.workerMode ? (
+                                                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-surface-secondary border border-border text-text-tertiary">
+                                                                {task.workerMode}
+                                                            </span>
+                                                        ) : null}
+                                                        <span>attempt {task.attemptCount}</span>
+                                                        <span className="font-mono truncate">{task.id}</span>
+                                                    </div>
+                                                    {task.latestText ? (
+                                                        <div className="line-clamp-2 text-text-secondary">{task.latestText}</div>
+                                                    ) : null}
+                                                </div>
+                                            </button>
+                                        ))}
+                                    </div>
+                                )}
+                            </div>
+
+                            <div className="rounded-lg border border-border bg-surface-primary/50 p-3 space-y-3">
+                                <div className="flex items-center justify-between gap-2">
+                                    <div className="text-xs font-medium text-text-primary">后台任务详情</div>
+                                    {selectedBackgroundTask ? (
+                                        <button
+                                            type="button"
+                                            onClick={() => void handleCancelBackgroundTask(selectedBackgroundTask.id)}
+                                            disabled={selectedBackgroundTask.status !== 'running' || Boolean(backgroundTaskActionRunning[selectedBackgroundTask.id])}
+                                            className="inline-flex items-center gap-2 px-2.5 py-1.5 border border-red-300 text-red-600 rounded text-xs hover:bg-red-50/70 transition-colors disabled:opacity-50"
+                                        >
+                                            <Square className="w-3.5 h-3.5" />
+                                            {backgroundTaskActionRunning[selectedBackgroundTask.id] === 'cancel' ? '取消中...' : '停止任务'}
+                                        </button>
+                                    ) : null}
+                                </div>
+
+                                {!selectedBackgroundTask ? (
+                                    <div className="text-[11px] text-text-tertiary">请选择左侧一条后台任务。</div>
+                                ) : (
+                                    <div className="space-y-3">
+                                        <div className="rounded border border-border bg-surface-secondary/20 p-3">
+                                            <div className="flex items-center gap-2 flex-wrap">
+                                                <span className="text-xs font-medium text-text-primary">{selectedBackgroundTask.title}</span>
+                                                <span className={clsx('text-[10px] px-1.5 py-0.5 rounded', backgroundTaskStatusTone(selectedBackgroundTask.status))}>
+                                                    {selectedBackgroundTask.status}
+                                                </span>
+                                                <span className={clsx('text-[10px] px-1.5 py-0.5 rounded', backgroundTaskPhaseTone(selectedBackgroundTask.phase))}>
+                                                    {selectedBackgroundTask.phase}
+                                                </span>
+                                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-surface-secondary border border-border text-text-tertiary">
+                                                    {selectedBackgroundTask.kind}
+                                                </span>
+                                            </div>
+                                            <div className="mt-2 text-[11px] text-text-tertiary space-y-1">
+                                                <div className="font-mono break-all">{selectedBackgroundTask.id}</div>
+                                                {selectedBackgroundTask.sessionId ? <div>session: {selectedBackgroundTask.sessionId}</div> : null}
+                                                {selectedBackgroundTask.contextId ? <div>context: {selectedBackgroundTask.contextId}</div> : null}
+                                                <div>created: {new Date(selectedBackgroundTask.createdAt).toLocaleString()}</div>
+                                                <div>updated: {new Date(selectedBackgroundTask.updatedAt).toLocaleString()}</div>
+                                                {selectedBackgroundTask.completedAt ? <div>completed: {new Date(selectedBackgroundTask.completedAt).toLocaleString()}</div> : null}
+                                                <div>attempts: {selectedBackgroundTask.attemptCount}</div>
+                                                <div>workerState: {selectedBackgroundTask.workerState}</div>
+                                                {selectedBackgroundTask.workerMode ? <div>workerMode: {selectedBackgroundTask.workerMode}</div> : null}
+                                                {typeof selectedBackgroundTask.workerPid === 'number' ? <div>workerPid: {selectedBackgroundTask.workerPid}</div> : null}
+                                                {selectedBackgroundTask.workerLastHeartbeatAt ? <div>workerHeartbeat: {new Date(selectedBackgroundTask.workerLastHeartbeatAt).toLocaleString()}</div> : null}
+                                                <div>rollback: {selectedBackgroundTask.rollbackState}</div>
+                                                {selectedBackgroundTask.cancelReason ? <div>cancelReason: {selectedBackgroundTask.cancelReason}</div> : null}
+                                                {selectedBackgroundTask.rollbackError ? <div className="text-red-600">rollbackError: {selectedBackgroundTask.rollbackError}</div> : null}
+                                                {selectedBackgroundTask.summary ? (
+                                                    <div className="text-text-secondary">summary: {selectedBackgroundTask.summary}</div>
+                                                ) : null}
+                                                {selectedBackgroundTask.error ? (
+                                                    <div className="text-red-600">error: {selectedBackgroundTask.error}</div>
+                                                ) : null}
+                                            </div>
+                                        </div>
+
+                                        <div className="rounded border border-border bg-surface-secondary/20 p-3 space-y-2">
+                                            <div className="flex items-center gap-2 text-[11px] font-medium text-text-primary">
+                                                <Activity className="w-3.5 h-3.5" />
+                                                实时过程
+                                            </div>
+                                            {selectedBackgroundTask.turns.length === 0 ? (
+                                                <div className="text-[11px] text-text-tertiary">暂无过程记录。</div>
+                                            ) : (
+                                                <div className="max-h-96 overflow-auto space-y-2 pr-1">
+                                                    {selectedBackgroundTask.turns.map((turn) => (
+                                                        <div key={turn.id} className="rounded border border-border bg-surface-primary/60 p-2">
+                                                            <div className="flex items-center justify-between gap-2">
+                                                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-surface-secondary border border-border text-text-tertiary">
+                                                                    {turn.source}
+                                                                </span>
+                                                                <span className="text-[10px] text-text-tertiary">
+                                                                    {new Date(turn.at).toLocaleTimeString()}
+                                                                </span>
+                                                            </div>
+                                                            <div className="mt-2 text-[11px] leading-5 text-text-secondary whitespace-pre-wrap break-words">
+                                                                {turn.text}
+                                                            </div>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            )}
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="bg-surface-secondary/30 rounded-lg border border-border p-4 space-y-4">
+                        <div className="flex items-start justify-between gap-3">
+                            <div>
                                 <h3 className="text-sm font-medium text-text-primary">Runtime Session / Transcript</h3>
                                 <p className="text-xs text-text-tertiary mt-1">
                                     查看统一运行时的会话 transcript、checkpoint 和当前已注册 hooks，确认会话恢复与 compact 语义是否正常。
@@ -1483,6 +1697,53 @@ export function ToolsSettingsSection({
                                                             <pre className="mt-2 whitespace-pre-wrap break-all text-[11px] leading-5 text-text-secondary">
                                                                 {item.content || '(empty)'}
                                                             </pre>
+                                                        </details>
+                                                    ))}
+                                                </div>
+                                            </div>
+
+                                            <div className="rounded border border-border bg-surface-secondary/20 p-3">
+                                                <div className="text-[11px] font-medium text-text-primary">Tool Result Store</div>
+                                                <div className="mt-2 max-h-[24rem] overflow-auto space-y-2 pr-1">
+                                                    {runtimeSessionToolResults.length === 0 ? (
+                                                        <div className="text-[11px] text-text-tertiary">暂无完整 tool result 记录。</div>
+                                                    ) : runtimeSessionToolResults.map((item) => (
+                                                        <details key={item.id} className="rounded border border-border bg-surface-primary/60 p-2">
+                                                            <summary className="cursor-pointer flex items-center justify-between gap-2 text-[11px]">
+                                                                <span className="font-medium text-text-primary">
+                                                                    {item.toolName} · {item.success ? 'success' : 'error'}
+                                                                </span>
+                                                                <span className="text-text-tertiary">{new Date(item.createdAt).toLocaleString()}</span>
+                                                            </summary>
+                                                            <div className="mt-2 space-y-2 text-[11px] text-text-secondary">
+                                                                <div className="flex flex-wrap gap-2 text-text-tertiary">
+                                                                    <span className="font-mono break-all">call: {item.callId}</span>
+                                                                    {item.command ? <span className="font-mono break-all">cmd: {item.command}</span> : null}
+                                                                    {item.truncated ? (
+                                                                        <span>budget: {item.originalChars ?? 0} → {item.promptChars ?? 0}</span>
+                                                                    ) : (
+                                                                        <span>budget: full</span>
+                                                                    )}
+                                                                </div>
+                                                                {item.promptText ? (
+                                                                    <div>
+                                                                        <div className="text-[10px] text-text-tertiary mb-1">Prompt 注入文本</div>
+                                                                        <pre className="whitespace-pre-wrap break-all leading-5">{item.promptText}</pre>
+                                                                    </div>
+                                                                ) : null}
+                                                                {item.summaryText ? (
+                                                                    <div>
+                                                                        <div className="text-[10px] text-text-tertiary mb-1">摘要</div>
+                                                                        <pre className="whitespace-pre-wrap break-all leading-5">{item.summaryText}</pre>
+                                                                    </div>
+                                                                ) : null}
+                                                                {item.resultText ? (
+                                                                    <div>
+                                                                        <div className="text-[10px] text-text-tertiary mb-1">完整结果</div>
+                                                                        <pre className="whitespace-pre-wrap break-all leading-5">{item.resultText}</pre>
+                                                                    </div>
+                                                                ) : null}
+                                                            </div>
                                                         </details>
                                                     ))}
                                                 </div>

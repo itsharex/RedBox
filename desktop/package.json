@@ -78,7 +78,8 @@
     "asarUnpack": [
       "**/*.node",
       "node_modules/ffmpeg-static/**",
-      ".plugin-runtime/**"
+      ".plugin-runtime/**",
+      "dist-electron/workers/**"
     ],
     "win": {
       "target": [

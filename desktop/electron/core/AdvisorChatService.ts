@@ -1,5 +1,5 @@
 /**
- * AdvisorChatService - 智囊团聊天服务（pi-agent-core 版本）
+ * AdvisorChatService - 智囊团聊天服务（统一 QueryRuntime 版本）
  *
  * 专门为智囊团设计的聊天服务，包含：
  * - 思维链展示
@@ -8,20 +8,23 @@
  */
 
 import { EventEmitter } from 'events';
-import { getModel, type Model } from '@mariozechner/pi-ai';
 import {
     ToolRegistry,
     ToolExecutor,
     ToolConfirmationOutcome,
-    type ToolResult,
 } from './toolRegistry';
+import {
+    addChatMessage,
+    type ChatMessage,
+    createChatSession,
+    getChatMessages,
+    getChatSessionByContext,
+    searchVectors,
+} from '../db';
 import { CalculatorTool } from './tools/calculatorTool';
 import { WriteFileTool } from './tools/writeFileTool';
 import { EditTool } from './tools/editTool';
 import { embeddingService } from './vector/EmbeddingService';
-import { createChatSession, getChatSession, getSettings, searchVectors } from '../db';
-import { resolveChatMaxTokens } from './chatTokenConfig';
-import { normalizeApiBaseUrl } from './urlUtils';
 import { QueryRuntime } from './queryRuntime';
 
 // ========== Types ==========
@@ -91,10 +94,12 @@ export class AdvisorChatService extends EventEmitter {
     private toolRegistry: ToolRegistry;
     private toolExecutor: ToolExecutor;
     private abortController: AbortController | null = null;
+    private readonly sessionId: string;
 
     constructor(config: AdvisorChatConfig) {
         super();
         this.config = config;
+        this.sessionId = this.ensureSession().id;
 
         // 初始化工具注册表（仅包含安全工具）
         this.toolRegistry = new ToolRegistry();
@@ -122,12 +127,21 @@ export class AdvisorChatService extends EventEmitter {
         const signal = this.abortController.signal;
 
         try {
+            const session = this.ensureSession();
+            addChatMessage({
+                id: `advisor_user_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+                session_id: session.id,
+                role: 'user',
+                content: message,
+            });
+
             this.emitEvent({
                 type: 'thinking_start',
                 content: '正在分析问题...',
             });
 
-            const ragContext = await this.performRAG(message, signal, history);
+            const effectiveHistory = history.length > 0 ? history : this.getStoredHistory();
+            const ragContext = await this.performRAG(message, signal, effectiveHistory);
             const systemPrompt = this.buildSystemPrompt(ragContext);
 
             this.emitEvent({
@@ -135,7 +149,14 @@ export class AdvisorChatService extends EventEmitter {
                 content: '基于专业知识和上下文进行深度思考...',
             });
 
-            const fullResponse = await this.runAgentLoop(message, history, systemPrompt, signal);
+            const fullResponse = await this.runAgentLoop(message, effectiveHistory, systemPrompt, signal);
+
+            addChatMessage({
+                id: `advisor_assistant_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+                session_id: session.id,
+                role: 'assistant',
+                content: fullResponse,
+            });
 
             this.emitEvent({ type: 'thinking_end', content: '思考完成' });
             this.emitEvent({ type: 'done' });
@@ -199,9 +220,9 @@ export class AdvisorChatService extends EventEmitter {
 
             console.log(`[AdvisorChatService] RAG: Found ${searchResults.length} results for query: "${query}"`);
 
-            const sources = searchResults.map(r => r.sourceId);
+            const sources = searchResults.map((r: { sourceId: string }) => r.sourceId);
             const context = searchResults
-                .map((r, i) => `[参考 ${i + 1}] (${r.sourceId})\n${r.content}`)
+                .map((r: { sourceId: string; content: string }, i: number) => `[参考 ${i + 1}] (${r.sourceId})\n${r.content}`)
                 .join('\n\n');
 
             this.emitEvent({
@@ -265,70 +286,6 @@ ${ragContext.context}
         return parts.join('\n\n');
     }
 
-    private createModelWithBaseUrl(): Model<any> {
-        const requestedModel = (this.config.model || 'gpt-4o').trim();
-        const resolvedBaseUrl = normalizeApiBaseUrl(this.config.baseURL || 'https://api.openai.com/v1', 'https://api.openai.com/v1');
-        const isOfficialOpenAI = this.isOfficialOpenAIEndpoint(resolvedBaseUrl);
-
-        if (isOfficialOpenAI) {
-            const resolved = getModel('openai', requestedModel as any) as (Model<any> & { baseUrl?: string }) | undefined;
-            if (resolved) {
-                return {
-                    ...resolved,
-                    baseUrl: resolvedBaseUrl || resolved.baseUrl,
-                };
-            }
-
-            const fallback = getModel('openai', 'gpt-4o' as any) as (Model<any> & { baseUrl?: string }) | undefined;
-            if (fallback) {
-                console.warn(`[AdvisorChatService] Unknown OpenAI model "${requestedModel}", fallback to gpt-4o`);
-                return {
-                    ...fallback,
-                    baseUrl: resolvedBaseUrl || fallback.baseUrl,
-                };
-            }
-        }
-
-        const lower = `${requestedModel} ${resolvedBaseUrl}`.toLowerCase();
-        const isQwenFamily = lower.includes('qwen') || lower.includes('dashscope.aliyuncs.com');
-        const isDeepSeekFamily = lower.includes('deepseek');
-        const settings = (getSettings() || {}) as Record<string, unknown>;
-        const maxTokens = resolveChatMaxTokens(settings, isDeepSeekFamily);
-        const compat: Record<string, unknown> = {
-            supportsStore: false,
-            supportsDeveloperRole: false,
-            maxTokensField: 'max_tokens',
-            supportsReasoningEffort: !isQwenFamily,
-        };
-
-        if (isQwenFamily) {
-            compat.thinkingFormat = 'qwen';
-        }
-
-        return {
-            id: requestedModel || 'openai-compatible-model',
-            name: `OpenAI-Compatible (${requestedModel || 'model'})`,
-            api: 'openai-completions',
-            provider: 'openai-compatible',
-            baseUrl: resolvedBaseUrl,
-            reasoning: true,
-            input: ['text', 'image'],
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-            contextWindow: 128000,
-            maxTokens,
-            compat: compat as any,
-        } as Model<any>;
-    }
-
-    private isOfficialOpenAIEndpoint(baseURL: string): boolean {
-        try {
-            const url = new URL(baseURL);
-            return url.hostname === 'api.openai.com';
-        } catch {
-            return false;
-        }
-    }
-
     private historyToRuntimeMessages(history: ChatHistoryMessage[]) {
         return history.slice(-10).map((msg) => ({
             role: msg.role,
@@ -345,13 +302,6 @@ ${ragContext.context}
         systemPrompt: string,
         signal: AbortSignal
     ): Promise<string> {
-        const sessionId = `advisor_${this.config.advisorId}_${Date.now()}`;
-        if (!getChatSession(sessionId)) {
-            createChatSession(sessionId, `Advisor ${this.config.advisorName}`, {
-                contextType: 'advisor-discussion',
-                contextId: this.config.advisorId,
-            });
-        }
         let fullResponse = '';
 
         const runtime = new QueryRuntime(
@@ -404,7 +354,7 @@ ${ragContext.context}
                 },
             },
             {
-                sessionId,
+                sessionId: this.sessionId,
                 apiKey: this.config.apiKey,
                 baseURL: this.config.baseURL,
                 model: this.config.model,
@@ -424,6 +374,27 @@ ${ragContext.context}
         }
         fullResponse = result.response || fullResponse;
         return fullResponse;
+    }
+
+    private ensureSession() {
+        const existing = getChatSessionByContext(this.config.advisorId, 'advisor-discussion');
+        if (existing) {
+            return existing;
+        }
+        return createChatSession(`advisor_${this.config.advisorId}_${Date.now()}`, `Advisor ${this.config.advisorName}`, {
+            contextType: 'advisor-discussion',
+            contextId: this.config.advisorId,
+        });
+    }
+
+    private getStoredHistory(): ChatHistoryMessage[] {
+        return getChatMessages(this.sessionId)
+            .filter((msg): msg is ChatMessage & { role: 'user' | 'assistant' } => msg.role === 'user' || msg.role === 'assistant')
+            .slice(-10)
+            .map((msg) => ({
+                role: msg.role,
+                content: msg.content,
+            })) as ChatHistoryMessage[];
     }
 
     /**

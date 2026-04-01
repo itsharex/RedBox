@@ -124,6 +124,24 @@ export interface SessionCheckpointRecord {
   createdAt: number;
 }
 
+export interface SessionToolResultItem {
+  id: string;
+  sessionId: string;
+  callId: string;
+  toolName: string;
+  command?: string;
+  success: boolean;
+  resultText?: string;
+  summaryText?: string;
+  promptText?: string;
+  originalChars?: number;
+  promptChars?: number;
+  truncated: boolean;
+  payload?: unknown;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface RoleSpec {
   roleId: string;
   purpose: string;
@@ -198,6 +216,7 @@ declare global {
           chatSession?: { id: string; title?: string; updatedAt?: string } | null;
           transcript?: SessionRuntimeRecord[];
           checkpoints?: SessionCheckpointRecord[];
+          toolResults?: SessionToolResultItem[];
         } | null>;
         resume: (sessionId: string) => Promise<{
           chatSession?: { id: string; title?: string; updatedAt?: string } | null;
@@ -205,6 +224,7 @@ declare global {
         } | null>;
         fork: (sessionId: string) => Promise<{ success: boolean; session?: { id: string; transcriptCount: number; checkpointCount: number }; error?: string }>;
         getTranscript: (sessionId: string, limit?: number) => Promise<SessionRuntimeRecord[]>;
+        getToolResults: (sessionId: string, limit?: number) => Promise<SessionToolResultItem[]>;
       };
       runtime: {
         query: (payload: { sessionId?: string; message: string; modelConfig?: unknown }) => Promise<{ success: boolean; sessionId: string; response?: string; error?: string }>;
@@ -212,6 +232,7 @@ declare global {
         forkSession: (payload: { sessionId: string }) => Promise<{ success: boolean; sessionId?: string; forkedSessionId?: string }>;
         getTrace: (payload: { sessionId: string; limit?: number }) => Promise<SessionRuntimeRecord[]>;
         getCheckpoints: (payload: { sessionId: string; limit?: number }) => Promise<SessionCheckpointRecord[]>;
+        getToolResults: (payload: { sessionId: string; limit?: number }) => Promise<SessionToolResultItem[]>;
       };
       toolHooks: {
         list: () => Promise<unknown[]>;
@@ -224,11 +245,20 @@ declare global {
           kind: 'redclaw-project' | 'scheduled-task' | 'long-cycle' | 'heartbeat' | 'memory-maintenance' | 'headless-runtime';
           title: string;
           status: 'running' | 'completed' | 'failed' | 'cancelled';
+          phase: 'starting' | 'thinking' | 'tooling' | 'responding' | 'updating' | 'completed' | 'failed' | 'cancelled';
           sessionId?: string;
           contextId?: string;
           error?: string;
           summary?: string;
           latestText?: string;
+          attemptCount: number;
+          workerState: 'idle' | 'starting' | 'running' | 'retry_wait' | 'timed_out' | 'stopping';
+          workerMode?: 'main-process' | 'child-json-worker' | 'child-runtime-worker';
+          workerPid?: number;
+          workerLastHeartbeatAt?: string;
+          cancelReason?: string;
+          rollbackState: 'idle' | 'running' | 'completed' | 'failed' | 'not_required';
+          rollbackError?: string;
           createdAt: string;
           updatedAt: string;
           completedAt?: string;
@@ -244,11 +274,49 @@ declare global {
           kind: 'redclaw-project' | 'scheduled-task' | 'long-cycle' | 'heartbeat' | 'memory-maintenance' | 'headless-runtime';
           title: string;
           status: 'running' | 'completed' | 'failed' | 'cancelled';
+          phase: 'starting' | 'thinking' | 'tooling' | 'responding' | 'updating' | 'completed' | 'failed' | 'cancelled';
           sessionId?: string;
           contextId?: string;
           error?: string;
           summary?: string;
           latestText?: string;
+          attemptCount: number;
+          workerState: 'idle' | 'starting' | 'running' | 'retry_wait' | 'timed_out' | 'stopping';
+          workerMode?: 'main-process' | 'child-json-worker' | 'child-runtime-worker';
+          workerPid?: number;
+          workerLastHeartbeatAt?: string;
+          cancelReason?: string;
+          rollbackState: 'idle' | 'running' | 'completed' | 'failed' | 'not_required';
+          rollbackError?: string;
+          createdAt: string;
+          updatedAt: string;
+          completedAt?: string;
+          turns: Array<{
+            id: string;
+            at: string;
+            text: string;
+            source: 'thought' | 'tool' | 'response' | 'system';
+          }>;
+        } | null>;
+        cancel: (taskId: string) => Promise<{
+          id: string;
+          kind: 'redclaw-project' | 'scheduled-task' | 'long-cycle' | 'heartbeat' | 'memory-maintenance' | 'headless-runtime';
+          title: string;
+          status: 'running' | 'completed' | 'failed' | 'cancelled';
+          phase: 'starting' | 'thinking' | 'tooling' | 'responding' | 'updating' | 'completed' | 'failed' | 'cancelled';
+          sessionId?: string;
+          contextId?: string;
+          error?: string;
+          summary?: string;
+          latestText?: string;
+          attemptCount: number;
+          workerState: 'idle' | 'starting' | 'running' | 'retry_wait' | 'timed_out' | 'stopping';
+          workerMode?: 'main-process' | 'child-json-worker' | 'child-runtime-worker';
+          workerPid?: number;
+          workerLastHeartbeatAt?: string;
+          cancelReason?: string;
+          rollbackState: 'idle' | 'running' | 'completed' | 'failed' | 'not_required';
+          rollbackError?: string;
           createdAt: string;
           updatedAt: string;
           completedAt?: string;

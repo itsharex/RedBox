@@ -8,6 +8,15 @@
 
 import { EventEmitter } from 'events';
 import {
+    addChatMessage,
+    createChatSession,
+    getChatMessages,
+    getChatSession,
+    getChatSessionByContext,
+} from '../db';
+import { getCoreSystemPrompt } from './prompts/systemPrompt';
+import { QueryRuntime } from './queryRuntime';
+import {
     ToolRegistry,
     ToolExecutor,
     type ToolConfirmationDetails,
@@ -15,9 +24,8 @@ import {
 } from './toolRegistry';
 import { SkillManager } from './skillManager';
 import { createBuiltinTools } from './tools';
-import { CompressionService, createCompressionService } from './compressionService';
 import { Instance } from './instance';
-import { createAgentExecutor, type AgentExecutor, type AgentConfig, type AgentEvent } from './agentExecutor';
+import type { RuntimeEvent } from './runtimeTypes';
 
 // ========== Types ==========
 
@@ -74,16 +82,18 @@ export class ChatService extends EventEmitter {
     private toolRegistry: ToolRegistry;
     private toolExecutor: ToolExecutor;
     private skillManager: SkillManager;
-    private compressionService: CompressionService;
 
     private streamingState: StreamingState = StreamingState.Idle;
     private messageQueue: string[] = [];
     private history: HistoryItem[] = [];
-    private currentExecutor: AgentExecutor | null = null;
+    private abortController: AbortController | null = null;
+    private readonly pendingConfirmations = new Map<string, { resolve: (outcome: ToolConfirmationOutcome) => void; timeoutId: NodeJS.Timeout }>();
+    private readonly sessionId: string;
 
     constructor(config: ChatServiceConfig) {
         super();
         this.config = config;
+        this.sessionId = `legacy_chat_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
         this.toolRegistry = new ToolRegistry();
         this.toolRegistry.registerTools(createBuiltinTools({ chatService: this, pack: 'full' }));
@@ -97,17 +107,24 @@ export class ChatService extends EventEmitter {
         if (config.projectRoot) {
             Instance.init(config.projectRoot);
         }
-
-        this.compressionService = createCompressionService({
-            apiKey: config.apiKey,
-            baseURL: config.baseURL,
-            model: config.model,
-            threshold: config.compressionThreshold,
-        });
     }
 
     async initialize(): Promise<void> {
         await this.skillManager.discoverSkills(this.config.projectRoot);
+        this.ensureSession();
+        const stored = getChatMessages(this.sessionId)
+            .filter((msg) => msg.role === 'user' || msg.role === 'assistant' || msg.role === 'tool' || msg.role === 'system')
+            .map((msg) => ({
+                id: msg.id,
+                role: msg.role,
+                content: msg.content,
+                timestamp: msg.timestamp,
+                toolCallId: msg.tool_call_id,
+            })) as HistoryItem[];
+        if (stored.length > 0) {
+            this.history = stored;
+            this.emit('history_updated', this.getHistory());
+        }
     }
 
     async sendMessage(message: string): Promise<void> {
@@ -128,12 +145,16 @@ export class ChatService extends EventEmitter {
     }
 
     cancel(): void {
-        this.currentExecutor?.cancel();
+        this.abortController?.abort();
         this.setStreamingState(StreamingState.Idle);
     }
 
     confirmToolCall(callId: string, outcome: ToolConfirmationOutcome): void {
-        this.currentExecutor?.confirmToolCall(callId, outcome);
+        const pending = this.pendingConfirmations.get(callId);
+        if (!pending) return;
+        clearTimeout(pending.timeoutId);
+        this.pendingConfirmations.delete(callId);
+        pending.resolve(outcome);
     }
 
     getHistory(): HistoryItem[] {
@@ -163,46 +184,59 @@ export class ChatService extends EventEmitter {
             this.emit('thinking', 'Processing your request...');
 
             this.addHistoryItem({ role: 'user', content: message });
-
-            const executorConfig: AgentConfig = {
-                apiKey: this.config.apiKey,
-                baseURL: this.config.baseURL,
-                model: this.config.model,
-                maxTurns: this.config.maxTurns,
-                maxTimeMinutes: this.config.maxTimeMinutes,
-                projectRoot: this.config.projectRoot,
-                temperature: this.config.temperature,
-            };
-
-            this.currentExecutor = await createAgentExecutor(
-                executorConfig,
-                (event) => this.handleAgentEvent(event)
+            this.abortController = new AbortController();
+            const runtime = new QueryRuntime(
+                this.toolRegistry,
+                this.toolExecutor,
+                {
+                    onEvent: (event) => this.handleRuntimeEvent(event),
+                    onToolResult: () => undefined,
+                },
+                {
+                    sessionId: this.sessionId,
+                    apiKey: this.config.apiKey,
+                    baseURL: this.config.baseURL,
+                    model: this.config.model,
+                    systemPrompt: getCoreSystemPrompt({
+                        skills: this.skillManager.getSkills(),
+                        tools: this.toolRegistry.getAllTools(),
+                        interactive: true,
+                    }),
+                    messages: this.historyToRuntimeMessages(),
+                    signal: this.abortController.signal,
+                    maxTurns: this.config.maxTurns,
+                    maxTimeMinutes: this.config.maxTimeMinutes,
+                    temperature: this.config.temperature,
+                    toolPack: 'full',
+                },
             );
 
-            await this.currentExecutor.run(this.buildPromptWithHistory(message));
+            const result = await runtime.run(message);
+            if (result.error && !this.abortController.signal.aborted) {
+                this.emit('error', { message: result.error, recoverable: false });
+            }
             this.emit('done');
         } catch (error) {
             const msg = error instanceof Error ? error.message : String(error);
             this.emit('error', { message: msg, recoverable: false });
         } finally {
-            this.currentExecutor = null;
+            this.abortController = null;
             this.setStreamingState(StreamingState.Idle);
             this.processQueuedMessages();
         }
     }
 
-    private buildPromptWithHistory(message: string): string {
-        const historyContext = this.history
+    private historyToRuntimeMessages(): Array<{ role: 'user' | 'assistant'; content: string }> {
+        return this.history
             .slice(-12)
-            .filter((h) => h.role !== 'system')
-            .map((h) => `${h.role}: ${h.content}`)
-            .join('\n');
-
-        if (!historyContext) return message;
-        return `Conversation history:\n${historyContext}\n\nCurrent user request:\n${message}`;
+            .filter((h): h is HistoryItem & { role: 'user' | 'assistant' } => h.role === 'user' || h.role === 'assistant')
+            .map((h) => ({
+                role: h.role,
+                content: h.content,
+            }));
     }
 
-    private handleAgentEvent(event: AgentEvent): void {
+    private handleRuntimeEvent(event: RuntimeEvent): void {
         switch (event.type) {
             case 'thinking':
                 this.emit('thinking', event.content);
@@ -233,7 +267,7 @@ export class ChatService extends EventEmitter {
             case 'tool_end':
                 this.addHistoryItem({
                     role: 'tool',
-                    content: event.result.content,
+                    content: event.result.display || event.result.llmContent || '',
                     toolCallId: event.callId,
                 });
                 this.emit('tool_end', {
@@ -243,24 +277,25 @@ export class ChatService extends EventEmitter {
                 });
                 break;
 
-            case 'tool_confirm_request':
-                this.setStreamingState(StreamingState.WaitingConfirmation);
-                this.emit('tool_confirm_request', {
-                    callId: event.callId,
-                    name: event.name,
-                    details: event.details,
-                });
-                break;
-
-            case 'skill_activated':
-                this.emit('skill_activated', {
-                    name: event.name,
-                    description: event.description,
-                });
-                break;
-
             case 'error':
                 this.emit('error', { message: event.message, recoverable: false });
+                break;
+            case 'checkpoint':
+                this.emit('thinking', event.summary);
+                break;
+            case 'compact_start':
+                this.emit('thinking', `Compacting context (${event.strategy})...`);
+                break;
+            case 'compact_end':
+                if (event.summary) {
+                    this.emit('thinking', event.summary);
+                }
+                break;
+            case 'query_start':
+            case 'hook_start':
+            case 'hook_end':
+            case 'tool_summary':
+            case 'done':
                 break;
         }
     }
@@ -277,8 +312,13 @@ export class ChatService extends EventEmitter {
             name: tool.name,
             details,
         });
-        // 兼容旧接口：默认自动放行一次，真实确认由外部触发 confirmToolCall。
-        return ToolConfirmationOutcome.ProceedOnce;
+        return await new Promise((resolve) => {
+            const timeoutId = setTimeout(() => {
+                this.pendingConfirmations.delete(callId);
+                resolve(ToolConfirmationOutcome.Cancel);
+            }, 60000);
+            this.pendingConfirmations.set(callId, { resolve, timeoutId });
+        });
     }
 
     private processQueuedMessages(): void {
@@ -305,7 +345,25 @@ export class ChatService extends EventEmitter {
             timestamp: Date.now(),
         };
         this.history.push(historyItem);
+        this.ensureSession();
+        addChatMessage({
+            id: historyItem.id,
+            session_id: this.sessionId,
+            role: historyItem.role,
+            content: historyItem.content,
+            tool_call_id: historyItem.toolCallId,
+        });
         this.emit('history_updated', this.getHistory());
+    }
+
+    private ensureSession(): void {
+        if (getChatSession(this.sessionId)) {
+            return;
+        }
+        createChatSession(this.sessionId, 'Legacy Chat', {
+            contextType: 'legacy-chat',
+            contextId: this.sessionId,
+        });
     }
 }
 

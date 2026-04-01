@@ -39,12 +39,30 @@ function copyBuiltinSkills() {
   }
 }
 
+function copyWorkerScripts() {
+  return {
+    name: 'copy-worker-scripts',
+    closeBundle: () => {
+      const srcDir = path.resolve(__dirname, 'electron/workers')
+      const destDir = path.resolve(__dirname, 'dist-electron/workers')
+
+      if (fs.existsSync(srcDir)) {
+        fs.cpSync(srcDir, destDir, { recursive: true })
+        console.log(`[copy-worker-scripts] Copied worker scripts from ${srcDir} to ${destDir}`)
+      } else {
+        console.warn(`[copy-worker-scripts] Source directory not found: ${srcDir}`)
+      }
+    }
+  }
+}
+
 // https://vitejs.dev/config/
 export default defineConfig({
   plugins: [
     react(),
     copyPromptLibrary(),
     copyBuiltinSkills(),
+    copyWorkerScripts(),
     electron({
       main: {
         // Shortcut of `build.lib.entry`.

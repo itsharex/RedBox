@@ -25,6 +25,9 @@ import {
 } from './backgroundRuntimeLock';
 import { getBackgroundTaskRegistry } from './backgroundTaskRegistry';
 import { getHeadlessAgentRunner } from './headlessAgentRunner';
+import { getHeadlessTaskSupervisor } from './headlessTaskSupervisor';
+import { getHeadlessWorkerProcessManager } from './headlessWorkerProcessManager';
+import { getBackgroundSessionStore } from './backgroundSessionStore';
 
 const MAINTENANCE_PROMPT_PATH = 'runtime/memory/maintenance_manager.txt';
 const DEFAULT_MODEL_FALLBACK = 'gpt-4o-mini';
@@ -436,24 +439,40 @@ export class MemoryMaintenanceService {
         title: `记忆维护 · ${reason}`,
         contextId: `memory-maintenance:${reason}`,
       });
-      const planResult = await getHeadlessAgentRunner().runJsonRuntimeTask({
+      const backgroundSession = getBackgroundSessionStore().ensureSession({
+        contextId: `memory-maintenance:${reason}`,
+        contextType: 'background-maintenance',
+        title: `记忆维护 · ${reason}`,
+        runtimeMode: 'background-maintenance',
+        metadata: {
+          maintenanceReason: reason,
+        },
+      });
+      await getBackgroundTaskRegistry().attachSession(backgroundTask.id, backgroundSession.id);
+      const planResult = await getHeadlessTaskSupervisor().run({
         taskId: backgroundTask.id,
         title: `Memory Maintenance ${reason}`,
-        contextId: `memory-maintenance:${reason}`,
-        systemPrompt: prompt,
-        userInput: 'Return the memory maintenance actions now as strict JSON.',
-        model,
-        apiKey,
-        baseURL,
-        maxTurns: 6,
-        temperature: 0.1,
+        backoff: {
+          initialDelayMs: 1000,
+          maxDelayMs: 20000,
+          maxAttempts: 2,
+          giveUpAfterMs: 5 * 60 * 1000,
+          timeoutMs: 75 * 1000,
+        },
+        execute: (signal) => getHeadlessWorkerProcessManager().runJsonTask({
+          taskId: backgroundTask.id,
+          sessionId: backgroundSession.id,
+          model,
+          apiKey,
+          baseURL,
+          systemPrompt: prompt,
+          userInput: 'Return the memory maintenance actions now as strict JSON.',
+          temperature: 0.1,
+          rollback: () => this.releaseRunLock(),
+          attemptSignal: signal,
+        }),
       });
-      if (planResult.error) {
-        await getBackgroundTaskRegistry().failTask(backgroundTask.id, planResult.error);
-        throw new Error(planResult.error);
-      }
       const plan = parseJsonResponse(planResult.response);
-      await getBackgroundTaskRegistry().completeTask(backgroundTask.id, String(plan.summary || '').trim() || 'memory maintenance completed');
       if (taskId) {
         runtime.addTrace(taskId, 'memory.plan_received', {
           summary: plan.summary || '',
@@ -471,6 +490,7 @@ export class MemoryMaintenanceService {
         actions,
       });
 
+      await getBackgroundTaskRegistry().updatePhase(backgroundTask.id, 'updating');
       for (const action of actions) {
         await this.applyAction(action);
         if (taskId) {
@@ -481,6 +501,7 @@ export class MemoryMaintenanceService {
       this.lastSummary = String(plan.summary || '').trim() || `actions=${actions.length}`;
       this.pendingMutations = 0;
       this.lastRunAt = new Date().toISOString();
+      await getBackgroundTaskRegistry().completeTask(backgroundTask.id, this.lastSummary);
       if (taskId) {
         runtime.completeNode(taskId, 'execute_tools', this.lastSummary);
         runtime.completeTask(taskId, this.lastSummary);
