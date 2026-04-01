@@ -1567,6 +1567,10 @@ ipcMain.handle('background-tasks:cancel', async (_, payload?: { taskId?: string 
   return getBackgroundTaskRegistry().cancelTask(String(payload?.taskId || ''));
 });
 
+ipcMain.handle('background-workers:get-pool-state', async () => {
+  return getHeadlessWorkerProcessManager().getPoolSnapshot();
+});
+
 ipcMain.handle('memory:add', async (_, { content, type, tags }) => {
   return addUserMemoryToFile(content, type, tags);
 });

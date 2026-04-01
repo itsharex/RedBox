@@ -46,6 +46,7 @@ export interface BackgroundTaskRecord {
   workerState: BackgroundTaskWorkerState;
   workerMode?: 'main-process' | 'child-json-worker' | 'child-runtime-worker';
   workerPid?: number;
+  workerLabel?: string;
   workerLastHeartbeatAt?: string;
   cancelReason?: string;
   rollbackState: BackgroundTaskRollbackState;
@@ -212,6 +213,7 @@ export class BackgroundTaskRegistry extends EventEmitter {
   async updateWorkerProcess(taskId: string, input: {
     workerMode?: 'main-process' | 'child-json-worker' | 'child-runtime-worker';
     workerPid?: number;
+    workerLabel?: string;
     heartbeatAt?: string;
   }): Promise<void> {
     await this.ensureLoaded();
@@ -222,6 +224,9 @@ export class BackgroundTaskRegistry extends EventEmitter {
     }
     if (typeof input.workerPid === 'number' && Number.isFinite(input.workerPid)) {
       task.workerPid = input.workerPid;
+    }
+    if (typeof input.workerLabel === 'string' && input.workerLabel.trim()) {
+      task.workerLabel = input.workerLabel.trim();
     }
     if (input.heartbeatAt) {
       task.workerLastHeartbeatAt = input.heartbeatAt;

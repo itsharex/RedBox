@@ -70,6 +70,9 @@ contextBridge.exposeInMainWorld('ipcRenderer', {
     get: (taskId: string) => ipcRenderer.invoke('background-tasks:get', { taskId }),
     cancel: (taskId: string) => ipcRenderer.invoke('background-tasks:cancel', { taskId }),
   },
+  backgroundWorkers: {
+    getPoolState: () => ipcRenderer.invoke('background-workers:get-pool-state'),
+  },
   tasks: {
     create: (payload?: { runtimeMode?: string; sessionId?: string; userInput?: string; metadata?: Record<string, unknown> }) => ipcRenderer.invoke('tasks:create', payload || {}),
     list: (payload?: { status?: string; ownerSessionId?: string; limit?: number }) => ipcRenderer.invoke('tasks:list', payload || {}),

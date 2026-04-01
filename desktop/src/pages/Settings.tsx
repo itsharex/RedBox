@@ -17,6 +17,7 @@ import {
   type AiPresetGroup,
   type RoleSpec,
   type BackgroundTaskItem,
+  type BackgroundWorkerPoolState,
   type CreateAiSourceDraft,
   type LocalAiGuide,
   type MemoryHistoryEntry,
@@ -202,6 +203,7 @@ export function Settings() {
   const [runtimeSessionToolResults, setRuntimeSessionToolResults] = useState<RuntimeSessionToolResultItem[]>([]);
   const [runtimeHooks, setRuntimeHooks] = useState<RuntimeHookDefinition[]>([]);
   const [backgroundTasks, setBackgroundTasks] = useState<BackgroundTaskItem[]>([]);
+  const [backgroundWorkerPool, setBackgroundWorkerPool] = useState<BackgroundWorkerPoolState>({ json: [], runtime: [] });
   const [selectedBackgroundTaskId, setSelectedBackgroundTaskId] = useState('');
   const [runtimeDraftInput, setRuntimeDraftInput] = useState('');
   const [runtimeDraftMode, setRuntimeDraftMode] = useState<'redclaw' | 'knowledge' | 'chatroom' | 'advisor-discussion' | 'background-maintenance'>('redclaw');
@@ -1463,6 +1465,19 @@ export function Settings() {
     }
   };
 
+  const loadBackgroundWorkerPool = async () => {
+    try {
+      const result = await window.ipcRenderer.backgroundWorkers.getPoolState();
+      setBackgroundWorkerPool({
+        json: Array.isArray(result?.json) ? result.json : [],
+        runtime: Array.isArray(result?.runtime) ? result.runtime : [],
+      });
+    } catch (e) {
+      console.error('Failed to load background worker pool', e);
+      setBackgroundWorkerPool({ json: [], runtime: [] });
+    }
+  };
+
   const loadRuntimeDeveloperData = async () => {
     await Promise.all([
       loadRuntimeRoles(),
@@ -1470,6 +1485,7 @@ export function Settings() {
       loadRuntimeSessions(),
       loadRuntimeHooks(),
       loadBackgroundTasks(),
+      loadBackgroundWorkerPool(),
     ]);
   };
 
@@ -2746,6 +2762,7 @@ export function Settings() {
                 runtimeRoles={runtimeRoles}
                 runtimeSessions={runtimeSessions}
                 backgroundTasks={backgroundTasks}
+                backgroundWorkerPool={backgroundWorkerPool}
                 selectedRuntimeTaskId={selectedRuntimeTaskId}
                 setSelectedRuntimeTaskId={setSelectedRuntimeTaskId}
                 selectedRuntimeSessionId={selectedRuntimeSessionId}

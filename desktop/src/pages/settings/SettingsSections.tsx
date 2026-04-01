@@ -5,6 +5,7 @@ import type {
   AgentTaskSnapshot,
   AgentTaskTrace,
   BackgroundTaskItem,
+  BackgroundWorkerPoolState,
   McpServerConfig,
   MemoryHistoryEntry,
   MemoryMaintenanceStatus,
@@ -680,6 +681,7 @@ interface ToolsSettingsSectionProps {
         chatSession?: { id: string; title?: string; updatedAt?: string } | null;
     }>;
     backgroundTasks: BackgroundTaskItem[];
+    backgroundWorkerPool: BackgroundWorkerPoolState;
     selectedRuntimeTaskId: string;
     setSelectedRuntimeTaskId: Dispatch<SetStateAction<string>>;
     selectedRuntimeSessionId: string;
@@ -767,6 +769,7 @@ export function ToolsSettingsSection({
     runtimeRoles,
     runtimeSessions,
     backgroundTasks,
+    backgroundWorkerPool,
     selectedRuntimeTaskId,
     setSelectedRuntimeTaskId,
     selectedRuntimeSessionId,
@@ -1463,6 +1466,11 @@ export function ToolsSettingsSection({
                                                                 {task.workerMode}
                                                             </span>
                                                         ) : null}
+                                                        {task.workerLabel ? (
+                                                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-surface-secondary border border-border text-text-tertiary">
+                                                                {task.workerLabel}
+                                                            </span>
+                                                        ) : null}
                                                         <span>attempt {task.attemptCount}</span>
                                                         <span className="font-mono truncate">{task.id}</span>
                                                     </div>
@@ -1519,6 +1527,7 @@ export function ToolsSettingsSection({
                                                 <div>attempts: {selectedBackgroundTask.attemptCount}</div>
                                                 <div>workerState: {selectedBackgroundTask.workerState}</div>
                                                 {selectedBackgroundTask.workerMode ? <div>workerMode: {selectedBackgroundTask.workerMode}</div> : null}
+                                                {selectedBackgroundTask.workerLabel ? <div>workerLabel: {selectedBackgroundTask.workerLabel}</div> : null}
                                                 {typeof selectedBackgroundTask.workerPid === 'number' ? <div>workerPid: {selectedBackgroundTask.workerPid}</div> : null}
                                                 {selectedBackgroundTask.workerLastHeartbeatAt ? <div>workerHeartbeat: {new Date(selectedBackgroundTask.workerLastHeartbeatAt).toLocaleString()}</div> : null}
                                                 <div>rollback: {selectedBackgroundTask.rollbackState}</div>
@@ -1555,6 +1564,69 @@ export function ToolsSettingsSection({
                                                             <div className="mt-2 text-[11px] leading-5 text-text-secondary whitespace-pre-wrap break-words">
                                                                 {turn.text}
                                                             </div>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            )}
+                                        </div>
+
+                                        <div className="rounded border border-border bg-surface-secondary/20 p-3 space-y-3">
+                                            <div className="flex items-center justify-between gap-2">
+                                                <div className="text-[11px] font-medium text-text-primary">Worker 池</div>
+                                                <span className="text-[10px] text-text-tertiary">
+                                                    json {backgroundWorkerPool.json.length} / runtime {backgroundWorkerPool.runtime.length}
+                                                </span>
+                                            </div>
+
+                                            {backgroundWorkerPool.json.length === 0 && backgroundWorkerPool.runtime.length === 0 ? (
+                                                <div className="text-[11px] text-text-tertiary">当前还没有持久 worker 被拉起。</div>
+                                            ) : (
+                                                <div className="space-y-3">
+                                                    {([
+                                                        ['JSON Workers', backgroundWorkerPool.json],
+                                                        ['Runtime Workers', backgroundWorkerPool.runtime],
+                                                    ] as const).map(([label, items]) => (
+                                                        <div key={label} className="space-y-2">
+                                                            <div className="text-[10px] uppercase tracking-wide text-text-tertiary">{label}</div>
+                                                            {items.length === 0 ? (
+                                                                <div className="text-[11px] text-text-tertiary">暂无</div>
+                                                            ) : (
+                                                                <div className="space-y-2">
+                                                                    {items.map((worker) => (
+                                                                        <div key={worker.id} className="rounded border border-border bg-surface-primary/60 p-2 text-[11px] text-text-secondary">
+                                                                            <div className="flex items-center gap-2 flex-wrap">
+                                                                                <span className="font-medium text-text-primary">{worker.id}</span>
+                                                                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-surface-secondary border border-border text-text-tertiary">
+                                                                                    {worker.mode}
+                                                                                </span>
+                                                                                <span className={clsx(
+                                                                                    'text-[10px] px-1.5 py-0.5 rounded border',
+                                                                                    worker.busy
+                                                                                        ? 'bg-orange-50 border-orange-200 text-orange-700'
+                                                                                        : 'bg-emerald-50 border-emerald-200 text-emerald-700',
+                                                                                )}>
+                                                                                    {worker.busy ? 'busy' : 'idle'}
+                                                                                </span>
+                                                                                <span className={clsx(
+                                                                                    'text-[10px] px-1.5 py-0.5 rounded border',
+                                                                                    worker.ready
+                                                                                        ? 'bg-sky-50 border-sky-200 text-sky-700'
+                                                                                        : 'bg-surface-secondary border-border text-text-tertiary',
+                                                                                )}>
+                                                                                    {worker.ready ? 'ready' : 'booting'}
+                                                                                </span>
+                                                                            </div>
+                                                                            <div className="mt-2 space-y-1 text-text-tertiary">
+                                                                                {typeof worker.pid === 'number' ? <div>pid: {worker.pid}</div> : null}
+                                                                                {worker.sessionId ? <div>session: {worker.sessionId}</div> : null}
+                                                                                {worker.taskId ? <div>task: {worker.taskId}</div> : null}
+                                                                                {worker.lastHeartbeatAt ? <div>heartbeat: {new Date(worker.lastHeartbeatAt).toLocaleString()}</div> : null}
+                                                                                {worker.lastUsedAt ? <div>lastUsed: {new Date(worker.lastUsedAt).toLocaleString()}</div> : null}
+                                                                            </div>
+                                                                        </div>
+                                                                    ))}
+                                                                </div>
+                                                            )}
                                                         </div>
                                                     ))}
                                                 </div>

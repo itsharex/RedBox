@@ -44,6 +44,7 @@ const MAX_RECENT_MESSAGES_PER_SESSION = 12;
 const MAX_MESSAGE_CONTENT_CHARS = 280;
 const SESSION_SCAN_INTERVAL_MS = 10 * 60 * 1000;
 const MIN_RUN_INTERVAL_MS = 20 * 60 * 1000;
+const QUERY_AFTER_MIN_RUN_INTERVAL_MS = 5 * 60 * 1000;
 
 function buildMaintenanceRoute(reason: MaintenanceTriggerReason, pendingMutations: number): IntentRoute {
   return {
@@ -59,7 +60,15 @@ function buildMaintenanceRoute(reason: MaintenanceTriggerReason, pendingMutation
   };
 }
 
-type MaintenanceTriggerReason = 'init' | 'mutation' | 'periodic' | 'workspace-change' | 'manual';
+type MaintenanceTriggerReason = 'init' | 'mutation' | 'periodic' | 'workspace-change' | 'manual' | 'query-after';
+
+type SessionLifecycleSignal = {
+  sessionId: string;
+  runtimeMode?: string;
+  responseLength?: number;
+  compacted?: boolean;
+  updatedAt: number;
+};
 
 type MaintenanceAction = {
   type: 'create' | 'update' | 'archive' | 'delete' | 'noop';
@@ -121,13 +130,17 @@ function isUserOrAssistantMessage(message: ChatMessage): message is ChatMessage 
   return message.role === 'user' || message.role === 'assistant';
 }
 
-function buildRecentConversationSummaries(): RecentConversationSummary[] {
+function buildRecentConversationSummaries(prioritizedSessionIds: string[] = []): RecentConversationSummary[] {
   const sessions = getChatSessions();
   const preferred = sessions.filter((session) => {
     const metadata = parseSessionMetadata(session);
     return String(metadata.contextType || '').trim().toLowerCase() === 'redclaw';
   });
-  const candidateSessions = (preferred.length > 0 ? preferred : sessions).slice(0, MAX_RECENT_SESSION_ITEMS);
+  const baseSessions = preferred.length > 0 ? preferred : sessions;
+  const prioritizedSet = new Set(prioritizedSessionIds.filter(Boolean));
+  const prioritizedSessions = baseSessions.filter((session) => prioritizedSet.has(session.id));
+  const remainingSessions = baseSessions.filter((session) => !prioritizedSet.has(session.id));
+  const candidateSessions = [...prioritizedSessions, ...remainingSessions].slice(0, MAX_RECENT_SESSION_ITEMS);
 
   return candidateSessions.map((session) => {
     const metadata = parseSessionMetadata(session);
@@ -231,6 +244,7 @@ export class MemoryMaintenanceService {
   private periodicTimer: NodeJS.Timeout | null = null;
   private unsubscribeMutationListener: (() => void) | null = null;
   private readonly lockOwnerId = `memory-maintenance:${process.pid}:${Date.now().toString(36)}`;
+  private readonly recentSessionSignals = new Map<string, SessionLifecycleSignal>();
 
   private getLockPath(): string {
     return path.join(getWorkspacePaths().redclaw, 'memory-maintenance.lock');
@@ -318,6 +332,27 @@ export class MemoryMaintenanceService {
     return this.getStatus();
   }
 
+  notifyQueryLifecycleEvent(params: {
+    sessionId: string;
+    runtimeMode?: string;
+    responseLength?: number;
+    compacted?: boolean;
+  }): void {
+    if (!params.sessionId) return;
+    if (!this.started) {
+      this.start();
+    }
+    this.recentSessionSignals.set(params.sessionId, {
+      sessionId: params.sessionId,
+      runtimeMode: params.runtimeMode,
+      responseLength: params.responseLength,
+      compacted: params.compacted,
+      updatedAt: Date.now(),
+    });
+    const delay = params.compacted || Number(params.responseLength || 0) > 1200 ? FAST_DEBOUNCE_MS : DEBOUNCE_MS;
+    this.scheduleDebouncedRun('query-after', delay);
+  }
+
   private handleMutation(event: MemoryMutationEvent): void {
     if (event.source === 'maintenance') {
       return;
@@ -346,7 +381,8 @@ export class MemoryMaintenanceService {
 
     const nowMs = Date.now();
     const lastRunMs = this.lastRunAt ? new Date(this.lastRunAt).getTime() : 0;
-    if (!force && lastRunMs > 0 && nowMs - lastRunMs < MIN_RUN_INTERVAL_MS) {
+    const requiredRunInterval = reason === 'query-after' ? QUERY_AFTER_MIN_RUN_INTERVAL_MS : MIN_RUN_INTERVAL_MS;
+    if (!force && lastRunMs > 0 && nowMs - lastRunMs < requiredRunInterval) {
       return;
     }
 
@@ -356,13 +392,19 @@ export class MemoryMaintenanceService {
     }
     this.lastScanAt = new Date(nowMs).toISOString();
 
+    const prioritizedSessionIds = [...this.recentSessionSignals.values()]
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .slice(0, MAX_RECENT_SESSION_ITEMS)
+      .map((item) => item.sessionId);
+
     const active = await listUserMemoriesFromFile();
     const archived = await listArchivedMemoriesFromFile();
     const history = await listMemoryHistoryFromFile();
-    const recentConversations = buildRecentConversationSummaries();
+    const recentConversations = buildRecentConversationSummaries(prioritizedSessionIds);
 
     const shouldRun = force
       || this.pendingMutations > 0
+      || (reason === 'query-after' && prioritizedSessionIds.length > 0)
       || (reason === 'periodic' && active.length >= 20)
       || (reason === 'init' && (active.length >= 10 || history.length >= 20))
       || (recentConversations.length >= 4 && history.length >= 12);
@@ -501,6 +543,9 @@ export class MemoryMaintenanceService {
       this.lastSummary = String(plan.summary || '').trim() || `actions=${actions.length}`;
       this.pendingMutations = 0;
       this.lastRunAt = new Date().toISOString();
+      for (const sessionId of prioritizedSessionIds) {
+        this.recentSessionSignals.delete(sessionId);
+      }
       await getBackgroundTaskRegistry().completeTask(backgroundTask.id, this.lastSummary);
       if (taskId) {
         runtime.completeNode(taskId, 'execute_tools', this.lastSummary);

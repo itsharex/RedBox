@@ -1,9 +1,11 @@
 import { CompactManager } from './compactManager';
+import { getMemoryMaintenanceService } from './memoryMaintenanceService';
 import { executeRuntimeHooks } from './runtimeHooks';
 import { evaluateRuntimeToolPermission } from './runtimePermissions';
 import { getSessionRuntimeStore } from './sessionRuntimeStore';
 import { getToolResultStore } from './toolResultStore';
 import { applyToolResultBudget } from './toolResultBudget';
+import { getTaskGraphRuntime } from './ai/taskGraphRuntime';
 import {
   createErrorResult,
   ToolErrorType,
@@ -15,6 +17,7 @@ import {
   type ToolResult,
 } from './toolRegistry';
 import { normalizeApiBaseUrl, safeUrlJoin } from './urlUtils';
+import { getChatMessages } from '../db';
 import type { RuntimeAdapter, RuntimeConfig, RuntimeMessage } from './runtimeTypes';
 
 type LlmToolCall = {
@@ -36,6 +39,11 @@ type LlmResponse = {
 
 const now = () => Date.now();
 const nextId = (prefix: string) => `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+const truncateText = (value: unknown, limit: number): string => {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit)}...`;
+};
 
 const isToolConcurrencySafe = (registry: ToolRegistry, toolName: string, args: Record<string, unknown>): boolean => {
   const tool = registry.getTool(toolName);
@@ -140,6 +148,7 @@ export class QueryRuntime {
     let continuationCount = 0;
     let lastContinuationDelta = 0;
     let compactFailureCount = 0;
+    let hadCompaction = false;
 
     while (turnCount < maxTurns) {
       if (now() - startedAt > maxTimeMs) {
@@ -205,23 +214,66 @@ export class QueryRuntime {
         });
       }
       if (compacted) {
+        hadCompaction = true;
         compactFailureCount = 0;
+        const rehydrated = this.rehydrateCompactedMessages(messages, compacted);
         this.adapter.onEvent({ type: 'compact_start', strategy: compacted.strategy });
         this.store.appendTranscript({
           sessionId: this.config.sessionId,
           recordType: 'query.compact',
           role: 'system',
           content: compacted.summary,
-          payload: { kind: 'query.compact', data: { strategy: compacted.strategy } },
+          payload: {
+            kind: 'query.compact',
+            data: {
+              strategy: compacted.strategy,
+              reinjected: rehydrated.reinjected,
+              preservedSegments: rehydrated.preservedSegmentCount,
+            },
+          },
         });
         this.store.addCheckpoint({
           sessionId: this.config.sessionId,
           checkpointType: 'compact',
           summary: `${compacted.strategy} compact applied`,
-          payload: { strategy: compacted.strategy, summary: compacted.summary },
+          payload: {
+            strategy: compacted.strategy,
+            summary: compacted.summary,
+            reinjected: rehydrated.reinjected,
+            preservedSegments: rehydrated.preservedSegmentCount,
+          },
         });
-        messages = compacted.compactedMessages;
-        this.adapter.onEvent({ type: 'compact_end', strategy: compacted.strategy, summary: compacted.summary, compacted: true });
+        if (rehydrated.reinjectedSummary) {
+          this.store.appendTranscript({
+            sessionId: this.config.sessionId,
+            recordType: 'query.compact.rehydrated',
+            role: 'system',
+            content: rehydrated.reinjectedSummary,
+            payload: {
+              kind: 'query.compact.rehydrated',
+              data: {
+                strategy: compacted.strategy,
+                preservedSegmentCount: rehydrated.preservedSegmentCount,
+              },
+            },
+          });
+          this.store.addCheckpoint({
+            sessionId: this.config.sessionId,
+            checkpointType: 'compact.rehydrated',
+            summary: `compact context rehydrated (${rehydrated.preservedSegmentCount} segments)`,
+            payload: {
+              strategy: compacted.strategy,
+              preservedSegmentCount: rehydrated.preservedSegmentCount,
+            },
+          });
+        }
+        messages = rehydrated.messages;
+        this.adapter.onEvent({
+          type: 'compact_end',
+          strategy: compacted.strategy,
+          summary: rehydrated.reinjectedSummary || compacted.summary,
+          compacted: true,
+        });
       }
 
       let llmResponse: LlmResponse;
@@ -237,6 +289,7 @@ export class QueryRuntime {
             { role: 'system', content: 'Reactive compaction requested after context overflow.' },
           ]);
           if (reactive) {
+            hadCompaction = true;
             messages = reactive.compactedMessages;
             this.adapter.onEvent({ type: 'compact_start', strategy: 'reactive' });
             this.adapter.onEvent({ type: 'compact_end', strategy: 'reactive', summary: reactive.summary, compacted: true });
@@ -399,6 +452,10 @@ export class QueryRuntime {
         checkpointType: 'response.final',
         summary: responseText.slice(0, 240) || 'Assistant response completed',
         payload: { turnCount, responseLength: responseText.length },
+      });
+      this.notifyMemoryLifecycle({
+        responseLength: responseText.length,
+        compacted: hadCompaction,
       });
       await executeRuntimeHooks({
         event: 'query.after',
@@ -744,5 +801,173 @@ export class QueryRuntime {
 
   private extractCommand(args: Record<string, unknown>): string {
     return typeof args.command === 'string' ? args.command : '';
+  }
+
+  private notifyMemoryLifecycle(params: {
+    responseLength: number;
+    compacted: boolean;
+  }): void {
+    if (this.config.runtimeMode === 'background-maintenance') {
+      return;
+    }
+    try {
+      getMemoryMaintenanceService().notifyQueryLifecycleEvent({
+        sessionId: this.config.sessionId,
+        runtimeMode: this.config.runtimeMode,
+        responseLength: params.responseLength,
+        compacted: params.compacted,
+      });
+    } catch (error) {
+      this.adapter.onEvent({
+        type: 'tool_summary',
+        toolName: 'memory-maintenance',
+        content: `memory lifecycle notify failed: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+  }
+
+  private rehydrateCompactedMessages(
+    originalMessages: RuntimeMessage[],
+    compacted: { strategy: 'micro' | 'normal' | 'reactive'; summary: string; compactedMessages: RuntimeMessage[] },
+  ): {
+    messages: RuntimeMessage[];
+    reinjected: boolean;
+    reinjectedSummary: string;
+    preservedSegmentCount: number;
+  } {
+    const firstSystemMessage = originalMessages.find((message) => message.role === 'system') || compacted.compactedMessages[0];
+    const compactedTail = compacted.compactedMessages.filter((message, index) => {
+      if (message.role !== 'system') return true;
+      return index === 0 && message === firstSystemMessage;
+    }).filter(Boolean) as RuntimeMessage[];
+
+    const checkpoints = this.store.listCheckpoints(this.config.sessionId, 8)
+      .filter((checkpoint) => !checkpoint.checkpointType.startsWith('compact'))
+      .slice(0, 5);
+    const toolResults = this.store.listToolResults(this.config.sessionId, 6).slice(0, 4);
+    const attachmentSummaries = this.getRecentAttachmentSummaries();
+    const taskNodeSummaries = this.getRecentTaskNodeSummaries();
+    const recentTurns = originalMessages
+      .filter((message) => message.role !== 'system')
+      .slice(-4)
+      .map((message) => `${message.role}: ${truncateText(message.content, 280)}`);
+
+    const preservedSegments: string[] = [
+      `runtimeMode: ${this.config.runtimeMode || 'unknown'}`,
+      `toolPack: ${this.config.toolPack}`,
+      `requiresHumanApproval: ${this.config.requiresHumanApproval ? 'true' : 'false'}`,
+    ];
+
+    if (checkpoints.length > 0) {
+      preservedSegments.push(
+        'Recent checkpoints:',
+        ...checkpoints.map((checkpoint) => `- ${checkpoint.checkpointType}: ${truncateText(checkpoint.summary, 220)}`),
+      );
+    }
+
+    if (toolResults.length > 0) {
+      preservedSegments.push(
+        'Recent tool outcomes:',
+        ...toolResults.map((result) => `- ${result.toolName} [${result.success ? 'ok' : 'fail'}]: ${truncateText(result.summaryText || result.promptText || result.resultText, 220)}`),
+      );
+    }
+
+    if (attachmentSummaries.length > 0) {
+      preservedSegments.push(
+        'Recent attachments and rich user payloads:',
+        ...attachmentSummaries.map((item) => `- ${item}`),
+      );
+    }
+
+    if (taskNodeSummaries.length > 0) {
+      preservedSegments.push(
+        'Recent task graph state:',
+        ...taskNodeSummaries.map((item) => `- ${item}`),
+      );
+    }
+
+    if (recentTurns.length > 0) {
+      preservedSegments.push(
+        'Recent live turns:',
+        ...recentTurns.map((item) => `- ${item}`),
+      );
+    }
+
+    const reinjectedSummary = [
+      '## Compact Boundary',
+      `Strategy: ${compacted.strategy}`,
+      `Summary: ${truncateText(compacted.summary, 3200)}`,
+      '',
+      '## Preserved Runtime Context',
+      ...preservedSegments,
+      '',
+      'Rules:',
+      '- Favor the latest live turns and preserved runtime context over older compressed details.',
+      '- Preserve current task goal, active role, and recent tool outcomes.',
+      '- Do not repeat already completed work unless the preserved context says it is incomplete.',
+    ].join('\n');
+
+    return {
+      messages: [
+        firstSystemMessage,
+        { role: 'system', content: reinjectedSummary },
+        ...compactedTail.slice(-8),
+      ].filter(Boolean) as RuntimeMessage[],
+      reinjected: true,
+      reinjectedSummary,
+      preservedSegmentCount: preservedSegments.length,
+    };
+  }
+
+  private getRecentAttachmentSummaries(): string[] {
+    const messages = getChatMessages(this.config.sessionId)
+      .filter((message) => message.role === 'user' && (message.attachment || message.display_content))
+      .slice(-4);
+
+    return messages.map((message) => {
+      let attachmentText = '';
+      if (message.attachment) {
+        try {
+          const parsed = JSON.parse(String(message.attachment)) as Record<string, unknown>;
+          const attachmentType = String(parsed.type || 'attachment').trim() || 'attachment';
+          const attachmentName = String(parsed.name || parsed.title || parsed.absolutePath || '').trim();
+          const attachmentSummary = String(parsed.summary || '').trim();
+          const attachmentKind = String(parsed.kind || '').trim();
+          attachmentText = [
+            attachmentType,
+            attachmentName && `name=${attachmentName}`,
+            attachmentKind && `kind=${attachmentKind}`,
+            attachmentSummary && `summary=${truncateText(attachmentSummary, 180)}`,
+          ].filter(Boolean).join(' | ');
+        } catch {
+          attachmentText = truncateText(message.attachment, 180);
+        }
+      }
+      const displayText = String(message.display_content || '').trim();
+      const contentText = String(message.content || '').trim();
+      return [
+        attachmentText && `attachment: ${attachmentText}`,
+        displayText && `display: ${truncateText(displayText, 180)}`,
+        contentText && `content: ${truncateText(contentText, 180)}`,
+      ].filter(Boolean).join(' || ');
+    }).filter(Boolean);
+  }
+
+  private getRecentTaskNodeSummaries(): string[] {
+    const tasks = getTaskGraphRuntime()
+      .listTasks({ ownerSessionId: this.config.sessionId, limit: 3 })
+      .slice(0, 2);
+
+    return tasks.flatMap((task) => {
+      const activeNodes = task.graph
+        .filter((node) => node.status === 'running' || node.status === 'failed' || node.status === 'pending')
+        .slice(0, 3);
+      const header = `task=${task.id} intent=${task.intent || task.taskType} status=${task.status}`;
+      const nodeLines = activeNodes.map((node) => `${node.type}:${node.status}${node.summary ? ` (${truncateText(node.summary, 120)})` : ''}`);
+      if (nodeLines.length === 0) {
+        return [header];
+      }
+      return [header, ...nodeLines];
+    });
   }
 }

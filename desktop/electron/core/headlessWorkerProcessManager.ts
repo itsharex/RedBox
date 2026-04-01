@@ -36,25 +36,24 @@ type HostedToolFeedback = {
   success: boolean;
 };
 
-type PendingJsonRun = {
+type PendingRunBase = {
   runId: string;
   taskId: string;
   sessionId: string;
   rollback?: () => Promise<void> | void;
   attemptSignal?: AbortSignal;
+  onAttemptAbort?: () => void;
+};
+
+type PendingJsonRun = PendingRunBase & {
   resolve: (value: JsonWorkerResult) => void;
   reject: (reason?: unknown) => void;
 };
 
-type PendingRuntimeRun = {
-  runId: string;
-  taskId: string;
-  sessionId: string;
+type PendingRuntimeRun = PendingRunBase & {
   toolPack: BuiltinToolPack;
   runtimeMode?: string;
   requiresHumanApproval?: boolean;
-  rollback?: () => Promise<void> | void;
-  attemptSignal?: AbortSignal;
   toolAbortController: AbortController;
   resolve: (value: RuntimeWorkerResult) => void;
   reject: (reason?: unknown) => void;
@@ -67,6 +66,37 @@ type ToolCallMessage = {
   name: string;
   args: Record<string, unknown>;
 };
+
+type BaseWorkerSlot<TPending extends PendingRunBase> = {
+  id: string;
+  mode: WorkerMode;
+  fileName: string;
+  child: ChildProcess | null;
+  ready: boolean;
+  currentRun: TPending | null;
+  readyResolvers: Array<() => void>;
+  lastHeartbeatAt?: string;
+  lastUsedAt: number;
+};
+
+type JsonWorkerSlot = BaseWorkerSlot<PendingJsonRun>;
+
+type RuntimeWorkerSlot = BaseWorkerSlot<PendingRuntimeRun>;
+
+export type WorkerPoolSlotSnapshot = {
+  id: string;
+  mode: WorkerMode;
+  ready: boolean;
+  busy: boolean;
+  pid?: number;
+  sessionId?: string;
+  taskId?: string;
+  lastHeartbeatAt?: string;
+  lastUsedAt?: string;
+};
+
+const MAX_JSON_WORKERS = 2;
+const MAX_RUNTIME_WORKERS = 3;
 
 function nextId(prefix: string): string {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -89,55 +119,137 @@ function createWorker(mode: WorkerMode, fileName: string): ChildProcess {
   });
 }
 
+function createWorkerSlot<TPending extends PendingRunBase>(
+  id: string,
+  mode: WorkerMode,
+  fileName: string,
+): BaseWorkerSlot<TPending> {
+  return {
+    id,
+    mode,
+    fileName,
+    child: null,
+    ready: false,
+    currentRun: null,
+    readyResolvers: [],
+    lastUsedAt: 0,
+  };
+}
+
 export class HeadlessWorkerProcessManager {
   private readonly runtimeStore = getSessionRuntimeStore();
   private readonly toolResultStore = getToolResultStore();
 
-  private jsonWorker: ChildProcess | null = null;
-  private jsonWorkerReady = false;
-  private currentJsonRun: PendingJsonRun | null = null;
-  private jsonQueue: Array<() => void> = [];
-  private jsonReadyResolvers: Array<() => void> = [];
+  private readonly jsonSlots: JsonWorkerSlot[] = [];
+  private readonly runtimeSlots: RuntimeWorkerSlot[] = [];
+  private readonly jsonSessionAffinity = new Map<string, string>();
+  private readonly runtimeSessionAffinity = new Map<string, string>();
+  private readonly jsonAvailabilityWaiters: Array<() => void> = [];
+  private readonly runtimeAvailabilityWaiters: Array<() => void> = [];
 
-  private runtimeWorker: ChildProcess | null = null;
-  private runtimeWorkerReady = false;
-  private currentRuntimeRun: PendingRuntimeRun | null = null;
-  private runtimeQueue: Array<() => void> = [];
-  private runtimeReadyResolvers: Array<() => void> = [];
+  private getOrCreateJsonSlot(index?: number): JsonWorkerSlot {
+    if (typeof index === 'number' && this.jsonSlots[index]) {
+      return this.jsonSlots[index];
+    }
+    const slot = createWorkerSlot<PendingJsonRun>(
+      `json-worker-${this.jsonSlots.length + 1}`,
+      'child-json-worker',
+      'json-runtime-worker.mjs',
+    );
+    this.jsonSlots.push(slot);
+    return slot;
+  }
 
-  private async ensureJsonWorker(): Promise<ChildProcess> {
-    if (this.jsonWorker && !this.jsonWorker.killed && this.jsonWorkerReady) {
-      return this.jsonWorker;
+  private getOrCreateRuntimeSlot(index?: number): RuntimeWorkerSlot {
+    if (typeof index === 'number' && this.runtimeSlots[index]) {
+      return this.runtimeSlots[index];
+    }
+    const slot = createWorkerSlot<PendingRuntimeRun>(
+      `runtime-worker-${this.runtimeSlots.length + 1}`,
+      'child-runtime-worker',
+      'query-runtime-worker.mjs',
+    );
+    this.runtimeSlots.push(slot);
+    return slot;
+  }
+
+  private resolvePoolWaiters(waiters: Array<() => void>): void {
+    for (const resolve of waiters.splice(0)) {
+      resolve();
+    }
+  }
+
+  private notifyJsonAvailability(): void {
+    this.resolvePoolWaiters(this.jsonAvailabilityWaiters);
+  }
+
+  private notifyRuntimeAvailability(): void {
+    this.resolvePoolWaiters(this.runtimeAvailabilityWaiters);
+  }
+
+  private async waitForJsonAvailability(): Promise<void> {
+    await new Promise<void>((resolve) => {
+      this.jsonAvailabilityWaiters.push(resolve);
+    });
+  }
+
+  private async waitForRuntimeAvailability(): Promise<void> {
+    await new Promise<void>((resolve) => {
+      this.runtimeAvailabilityWaiters.push(resolve);
+    });
+  }
+
+  private clearAffinityForSlot(slotId: string, map: Map<string, string>): void {
+    for (const [sessionId, currentSlotId] of map.entries()) {
+      if (currentSlotId === slotId) {
+        map.delete(sessionId);
+      }
+    }
+  }
+
+  private async ensureJsonSlot(slot: JsonWorkerSlot): Promise<ChildProcess> {
+    if (slot.child && !slot.child.killed && slot.ready) {
+      return slot.child;
+    }
+    if (slot.child && !slot.child.killed && !slot.ready) {
+      await new Promise<void>((resolve) => {
+        slot.readyResolvers.push(resolve);
+      });
+      return slot.child;
     }
 
-    const child = createWorker('child-json-worker', 'json-runtime-worker.mjs');
-    this.jsonWorker = child;
-    this.jsonWorkerReady = false;
+    const child = createWorker(slot.mode, slot.fileName);
+    slot.child = child;
+    slot.ready = false;
 
     child.on('message', (message: any) => {
       if (!message || typeof message !== 'object') return;
 
       if (message.type === 'ready') {
-        this.jsonWorkerReady = true;
-        for (const resolve of this.jsonReadyResolvers.splice(0)) {
+        slot.ready = true;
+        slot.lastHeartbeatAt = new Date().toISOString();
+        for (const resolve of slot.readyResolvers.splice(0)) {
           resolve();
         }
+        this.notifyJsonAvailability();
         return;
       }
 
+      const run = slot.currentRun;
+
       if (message.type === 'heartbeat') {
-        const run = this.currentJsonRun;
+        slot.lastHeartbeatAt = new Date().toISOString();
         if (run && (!message.runId || message.runId === run.runId)) {
           void getBackgroundTaskRegistry().updateWorkerProcess(run.taskId, {
-            workerMode: 'child-json-worker',
+            workerMode: slot.mode,
             workerPid: child.pid || undefined,
-            heartbeatAt: new Date().toISOString(),
+            workerLabel: slot.id,
+            heartbeatAt: slot.lastHeartbeatAt,
           });
         }
         return;
       }
 
-      const run = this.currentJsonRun;
       if (!run || (message.runId && message.runId !== run.runId)) {
         return;
       }
@@ -146,8 +258,9 @@ export class HeadlessWorkerProcessManager {
         this.handleWorkerProgress({
           taskId: run.taskId,
           sessionId: run.sessionId,
-          workerMode: 'child-json-worker',
+          workerMode: slot.mode,
           workerPid: child.pid || undefined,
+          workerLabel: slot.id,
           phase: String(message.phase || ''),
           text: typeof message.text === 'string' ? message.text : '',
         });
@@ -155,7 +268,7 @@ export class HeadlessWorkerProcessManager {
       }
 
       if (message.type === 'result') {
-        this.finishJsonRun(() => {
+        this.finishJsonRun(slot, () => {
           const result = {
             response: String(message.response || ''),
             usage: message.usage,
@@ -173,7 +286,7 @@ export class HeadlessWorkerProcessManager {
       }
 
       if (message.type === 'error') {
-        this.finishJsonRun(() => {
+        this.finishJsonRun(slot, () => {
           const messageText = String(message.error || 'Worker execution failed');
           this.appendRuntimeFailureRecord(run.sessionId, messageText);
           run.reject(new Error(messageText));
@@ -183,20 +296,23 @@ export class HeadlessWorkerProcessManager {
 
     child.stderr?.on('data', (chunk) => {
       const text = String(chunk || '').trim();
-      if (text && this.currentJsonRun) {
-        void getBackgroundTaskRegistry().appendTurn(this.currentJsonRun.taskId, {
+      if (text && slot.currentRun) {
+        void getBackgroundTaskRegistry().appendTurn(slot.currentRun.taskId, {
           source: 'system',
-          text: `[worker-stderr] ${text}`,
+          text: `[worker-stderr][${slot.id}] ${text}`,
         });
       }
     });
 
     const handleExit = (reason: string) => {
-      this.jsonWorker = null;
-      this.jsonWorkerReady = false;
-      const run = this.currentJsonRun;
+      const run = slot.currentRun;
+      slot.child = null;
+      slot.ready = false;
+      this.clearAffinityForSlot(slot.id, this.jsonSessionAffinity);
       if (run) {
-        this.finishJsonRun(() => run.reject(new Error(reason)));
+        this.finishJsonRun(slot, () => run.reject(new Error(reason)));
+      } else {
+        this.notifyJsonAvailability();
       }
     };
 
@@ -209,45 +325,55 @@ export class HeadlessWorkerProcessManager {
     });
 
     await new Promise<void>((resolve) => {
-      this.jsonReadyResolvers.push(resolve);
+      slot.readyResolvers.push(resolve);
     });
 
     return child;
   }
 
-  private async ensureRuntimeWorker(): Promise<ChildProcess> {
-    if (this.runtimeWorker && !this.runtimeWorker.killed && this.runtimeWorkerReady) {
-      return this.runtimeWorker;
+  private async ensureRuntimeSlot(slot: RuntimeWorkerSlot): Promise<ChildProcess> {
+    if (slot.child && !slot.child.killed && slot.ready) {
+      return slot.child;
+    }
+    if (slot.child && !slot.child.killed && !slot.ready) {
+      await new Promise<void>((resolve) => {
+        slot.readyResolvers.push(resolve);
+      });
+      return slot.child;
     }
 
-    const child = createWorker('child-runtime-worker', 'query-runtime-worker.mjs');
-    this.runtimeWorker = child;
-    this.runtimeWorkerReady = false;
+    const child = createWorker(slot.mode, slot.fileName);
+    slot.child = child;
+    slot.ready = false;
 
     child.on('message', (message: any) => {
       if (!message || typeof message !== 'object') return;
 
       if (message.type === 'ready') {
-        this.runtimeWorkerReady = true;
-        for (const resolve of this.runtimeReadyResolvers.splice(0)) {
+        slot.ready = true;
+        slot.lastHeartbeatAt = new Date().toISOString();
+        for (const resolve of slot.readyResolvers.splice(0)) {
           resolve();
         }
+        this.notifyRuntimeAvailability();
         return;
       }
 
+      const run = slot.currentRun;
+
       if (message.type === 'heartbeat') {
-        const run = this.currentRuntimeRun;
+        slot.lastHeartbeatAt = new Date().toISOString();
         if (run && (!message.runId || message.runId === run.runId)) {
           void getBackgroundTaskRegistry().updateWorkerProcess(run.taskId, {
-            workerMode: 'child-runtime-worker',
+            workerMode: slot.mode,
             workerPid: child.pid || undefined,
-            heartbeatAt: new Date().toISOString(),
+            workerLabel: slot.id,
+            heartbeatAt: slot.lastHeartbeatAt,
           });
         }
         return;
       }
 
-      const run = this.currentRuntimeRun;
       if (!run || (message.runId && message.runId !== run.runId)) {
         return;
       }
@@ -256,8 +382,9 @@ export class HeadlessWorkerProcessManager {
         this.handleWorkerProgress({
           taskId: run.taskId,
           sessionId: run.sessionId,
-          workerMode: 'child-runtime-worker',
+          workerMode: slot.mode,
           workerPid: child.pid || undefined,
+          workerLabel: slot.id,
           phase: String(message.phase || ''),
           text: typeof message.text === 'string' ? message.text : '',
         });
@@ -265,12 +392,12 @@ export class HeadlessWorkerProcessManager {
       }
 
       if (message.type === 'tool-call-batch') {
-        void this.handleRuntimeToolBatch(child, run, Array.isArray(message.calls) ? message.calls : []);
+        void this.handleRuntimeToolBatch(slot, Array.isArray(message.calls) ? message.calls : []);
         return;
       }
 
       if (message.type === 'result') {
-        this.finishRuntimeRun(() => {
+        this.finishRuntimeRun(slot, () => {
           const result = {
             response: String(message.response || ''),
             usage: message.usage,
@@ -288,7 +415,7 @@ export class HeadlessWorkerProcessManager {
       }
 
       if (message.type === 'error') {
-        this.finishRuntimeRun(() => {
+        this.finishRuntimeRun(slot, () => {
           const messageText = String(message.error || 'Runtime worker execution failed');
           this.appendRuntimeFailureRecord(run.sessionId, messageText);
           run.reject(new Error(messageText));
@@ -298,21 +425,24 @@ export class HeadlessWorkerProcessManager {
 
     child.stderr?.on('data', (chunk) => {
       const text = String(chunk || '').trim();
-      if (text && this.currentRuntimeRun) {
-        void getBackgroundTaskRegistry().appendTurn(this.currentRuntimeRun.taskId, {
+      if (text && slot.currentRun) {
+        void getBackgroundTaskRegistry().appendTurn(slot.currentRun.taskId, {
           source: 'system',
-          text: `[runtime-worker-stderr] ${text}`,
+          text: `[runtime-worker-stderr][${slot.id}] ${text}`,
         });
       }
     });
 
     const handleExit = (reason: string) => {
-      this.runtimeWorker = null;
-      this.runtimeWorkerReady = false;
-      const run = this.currentRuntimeRun;
+      const run = slot.currentRun;
+      slot.child = null;
+      slot.ready = false;
+      this.clearAffinityForSlot(slot.id, this.runtimeSessionAffinity);
       if (run) {
         run.toolAbortController.abort();
-        this.finishRuntimeRun(() => run.reject(new Error(reason)));
+        this.finishRuntimeRun(slot, () => run.reject(new Error(reason)));
+      } else {
+        this.notifyRuntimeAvailability();
       }
     };
 
@@ -325,10 +455,80 @@ export class HeadlessWorkerProcessManager {
     });
 
     await new Promise<void>((resolve) => {
-      this.runtimeReadyResolvers.push(resolve);
+      slot.readyResolvers.push(resolve);
     });
 
     return child;
+  }
+
+  private async acquireJsonSlot(sessionId: string): Promise<JsonWorkerSlot> {
+    while (true) {
+      const preferredSlotId = this.jsonSessionAffinity.get(sessionId);
+      if (preferredSlotId) {
+        const preferred = this.jsonSlots.find((slot) => slot.id === preferredSlotId);
+        if (preferred) {
+          await this.ensureJsonSlot(preferred);
+          if (!preferred.currentRun) {
+            return preferred;
+          }
+        }
+      }
+
+      for (const slot of this.jsonSlots) {
+        await this.ensureJsonSlot(slot);
+      }
+      const idleExisting = this.jsonSlots
+        .filter((slot) => slot.ready && !slot.currentRun)
+        .sort((a, b) => a.lastUsedAt - b.lastUsedAt)[0];
+      if (idleExisting) {
+        return idleExisting;
+      }
+
+      if (this.jsonSlots.length < MAX_JSON_WORKERS) {
+        const slot = this.getOrCreateJsonSlot();
+        await this.ensureJsonSlot(slot);
+        if (!slot.currentRun) {
+          return slot;
+        }
+      }
+
+      await this.waitForJsonAvailability();
+    }
+  }
+
+  private async acquireRuntimeSlot(sessionId: string): Promise<RuntimeWorkerSlot> {
+    while (true) {
+      const preferredSlotId = this.runtimeSessionAffinity.get(sessionId);
+      if (preferredSlotId) {
+        const preferred = this.runtimeSlots.find((slot) => slot.id === preferredSlotId);
+        if (preferred) {
+          await this.ensureRuntimeSlot(preferred);
+          if (!preferred.currentRun) {
+            return preferred;
+          }
+        }
+      }
+
+      for (const slot of this.runtimeSlots) {
+        await this.ensureRuntimeSlot(slot);
+      }
+      const idleExisting = this.runtimeSlots
+        .filter((slot) => slot.ready && !slot.currentRun)
+        .sort((a, b) => a.lastUsedAt - b.lastUsedAt)[0];
+      if (idleExisting) {
+        return idleExisting;
+      }
+
+      if (this.runtimeSlots.length < MAX_RUNTIME_WORKERS) {
+        const slot = this.getOrCreateRuntimeSlot();
+        await this.ensureRuntimeSlot(slot);
+        if (!slot.currentRun) {
+          return slot;
+        }
+      }
+
+      await this.waitForRuntimeAvailability();
+    }
   }
 
   private handleWorkerProgress(input: {
@@ -336,6 +536,7 @@ export class HeadlessWorkerProcessManager {
     sessionId: string;
     workerMode: WorkerMode;
     workerPid?: number;
+    workerLabel?: string;
     phase: string;
     text: string;
   }): void {
@@ -353,6 +554,7 @@ export class HeadlessWorkerProcessManager {
     void registry.updateWorkerProcess(input.taskId, {
       workerMode: input.workerMode,
       workerPid: input.workerPid,
+      workerLabel: input.workerLabel,
       heartbeatAt: new Date().toISOString(),
     });
     if (input.text) {
@@ -371,6 +573,7 @@ export class HeadlessWorkerProcessManager {
             phase: normalizedPhase,
             workerMode: input.workerMode,
             workerPid: input.workerPid,
+            workerLabel: input.workerLabel,
           },
         },
       });
@@ -382,6 +585,7 @@ export class HeadlessWorkerProcessManager {
     toolPack: string;
     workerMode: WorkerMode;
     workerPid?: number;
+    workerLabel?: string;
     userInput: string;
   }): void {
     this.runtimeStore.appendTranscript({
@@ -395,6 +599,7 @@ export class HeadlessWorkerProcessManager {
           toolPack: params.toolPack,
           workerMode: params.workerMode,
           workerPid: params.workerPid,
+          workerLabel: params.workerLabel,
         },
       },
     });
@@ -406,6 +611,7 @@ export class HeadlessWorkerProcessManager {
         toolPack: params.toolPack,
         workerMode: params.workerMode,
         workerPid: params.workerPid,
+        workerLabel: params.workerLabel,
       },
     });
   }
@@ -460,43 +666,43 @@ export class HeadlessWorkerProcessManager {
     });
   }
 
-  private finishJsonRun(fn: () => void): void {
-    const run = this.currentJsonRun;
+  private finishJsonRun(slot: JsonWorkerSlot, fn: () => void): void {
+    const run = slot.currentRun;
     if (!run) return;
-    if (run.attemptSignal) {
-      run.attemptSignal.removeEventListener('abort', this.abortJsonRun);
+    if (run.attemptSignal && run.onAttemptAbort) {
+      run.attemptSignal.removeEventListener('abort', run.onAttemptAbort);
     }
     getBackgroundTaskRegistry().clearCancelHandle(run.taskId);
-    this.currentJsonRun = null;
+    slot.currentRun = null;
+    slot.lastUsedAt = Date.now();
     fn();
-    const next = this.jsonQueue.shift();
-    if (next) next();
+    this.notifyJsonAvailability();
   }
 
-  private finishRuntimeRun(fn: () => void): void {
-    const run = this.currentRuntimeRun;
+  private finishRuntimeRun(slot: RuntimeWorkerSlot, fn: () => void): void {
+    const run = slot.currentRun;
     if (!run) return;
-    if (run.attemptSignal) {
-      run.attemptSignal.removeEventListener('abort', this.abortRuntimeRun);
+    if (run.attemptSignal && run.onAttemptAbort) {
+      run.attemptSignal.removeEventListener('abort', run.onAttemptAbort);
     }
     run.toolAbortController.abort();
     getBackgroundTaskRegistry().clearCancelHandle(run.taskId);
-    this.currentRuntimeRun = null;
+    slot.currentRun = null;
+    slot.lastUsedAt = Date.now();
     fn();
-    const next = this.runtimeQueue.shift();
-    if (next) next();
+    this.notifyRuntimeAvailability();
   }
 
-  private abortJsonRun = () => {
-    if (!this.jsonWorker || !this.currentJsonRun) return;
-    this.jsonWorker.send?.({ type: 'abort', runId: this.currentJsonRun.runId });
-  };
+  private abortJsonRun(slot: JsonWorkerSlot): void {
+    if (!slot.child || !slot.currentRun) return;
+    slot.child.send?.({ type: 'abort', runId: slot.currentRun.runId });
+  }
 
-  private abortRuntimeRun = () => {
-    if (!this.runtimeWorker || !this.currentRuntimeRun) return;
-    this.currentRuntimeRun.toolAbortController.abort();
-    this.runtimeWorker.send?.({ type: 'abort', runId: this.currentRuntimeRun.runId });
-  };
+  private abortRuntimeRun(slot: RuntimeWorkerSlot): void {
+    if (!slot.child || !slot.currentRun) return;
+    slot.currentRun.toolAbortController.abort();
+    slot.child.send?.({ type: 'abort', runId: slot.currentRun.runId });
+  }
 
   async runJsonTask(input: {
     taskId: string;
@@ -510,76 +716,74 @@ export class HeadlessWorkerProcessManager {
     rollback?: () => Promise<void> | void;
     attemptSignal?: AbortSignal;
   }): Promise<JsonWorkerResult> {
-    return await new Promise<JsonWorkerResult>((resolve, reject) => {
-      const run = async () => {
-        try {
-          const child = await this.ensureJsonWorker();
-          const runId = nextId('json_run');
-          const registry = getBackgroundTaskRegistry();
-          this.currentJsonRun = {
-            runId,
-            taskId: input.taskId,
-            sessionId: input.sessionId,
-            rollback: input.rollback,
-            attemptSignal: input.attemptSignal,
-            resolve,
-            reject,
-          };
+    return await new Promise<JsonWorkerResult>(async (resolve, reject) => {
+      try {
+        const slot = await this.acquireJsonSlot(input.sessionId);
+        const child = await this.ensureJsonSlot(slot);
+        const runId = nextId('json_run');
+        const registry = getBackgroundTaskRegistry();
+        const onAttemptAbort = () => this.abortJsonRun(slot);
+        this.currentAffinity('json', input.sessionId, slot.id);
+        slot.currentRun = {
+          runId,
+          taskId: input.taskId,
+          sessionId: input.sessionId,
+          rollback: input.rollback,
+          attemptSignal: input.attemptSignal,
+          onAttemptAbort,
+          resolve,
+          reject,
+        };
 
-          registry.registerCancelHandle(input.taskId, {
-            cancel: () => {
-              child.send?.({ type: 'abort', runId });
-            },
-            rollback: input.rollback,
-          });
+        registry.registerCancelHandle(input.taskId, {
+          cancel: () => {
+            this.abortJsonRun(slot);
+          },
+          rollback: input.rollback,
+        });
 
-          await registry.updateWorkerProcess(input.taskId, {
-            workerMode: 'child-json-worker',
-            workerPid: child.pid || undefined,
-            heartbeatAt: new Date().toISOString(),
-          });
-          await registry.appendTurn(input.taskId, {
-            source: 'system',
-            text: `[worker] connected to persistent JSON child pid=${child.pid || 'unknown'}`,
-          });
-          this.appendRuntimeStartRecord({
-            sessionId: input.sessionId,
-            toolPack: 'background-maintenance',
-            workerMode: 'child-json-worker',
-            workerPid: child.pid || undefined,
-            userInput: input.userInput,
-          });
+        await registry.updateWorkerProcess(input.taskId, {
+          workerMode: slot.mode,
+          workerPid: child.pid || undefined,
+          workerLabel: slot.id,
+          heartbeatAt: new Date().toISOString(),
+        });
+        await registry.appendTurn(input.taskId, {
+          source: 'system',
+          text: `[worker] connected to persistent JSON child ${slot.id} pid=${child.pid || 'unknown'}`,
+        });
+        this.appendRuntimeStartRecord({
+          sessionId: input.sessionId,
+          toolPack: 'background-maintenance',
+          workerMode: slot.mode,
+          workerPid: child.pid || undefined,
+          workerLabel: slot.id,
+          userInput: input.userInput,
+        });
 
-          if (input.attemptSignal) {
-            if (input.attemptSignal.aborted) {
-              this.abortJsonRun();
-            } else {
-              input.attemptSignal.addEventListener('abort', this.abortJsonRun, { once: true });
-            }
+        if (input.attemptSignal) {
+          if (input.attemptSignal.aborted) {
+            this.abortJsonRun(slot);
+          } else {
+            input.attemptSignal.addEventListener('abort', onAttemptAbort, { once: true });
           }
-
-          child.send?.({
-            type: 'run-json-task',
-            runId,
-            payload: {
-              model: input.model,
-              apiKey: input.apiKey,
-              baseURL: input.baseURL,
-              systemPrompt: input.systemPrompt,
-              userInput: input.userInput,
-              temperature: input.temperature ?? 0.1,
-            },
-          });
-        } catch (error) {
-          reject(error);
         }
-      };
 
-      if (this.currentJsonRun) {
-        this.jsonQueue.push(run);
-        return;
+        child.send?.({
+          type: 'run-json-task',
+          runId,
+          payload: {
+            model: input.model,
+            apiKey: input.apiKey,
+            baseURL: input.baseURL,
+            systemPrompt: input.systemPrompt,
+            userInput: input.userInput,
+            temperature: input.temperature ?? 0.1,
+          },
+        });
+      } catch (error) {
+        reject(error);
       }
-      void run();
     });
   }
 
@@ -601,97 +805,128 @@ export class HeadlessWorkerProcessManager {
     rollback?: () => Promise<void> | void;
     attemptSignal?: AbortSignal;
   }): Promise<RuntimeWorkerResult> {
-    return await new Promise<RuntimeWorkerResult>((resolve, reject) => {
-      const run = async () => {
-        try {
-          const child = await this.ensureRuntimeWorker();
-          const runId = nextId('runtime_run');
-          const registry = getBackgroundTaskRegistry();
-          const toolRegistry = new ToolRegistry();
-          toolRegistry.registerTools(createBuiltinTools({ pack: input.toolPack }));
+    return await new Promise<RuntimeWorkerResult>(async (resolve, reject) => {
+      try {
+        const slot = await this.acquireRuntimeSlot(input.sessionId);
+        const child = await this.ensureRuntimeSlot(slot);
+        const runId = nextId('runtime_run');
+        const registry = getBackgroundTaskRegistry();
+        const toolRegistry = new ToolRegistry();
+        toolRegistry.registerTools(createBuiltinTools({ pack: input.toolPack }));
+        const onAttemptAbort = () => this.abortRuntimeRun(slot);
 
-          this.currentRuntimeRun = {
-            runId,
-            taskId: input.taskId,
-            sessionId: input.sessionId,
-            toolPack: input.toolPack,
-            runtimeMode: input.runtimeMode,
-            requiresHumanApproval: input.requiresHumanApproval,
-            rollback: input.rollback,
-            attemptSignal: input.attemptSignal,
-            toolAbortController: new AbortController(),
-            resolve,
-            reject,
-          };
+        this.currentAffinity('runtime', input.sessionId, slot.id);
+        slot.currentRun = {
+          runId,
+          taskId: input.taskId,
+          sessionId: input.sessionId,
+          toolPack: input.toolPack,
+          runtimeMode: input.runtimeMode,
+          requiresHumanApproval: input.requiresHumanApproval,
+          rollback: input.rollback,
+          attemptSignal: input.attemptSignal,
+          onAttemptAbort,
+          toolAbortController: new AbortController(),
+          resolve,
+          reject,
+        };
 
-          registry.registerCancelHandle(input.taskId, {
-            cancel: () => {
-              this.abortRuntimeRun();
-            },
-            rollback: input.rollback,
-          });
+        registry.registerCancelHandle(input.taskId, {
+          cancel: () => {
+            this.abortRuntimeRun(slot);
+          },
+          rollback: input.rollback,
+        });
 
-          await registry.updateWorkerProcess(input.taskId, {
-            workerMode: 'child-runtime-worker',
-            workerPid: child.pid || undefined,
-            heartbeatAt: new Date().toISOString(),
-          });
-          await registry.appendTurn(input.taskId, {
-            source: 'system',
-            text: `[worker] connected to persistent runtime child pid=${child.pid || 'unknown'} pack=${input.toolPack}`,
-          });
-          this.appendRuntimeStartRecord({
-            sessionId: input.sessionId,
-            toolPack: input.toolPack,
-            workerMode: 'child-runtime-worker',
-            workerPid: child.pid || undefined,
-            userInput: input.userInput,
-          });
+        await registry.updateWorkerProcess(input.taskId, {
+          workerMode: slot.mode,
+          workerPid: child.pid || undefined,
+          workerLabel: slot.id,
+          heartbeatAt: new Date().toISOString(),
+        });
+        await registry.appendTurn(input.taskId, {
+          source: 'system',
+          text: `[worker] connected to persistent runtime child ${slot.id} pid=${child.pid || 'unknown'} pack=${input.toolPack}`,
+        });
+        this.appendRuntimeStartRecord({
+          sessionId: input.sessionId,
+          toolPack: input.toolPack,
+          workerMode: slot.mode,
+          workerPid: child.pid || undefined,
+          workerLabel: slot.id,
+          userInput: input.userInput,
+        });
 
-          if (input.attemptSignal) {
-            if (input.attemptSignal.aborted) {
-              this.abortRuntimeRun();
-            } else {
-              input.attemptSignal.addEventListener('abort', this.abortRuntimeRun, { once: true });
-            }
+        if (input.attemptSignal) {
+          if (input.attemptSignal.aborted) {
+            this.abortRuntimeRun(slot);
+          } else {
+            input.attemptSignal.addEventListener('abort', onAttemptAbort, { once: true });
           }
-
-          child.send?.({
-            type: 'run-query-task',
-            runId,
-            payload: {
-              model: input.model,
-              apiKey: input.apiKey,
-              baseURL: input.baseURL,
-              systemPrompt: input.systemPrompt,
-              messages: input.messages,
-              userInput: input.userInput,
-              temperature: input.temperature ?? 0.6,
-              maxTurns: input.maxTurns ?? 24,
-              maxTimeMinutes: input.maxTimeMinutes ?? 12,
-              toolSchemas: toolRegistry.getToolSchemas(),
-            },
-          });
-        } catch (error) {
-          reject(error);
         }
-      };
 
-      if (this.currentRuntimeRun) {
-        this.runtimeQueue.push(run);
-        return;
+        child.send?.({
+          type: 'run-query-task',
+          runId,
+          payload: {
+            model: input.model,
+            apiKey: input.apiKey,
+            baseURL: input.baseURL,
+            systemPrompt: input.systemPrompt,
+            messages: input.messages,
+            userInput: input.userInput,
+            temperature: input.temperature ?? 0.6,
+            maxTurns: input.maxTurns ?? 24,
+            maxTimeMinutes: input.maxTimeMinutes ?? 12,
+            toolSchemas: toolRegistry.getToolSchemas(),
+          },
+        });
+      } catch (error) {
+        reject(error);
       }
-      void run();
     });
   }
 
+  private currentAffinity(kind: 'json' | 'runtime', sessionId: string, slotId: string): void {
+    if (kind === 'json') {
+      this.jsonSessionAffinity.set(sessionId, slotId);
+      return;
+    }
+    this.runtimeSessionAffinity.set(sessionId, slotId);
+  }
+
+  getPoolSnapshot(): {
+    json: WorkerPoolSlotSnapshot[];
+    runtime: WorkerPoolSlotSnapshot[];
+  } {
+    const toSnapshot = <TPending extends PendingRunBase>(slot: BaseWorkerSlot<TPending>): WorkerPoolSlotSnapshot => ({
+      id: slot.id,
+      mode: slot.mode,
+      ready: slot.ready,
+      busy: Boolean(slot.currentRun),
+      pid: slot.child?.pid || undefined,
+      sessionId: slot.currentRun?.sessionId,
+      taskId: slot.currentRun?.taskId,
+      lastHeartbeatAt: slot.lastHeartbeatAt,
+      lastUsedAt: slot.lastUsedAt ? new Date(slot.lastUsedAt).toISOString() : undefined,
+    });
+    return {
+      json: this.jsonSlots.map(toSnapshot),
+      runtime: this.runtimeSlots.map(toSnapshot),
+    };
+  }
+
   private async handleRuntimeToolBatch(
-    child: ChildProcess,
-    run: PendingRuntimeRun,
+    slot: RuntimeWorkerSlot,
     calls: ToolCallMessage[],
   ): Promise<void> {
+    const child = slot.child;
+    const run = slot.currentRun;
+    if (!child || !run) {
+      return;
+    }
     try {
-      const results = await this.executeHostedToolBatch(run, calls);
+      const results = await this.executeHostedToolBatch(slot, run, calls);
       child.send?.({
         type: 'tool-result-batch',
         runId: run.runId,
@@ -706,7 +941,11 @@ export class HeadlessWorkerProcessManager {
     }
   }
 
-  private async executeHostedToolBatch(run: PendingRuntimeRun, calls: ToolCallMessage[]): Promise<HostedToolFeedback[]> {
+  private async executeHostedToolBatch(
+    slot: RuntimeWorkerSlot,
+    run: PendingRuntimeRun,
+    calls: ToolCallMessage[],
+  ): Promise<HostedToolFeedback[]> {
     const registry = new ToolRegistry();
     registry.registerTools(createBuiltinTools({ pack: run.toolPack }));
     const executor = new ToolExecutor(registry, async () => ToolConfirmationOutcome.ProceedOnce);
@@ -720,7 +959,8 @@ export class HeadlessWorkerProcessManager {
         kind: 'assistant.tool_call',
         data: {
           calls: calls.map((call) => ({ id: call.id, name: call.name, args: call.args })),
-          workerMode: 'child-runtime-worker',
+          workerMode: slot.mode,
+          workerLabel: slot.id,
         },
       },
     });
@@ -770,7 +1010,8 @@ export class HeadlessWorkerProcessManager {
               callId: call.id,
               toolName: call.name,
               outcome: 'deny',
-              workerMode: 'child-runtime-worker',
+              workerMode: slot.mode,
+              workerLabel: slot.id,
             },
           },
         });
@@ -781,7 +1022,8 @@ export class HeadlessWorkerProcessManager {
           payload: {
             callId: call.id,
             toolName: call.name,
-            workerMode: 'child-runtime-worker',
+            workerMode: slot.mode,
+            workerLabel: slot.id,
           },
         });
         const deniedResult = createErrorResult(permission.reason, ToolErrorType.PERMISSION_DENIED);
@@ -809,7 +1051,8 @@ export class HeadlessWorkerProcessManager {
                 callId: call.id,
                 toolName: call.name,
                 outcome: 'confirm',
-                workerMode: 'child-runtime-worker',
+                workerMode: slot.mode,
+                workerLabel: slot.id,
               },
             },
           });
@@ -841,7 +1084,8 @@ export class HeadlessWorkerProcessManager {
         summaryText,
         payload: {
           durationMs: response.durationMs,
-          workerMode: 'child-runtime-worker',
+          workerMode: slot.mode,
+          workerLabel: slot.id,
         },
       });
       this.runtimeStore.appendTranscript({
@@ -857,6 +1101,7 @@ export class HeadlessWorkerProcessManager {
             toolName: response.name,
             success: response.result.success,
             durationMs: response.durationMs,
+            workerLabel: slot.id,
           },
         },
       });
@@ -916,6 +1161,7 @@ export class HeadlessWorkerProcessManager {
       checkpointType: 'tool.batch',
       summary: `Completed ${responses.length} hosted tool call(s)`,
       payload: {
+        workerLabel: slot.id,
         tools: responses.map((response) => ({
           callId: response.callId,
           name: response.name,
@@ -928,30 +1174,32 @@ export class HeadlessWorkerProcessManager {
   }
 
   async dispose(): Promise<void> {
-    this.jsonQueue = [];
-    this.runtimeQueue = [];
-
-    if (this.currentJsonRun && this.jsonWorker) {
-      this.jsonWorker.send?.({ type: 'abort', runId: this.currentJsonRun.runId });
+    for (const slot of this.jsonSlots) {
+      if (slot.currentRun && slot.child) {
+        slot.child.send?.({ type: 'abort', runId: slot.currentRun.runId });
+      }
     }
-    if (this.currentRuntimeRun && this.runtimeWorker) {
-      this.currentRuntimeRun.toolAbortController.abort();
-      this.runtimeWorker.send?.({ type: 'abort', runId: this.currentRuntimeRun.runId });
-    }
-
-    if (this.jsonWorker && !this.jsonWorker.killed) {
-      this.jsonWorker.kill();
-    }
-    if (this.runtimeWorker && !this.runtimeWorker.killed) {
-      this.runtimeWorker.kill();
+    for (const slot of this.runtimeSlots) {
+      if (slot.currentRun && slot.child) {
+        slot.currentRun.toolAbortController.abort();
+        slot.child.send?.({ type: 'abort', runId: slot.currentRun.runId });
+      }
     }
 
-    this.jsonWorker = null;
-    this.jsonWorkerReady = false;
-    this.currentJsonRun = null;
-    this.runtimeWorker = null;
-    this.runtimeWorkerReady = false;
-    this.currentRuntimeRun = null;
+    for (const slot of [...this.jsonSlots, ...this.runtimeSlots]) {
+      if (slot.child && !slot.child.killed) {
+        slot.child.kill();
+      }
+      slot.child = null;
+      slot.ready = false;
+      slot.currentRun = null as any;
+      slot.readyResolvers = [];
+    }
+
+    this.jsonSessionAffinity.clear();
+    this.runtimeSessionAffinity.clear();
+    this.resolvePoolWaiters(this.jsonAvailabilityWaiters);
+    this.resolvePoolWaiters(this.runtimeAvailabilityWaiters);
   }
 }
 

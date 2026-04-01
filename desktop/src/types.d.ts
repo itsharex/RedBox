@@ -255,6 +255,7 @@ declare global {
           workerState: 'idle' | 'starting' | 'running' | 'retry_wait' | 'timed_out' | 'stopping';
           workerMode?: 'main-process' | 'child-json-worker' | 'child-runtime-worker';
           workerPid?: number;
+          workerLabel?: string;
           workerLastHeartbeatAt?: string;
           cancelReason?: string;
           rollbackState: 'idle' | 'running' | 'completed' | 'failed' | 'not_required';
@@ -284,6 +285,7 @@ declare global {
           workerState: 'idle' | 'starting' | 'running' | 'retry_wait' | 'timed_out' | 'stopping';
           workerMode?: 'main-process' | 'child-json-worker' | 'child-runtime-worker';
           workerPid?: number;
+          workerLabel?: string;
           workerLastHeartbeatAt?: string;
           cancelReason?: string;
           rollbackState: 'idle' | 'running' | 'completed' | 'failed' | 'not_required';
@@ -313,6 +315,7 @@ declare global {
           workerState: 'idle' | 'starting' | 'running' | 'retry_wait' | 'timed_out' | 'stopping';
           workerMode?: 'main-process' | 'child-json-worker' | 'child-runtime-worker';
           workerPid?: number;
+          workerLabel?: string;
           workerLastHeartbeatAt?: string;
           cancelReason?: string;
           rollbackState: 'idle' | 'running' | 'completed' | 'failed' | 'not_required';
@@ -327,6 +330,32 @@ declare global {
             source: 'thought' | 'tool' | 'response' | 'system';
           }>;
         } | null>;
+      };
+      backgroundWorkers: {
+        getPoolState: () => Promise<{
+          json: Array<{
+            id: string;
+            mode: 'child-json-worker' | 'child-runtime-worker';
+            ready: boolean;
+            busy: boolean;
+            pid?: number;
+            sessionId?: string;
+            taskId?: string;
+            lastHeartbeatAt?: string;
+            lastUsedAt?: string;
+          }>;
+          runtime: Array<{
+            id: string;
+            mode: 'child-json-worker' | 'child-runtime-worker';
+            ready: boolean;
+            busy: boolean;
+            pid?: number;
+            sessionId?: string;
+            taskId?: string;
+            lastHeartbeatAt?: string;
+            lastUsedAt?: string;
+          }>;
+        }>;
       };
       tasks: {
         create: (payload?: { runtimeMode?: string; sessionId?: string; userInput?: string; metadata?: Record<string, unknown> }) => Promise<AgentTaskSnapshot>;

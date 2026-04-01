@@ -1385,13 +1385,6 @@ export function Chat({
 
       {/* Main Chat Area */}
       <div className="flex-1 min-w-0 flex flex-col h-full relative">
-        {/* Tool Confirmation Dialog */}
-        <ToolConfirmDialog
-          request={confirmRequest}
-          onConfirm={handleConfirmTool}
-          onCancel={handleCancelTool}
-        />
-
         {/* Header - Sidebar Controls - Hide if fixed session */}
         {!fixedSessionId && (
         <div className="absolute top-4 left-4 z-10 flex items-center gap-2">
@@ -1525,6 +1518,11 @@ export function Chat({
 
               {/* 居中的输入框 */}
               <form onSubmit={handleSubmit} className="relative w-full mt-8">
+                <ToolConfirmDialog
+                  request={confirmRequest}
+                  onConfirm={handleConfirmTool}
+                  onCancel={handleCancelTool}
+                />
                 <div className="relative">
                   <input
                     ref={inputRef}
@@ -1673,6 +1671,11 @@ export function Chat({
                 )}
 
                 <form onSubmit={handleSubmit} className="relative w-full">
+                  <ToolConfirmDialog
+                    request={confirmRequest}
+                    onConfirm={handleConfirmTool}
+                    onCancel={handleCancelTool}
+                  />
                   {allowFileUpload && pendingAttachment && (
                     <div className="mb-2 rounded-lg border border-border bg-surface-secondary/60 px-3 py-2 text-xs text-text-secondary flex items-center justify-between">
                       <span className="truncate">附件: {pendingAttachment.name}</span>
