@@ -38,7 +38,7 @@ import { createCompressionService } from '../core/compressionService';
 import { QueryRuntime } from '../core/queryRuntime';
 import { getLongTermMemoryPrompt } from '../core/fileMemoryStore';
 import { getRedClawProjectContextPrompt } from '../core/redclawStore';
-import { getMcpServers } from '../core/mcpStore';
+import { buildMcpPromptSection } from '../core/mcpPromptSummary';
 import {
   ensureRedClawOnboardingCompletedWithDefaults,
   handleRedClawOnboardingTurn,
@@ -132,6 +132,12 @@ interface GeneratedImagePreview {
   prompt?: string;
 }
 
+interface GeneratedVideoPreview {
+  id: string;
+  previewUrl: string;
+  prompt?: string;
+}
+
 interface CompactContextResult {
   success: boolean;
   compacted: boolean;
@@ -144,6 +150,12 @@ interface SessionRuntimeState {
   isProcessing: boolean;
   partialResponse: string;
   updatedAt: number;
+}
+
+interface ChatModelOverrideConfig {
+  apiKey?: string;
+  baseURL?: string;
+  modelName?: string;
 }
 
 const DEFAULT_REDCLAW_AUTO_COMPACT_TOKENS = 256000;
@@ -198,7 +210,13 @@ export class PiChatService {
     this.sessionId = `session_${Date.now()}`;
     this.skillManager = new SkillManager();
     this.toolRegistry = new ToolRegistry();
-    const tools = createBuiltinTools({ pack: 'redclaw' });
+    const tools = createBuiltinTools({
+      pack: 'redclaw',
+      skillManager: this.skillManager,
+      onSkillActivated: (payload) => {
+        this.sendToUI('chat:skill-activated', payload);
+      },
+    });
     this.toolRegistry.registerTools(tools);
     this.toolExecutor = new ToolExecutor(
       this.toolRegistry,
@@ -468,7 +486,7 @@ export class PiChatService {
     };
   }
 
-  async sendMessage(content: string, sessionId: string) {
+  async sendMessage(content: string, sessionId: string, modelOverride?: ChatModelOverrideConfig) {
     this.sessionId = sessionId;
     this.abortController = new AbortController();
     const signal = this.abortController.signal;
@@ -484,6 +502,7 @@ export class PiChatService {
         sessionId,
         allowInteractiveOnboarding: true,
         emitSkillActivation: true,
+        modelOverride,
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -555,11 +574,12 @@ export class PiChatService {
     try {
       this.emitDebugLog('info', 'agent:run:start');
       const generatedImages: GeneratedImagePreview[] = [];
+      const generatedVideos: GeneratedVideoPreview[] = [];
       const runtime = new QueryRuntime(
         this.toolRegistry,
         this.toolExecutor,
         {
-          onEvent: (event) => this.handleQueryRuntimeEvent(event, generatedImages),
+          onEvent: (event) => this.handleQueryRuntimeEvent(event, generatedImages, generatedVideos),
           onToolResult: (toolName, result, command) => {
             this.maybeRegisterArtifactFromRuntimeToolResult(toolName, result, command);
           },
@@ -601,6 +621,9 @@ export class PiChatService {
       let fullResponse = runResult.response || '';
       if (generatedImages.length > 0) {
         fullResponse = this.appendGeneratedImagesMarkdown(fullResponse, generatedImages);
+      }
+      if (generatedVideos.length > 0) {
+        fullResponse = this.appendGeneratedVideosMarkdown(fullResponse, generatedVideos);
       }
       if (fullResponse) {
         this.emitDebugLog('info', 'sendMessage:full-response', {
@@ -674,17 +697,18 @@ export class PiChatService {
     sessionId: string;
     allowInteractiveOnboarding: boolean;
     emitSkillActivation: boolean;
+    modelOverride?: ChatModelOverrideConfig;
   }): Promise<PreparePiRuntimeOutcome> {
-    const { content, sessionId, allowInteractiveOnboarding, emitSkillActivation } = params;
+    const { content, sessionId, allowInteractiveOnboarding, emitSkillActivation, modelOverride } = params;
     const settings = (getSettings() || {}) as Record<string, unknown>;
-    const apiKey = (settings.api_key as string) || (settings.openaiApiKey as string) || process.env.OPENAI_API_KEY || '';
+    const apiKey = String(modelOverride?.apiKey || (settings.api_key as string) || (settings.openaiApiKey as string) || process.env.OPENAI_API_KEY || '').trim();
     const baseURL = normalizeApiBaseUrl(
-      (settings.api_endpoint as string) || (settings.openaiApiBase as string) || 'https://api.openai.com/v1',
+      String(modelOverride?.baseURL || (settings.api_endpoint as string) || (settings.openaiApiBase as string) || 'https://api.openai.com/v1'),
       'https://api.openai.com/v1',
     );
     let metadata = this.getSessionMetadata(sessionId);
     const modelScope = resolveModelScopeFromContextType(String(metadata.contextType || ''));
-    const modelName = resolveScopedModelName(settings, modelScope, (settings.openaiModel as string) || 'gpt-4o');
+    const modelName = String(modelOverride?.modelName || resolveScopedModelName(settings, modelScope, (settings.openaiModel as string) || 'gpt-4o')).trim();
     const runtimeMode = this.resolveRuntimeMode(metadata);
 
     const workspacePaths = getWorkspacePaths();
@@ -881,6 +905,7 @@ export class PiChatService {
     const toolGuardState = this.createToolGuardState(metadata);
     const appCliCommands = new Map<string, string>();
     const generatedImages: GeneratedImagePreview[] = [];
+    const generatedVideos: GeneratedVideoPreview[] = [];
     let sawAnyToolExecution = false;
 
     this.agent = this.createAgent(model, apiKey, prompt, history, signal, toolGuardState);
@@ -1055,6 +1080,9 @@ export class PiChatService {
           if (!event.isError && command && this.isImageGenerateCommand(command)) {
             generatedImages.push(...this.extractGeneratedImagesFromToolResult(event.result));
           }
+          if (!event.isError && command && this.isVideoGenerateCommand(command)) {
+            generatedVideos.push(...this.extractGeneratedVideosFromToolResult(event.result));
+          }
           this.maybeRegisterArtifactFromToolResult(event.toolName, event.result, command);
           console.log('[PiChatService] tool:end', {
             sessionId: this.sessionId,
@@ -1156,6 +1184,9 @@ export class PiChatService {
       let finalResponse = runtime.displayResponse;
       if (generatedImages.length > 0) {
         finalResponse = this.appendGeneratedImagesMarkdown(finalResponse, generatedImages);
+      }
+      if (generatedVideos.length > 0) {
+        finalResponse = this.appendGeneratedVideosMarkdown(finalResponse, generatedVideos);
       }
       const cleaned = this.cleanupLeakedToolMarkup(finalResponse, sawAnyToolExecution);
       if (cleaned.hasLeakedToolMarkup) {
@@ -1409,6 +1440,20 @@ export class PiChatService {
         getTaskGraphRuntime().addArtifact(taskId, {
           type: 'image',
           label: String(record.id || `image-${index + 1}`),
+          metadata: { toolName, command: command || '', asset: record },
+        });
+      });
+      return;
+    }
+
+    if (toolName === 'app_cli' && data?.kind === 'generated-videos' && Array.isArray(data.assets)) {
+      getTaskGraphRuntime().startNode(taskId, 'save_artifact', '检测到视频产物');
+      data.assets.forEach((asset, index) => {
+        if (!asset || typeof asset !== 'object') return;
+        const record = asset as Record<string, unknown>;
+        getTaskGraphRuntime().addArtifact(taskId, {
+          type: 'video',
+          label: String(record.id || `video-${index + 1}`),
           metadata: { toolName, command: command || '', asset: record },
         });
       });
@@ -2019,7 +2064,9 @@ export class PiChatService {
     })) as AgentTool[];
 
     const executeSkillLoad = async (params: Record<string, unknown>) => {
-      const skillName = typeof params.name === 'string' ? params.name : '';
+      const skillName = typeof params.skill === 'string'
+        ? params.skill
+        : (typeof params.name === 'string' ? params.name : '');
       const activated = skillName ? await this.skillManager.activateSkill(skillName) : null;
 
       if (activated) {
@@ -2042,30 +2089,16 @@ export class PiChatService {
     };
 
     tools.push({
-      name: 'skill',
-      label: 'Load Skill',
-      description: this.skillManager.getSkillToolDescription(),
-      parameters: {
-        type: 'object',
-        properties: {
-          name: { type: 'string' },
-        },
-        required: ['name'],
-        additionalProperties: false,
-      } as any,
-      execute: async (_toolCallId: string, params: Record<string, unknown>) => executeSkillLoad(params),
-    } as AgentTool);
-
-    tools.push({
       name: 'activate_skill',
       label: 'Activate Skill',
       description: 'Legacy alias for the skill tool. Use this only if explicitly needed; prefer `skill`.',
       parameters: {
         type: 'object',
         properties: {
+          skill: { type: 'string' },
           name: { type: 'string' },
         },
-        required: ['name'],
+        anyOf: [{ required: ['skill'] }, { required: ['name'] }],
         additionalProperties: false,
       } as any,
       execute: async (_toolCallId: string, params: Record<string, unknown>) => executeSkillLoad(params),
@@ -2110,6 +2143,10 @@ export class PiChatService {
     return /^image\s+generate\b/i.test(String(command || '').trim());
   }
 
+  private isVideoGenerateCommand(command: string): boolean {
+    return /^video\s+generate\b/i.test(String(command || '').trim());
+  }
+
   private extractGeneratedImagesFromToolResult(result: unknown): GeneratedImagePreview[] {
     const wrapped = result as { details?: ToolResult } | undefined;
     const details = wrapped?.details as (ToolResult & { data?: unknown }) | undefined;
@@ -2143,6 +2180,44 @@ export class PiChatService {
     const gallery = [
       '## 生成图片',
       ...uniqueImages.map((image, index) => `![generated-${index + 1}](${image.previewUrl})`),
+    ].join('\n\n');
+
+    return normalized ? `${normalized}\n\n${gallery}` : gallery;
+  }
+
+  private extractGeneratedVideosFromToolResult(result: unknown): GeneratedVideoPreview[] {
+    const wrapped = result as { details?: ToolResult } | undefined;
+    const details = wrapped?.details as (ToolResult & { data?: unknown }) | undefined;
+    const data = details?.data as {
+      kind?: string;
+      assets?: Array<{ id?: string; previewUrl?: string; prompt?: string }>;
+    } | undefined;
+
+    if (data?.kind !== 'generated-videos' || !Array.isArray(data.assets)) {
+      return [];
+    }
+
+    return data.assets
+      .map((asset) => ({
+        id: String(asset?.id || '').trim(),
+        previewUrl: String(asset?.previewUrl || '').trim(),
+        prompt: typeof asset?.prompt === 'string' ? asset.prompt : undefined,
+      }))
+      .filter((asset) => asset.id && asset.previewUrl);
+  }
+
+  private appendGeneratedVideosMarkdown(content: string, videos: GeneratedVideoPreview[]): string {
+    const normalized = String(content || '').trim();
+    const uniqueVideos = videos.filter((video, index, list) =>
+      list.findIndex((item) => item.id === video.id) === index
+    );
+    if (uniqueVideos.length === 0) {
+      return normalized;
+    }
+
+    const gallery = [
+      '## 生成视频',
+      ...uniqueVideos.map((video, index) => `![generated-video-${index + 1}](${video.previewUrl})`),
     ].join('\n\n');
 
     return normalized ? `${normalized}\n\n${gallery}` : gallery;
@@ -2431,6 +2506,7 @@ export class PiChatService {
   private handleQueryRuntimeEvent(
     event: RuntimeEvent,
     generatedImages: GeneratedImagePreview[],
+    generatedVideos: GeneratedVideoPreview[],
   ): void {
     switch (event.type) {
       case 'thinking':
@@ -2474,6 +2550,11 @@ export class PiChatService {
           const data = (event.result.data || null) as Record<string, unknown> | null;
           if (data?.kind === 'generated-images' && Array.isArray(data.assets)) {
             generatedImages.push(...this.extractGeneratedImagesFromToolResult({
+              details: event.result,
+            }));
+          }
+          if (data?.kind === 'generated-videos' && Array.isArray(data.assets)) {
+            generatedVideos.push(...this.extractGeneratedVideosFromToolResult({
               details: event.result,
             }));
           }
@@ -2793,8 +2874,6 @@ export class PiChatService {
     const workspace = workspacePaths.base;
     const skillsXml = this.skillManager.getSkillsXml();
     const activeSkillContents = this.skillManager.getActiveSkillContents();
-    const mcpServers = getMcpServers().filter((server) => server.enabled);
-
     const promptParts: string[] = [
       renderPrompt(PI_CHAT_SYSTEM_BASE_TEMPLATE, {
         available_tools: this.buildAvailableToolsSummary(),
@@ -2822,18 +2901,13 @@ export class PiChatService {
       }),
     ];
 
-    if (mcpServers.length > 0) {
-      promptParts.push(
-        '',
-        '## 已配置 MCP 数据源（启用）',
-        ...mcpServers.slice(0, 20).map((server) => {
-          if (server.transport === 'stdio') {
-            return `- ${server.id}: ${server.name} [stdio] command=${server.command || '(missing)'}`;
-          }
-          return `- ${server.id}: ${server.name} [${server.transport}] url=${server.url || '(missing)'}`;
-        }),
-        '- 如需使用/检查数据源，优先调用 `app_cli` 的 mcp 子命令。',
-      );
+    const mcpPromptSection = buildMcpPromptSection({
+      maxVisibleServers: 4,
+      maxChars: 1200,
+      includeDiscoveryGuide: true,
+    });
+    if (mcpPromptSection) {
+      promptParts.push('', mcpPromptSection);
     }
 
     if (longTermMemory) {
@@ -2930,6 +3004,8 @@ export class PiChatService {
         '- 当用户提到具体人物、商品、场景、道具、品牌款式时，先查询主体库：`app_cli(command="subjects search --query ...")`，命中后再 `subjects get --id ...` 读取属性和图片路径。',
         '- 如果主体库没有结果，必须明确说未找到，不要自行臆测主体长相、服饰、商品款式或细节。',
         '- 当生图任务存在用户上传参考图、主体库图片、模板图、人物图、商品图时，必须优先使用 `app_cli(command="image generate ...")` 的参考图模式，不要退回纯文生图。',
+        '- 当用户要求生成短视频、动态镜头、运镜片段、首尾帧过渡时，必须优先使用 `app_cli(command="video generate ...")`，不要把视频需求错误降级成静态图片。',
+        '- 视频生成模式选择规则：无参考图时用 `text-to-video`；有 1 张参考图时优先 `reference-guided`；有 2 张参考图且用户强调起止状态、首尾帧、过渡时用 `first-last-frame`。',
         '- 如果已经命中主体库且主体含图片，优先通过 `payload.subjectIds` 或 `referenceImages` 把主体图片传进生图工具。',
         '- 多图参考时，提示词必须明确写出“图1/图2/图3 各自代表什么”，例如：图1是人物主体，图2是商品主体，图3是场景氛围参考。',
         '- 若本轮生图调用有参考图，但工具返回 `referenceImageCount = 0`，不能宣称“已按参考图生成成功”，必须说明参考图没有真正带入。',

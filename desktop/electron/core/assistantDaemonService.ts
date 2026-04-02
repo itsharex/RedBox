@@ -4,6 +4,8 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { app } from 'electron';
+import * as lark from '@larksuiteoapi/node-sdk';
 import { getWorkspacePaths } from '../db';
 import { getBackgroundTaskRegistry } from './backgroundTaskRegistry';
 import { getHeadlessAgentRunner } from './headlessAgentRunner';
@@ -35,8 +37,10 @@ type AssistantDaemonProcessResult = {
 
 type FeishuDaemonConfig = {
   enabled: boolean;
+  receiveMode: 'webhook' | 'websocket';
   endpointPath: string;
   verificationToken?: string;
+  encryptKey?: string;
   appId?: string;
   appSecret?: string;
   replyUsingChatId: boolean;
@@ -53,6 +57,7 @@ type WeixinDaemonConfig = {
   endpointPath: string;
   authToken?: string;
   autoStartSidecar: boolean;
+  cursorFile?: string;
   sidecarCommand?: string;
   sidecarArgs?: string[];
   sidecarCwd?: string;
@@ -70,6 +75,17 @@ type AssistantDaemonConfig = {
   weixin: WeixinDaemonConfig;
 };
 
+export type AssistantDaemonConfigPatch = {
+  enabled?: boolean;
+  autoStart?: boolean;
+  keepAliveWhenNoWindow?: boolean;
+  host?: string;
+  port?: number;
+  feishu?: Partial<FeishuDaemonConfig>;
+  relay?: Partial<RelayDaemonConfig>;
+  weixin?: Partial<WeixinDaemonConfig>;
+};
+
 export type AssistantDaemonStatus = {
   enabled: boolean;
   autoStart: boolean;
@@ -83,7 +99,7 @@ export type AssistantDaemonStatus = {
   activeTaskCount: number;
   queuedPeerCount: number;
   inFlightKeys: string[];
-  feishu: FeishuDaemonConfig & { webhookUrl: string };
+  feishu: FeishuDaemonConfig & { webhookUrl: string; websocketRunning: boolean; websocketReconnectAt?: string | null };
   relay: RelayDaemonConfig & { webhookUrl: string };
   weixin: WeixinDaemonConfig & { webhookUrl: string; sidecarRunning: boolean; sidecarPid?: number };
 };
@@ -96,6 +112,7 @@ const DEFAULT_CONFIG: AssistantDaemonConfig = {
   port: 31937,
   feishu: {
     enabled: false,
+    receiveMode: 'webhook',
     endpointPath: '/hooks/feishu/events',
     replyUsingChatId: true,
   },
@@ -157,10 +174,10 @@ function sanitizeStringRecord(value: unknown): Record<string, string> {
   return next;
 }
 
-function normalizeConfig(input?: Partial<AssistantDaemonConfig> | null): AssistantDaemonConfig {
-  const feishuInput = input?.feishu || {};
-  const relayInput = input?.relay || {};
-  const weixinInput = input?.weixin || {};
+function normalizeConfig(input?: AssistantDaemonConfigPatch | null): AssistantDaemonConfig {
+  const feishuInput: Partial<FeishuDaemonConfig> = input?.feishu || {};
+  const relayInput: Partial<RelayDaemonConfig> = input?.relay || {};
+  const weixinInput: Partial<WeixinDaemonConfig> = input?.weixin || {};
   return {
     enabled: Boolean(input?.enabled),
     autoStart: input?.autoStart === undefined ? DEFAULT_CONFIG.autoStart : Boolean(input.autoStart),
@@ -171,8 +188,10 @@ function normalizeConfig(input?: Partial<AssistantDaemonConfig> | null): Assista
     port: sanitizePort(input?.port),
     feishu: {
       enabled: Boolean(feishuInput.enabled),
+      receiveMode: feishuInput.receiveMode === 'websocket' ? 'websocket' : 'webhook',
       endpointPath: sanitizeEndpointPath(feishuInput.endpointPath, DEFAULT_CONFIG.feishu.endpointPath),
       verificationToken: String(feishuInput.verificationToken || '').trim() || undefined,
+      encryptKey: String(feishuInput.encryptKey || '').trim() || undefined,
       appId: String(feishuInput.appId || '').trim() || undefined,
       appSecret: String(feishuInput.appSecret || '').trim() || undefined,
       replyUsingChatId: feishuInput.replyUsingChatId === undefined
@@ -189,6 +208,7 @@ function normalizeConfig(input?: Partial<AssistantDaemonConfig> | null): Assista
       endpointPath: sanitizeEndpointPath(weixinInput.endpointPath, DEFAULT_CONFIG.weixin.endpointPath),
       authToken: String(weixinInput.authToken || '').trim() || undefined,
       autoStartSidecar: Boolean(weixinInput.autoStartSidecar),
+      cursorFile: String(weixinInput.cursorFile || '').trim() || undefined,
       sidecarCommand: String(weixinInput.sidecarCommand || '').trim() || undefined,
       sidecarArgs: sanitizeStringArray(weixinInput.sidecarArgs),
       sidecarCwd: String(weixinInput.sidecarCwd || '').trim() || undefined,
@@ -197,7 +217,7 @@ function normalizeConfig(input?: Partial<AssistantDaemonConfig> | null): Assista
   };
 }
 
-function mergeConfig(base: AssistantDaemonConfig, patch?: Partial<AssistantDaemonConfig> | null): AssistantDaemonConfig {
+function mergeConfig(base: AssistantDaemonConfig, patch?: AssistantDaemonConfigPatch | null): AssistantDaemonConfig {
   if (!patch) {
     return normalizeConfig(base);
   }
@@ -228,7 +248,7 @@ function extractErrorMessage(error: unknown): string {
   return String(error || 'unknown error');
 }
 
-async function readJsonBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
+async function readRequestBody(req: http.IncomingMessage): Promise<{ raw: string; json: Record<string, unknown> }> {
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const chunk of req) {
@@ -239,14 +259,17 @@ async function readJsonBody(req: http.IncomingMessage): Promise<Record<string, u
     }
     chunks.push(next);
   }
-  if (!chunks.length) return {};
+  if (!chunks.length) return { raw: '', json: {} };
   const raw = Buffer.concat(chunks).toString('utf-8').trim();
-  if (!raw) return {};
+  if (!raw) return { raw: '', json: {} };
   const parsed = JSON.parse(raw) as unknown;
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    return {};
+    return { raw, json: {} };
   }
-  return parsed as Record<string, unknown>;
+  return {
+    raw,
+    json: parsed as Record<string, unknown>,
+  };
 }
 
 function sendJson(res: http.ServerResponse, statusCode: number, payload: Record<string, unknown>): void {
@@ -298,7 +321,9 @@ export class AssistantDaemonService extends EventEmitter {
   private readonly peerQueues = new Map<string, Promise<AssistantDaemonProcessResult>>();
   private readonly inFlightKeys = new Set<string>();
   private readonly recentMessageIds = new Map<string, number>();
-  private feishuTokenCache: { token: string; expiresAtMs: number } | null = null;
+  private feishuClient: lark.Client | null = null;
+  private feishuEventDispatcher: lark.EventDispatcher | null = null;
+  private feishuWsClient: lark.WSClient | null = null;
   private weixinSidecar: ChildProcessWithoutNullStreams | null = null;
 
   private getConfigPath(): string {
@@ -307,6 +332,18 @@ export class AssistantDaemonService extends EventEmitter {
 
   private getLockPath(): string {
     return path.join(getWorkspacePaths().redclaw, 'assistant-daemon.lock');
+  }
+
+  private getWeixinCursorPath(): string {
+    return this.config.weixin.cursorFile
+      || path.join(getWorkspacePaths().redclaw, 'weixin-sidecar.cursor.json');
+  }
+
+  private getWeixinBootstrapScriptPath(): string {
+    if (app.isPackaged) {
+      return path.join(process.resourcesPath, 'app.asar.unpacked', 'scripts', 'start-weixin-sidecar.cjs');
+    }
+    return path.join(app.getAppPath(), 'scripts', 'start-weixin-sidecar.cjs');
   }
 
   async init(): Promise<void> {
@@ -323,8 +360,18 @@ export class AssistantDaemonService extends EventEmitter {
     this.lockState = 'passive';
     this.blockedBy = null;
     this.lastError = null;
-    this.feishuTokenCache = null;
+    this.feishuClient = null;
+    this.feishuEventDispatcher = null;
     await this.init();
+  }
+
+  async dispose(): Promise<void> {
+    await this.stopServerInternals();
+    this.clearLockProbe();
+    this.feishuClient = null;
+    this.feishuEventDispatcher = null;
+    this.lastError = null;
+    this.emitStatus();
   }
 
   async shouldKeepAliveWhenNoWindow(): Promise<boolean> {
@@ -349,6 +396,14 @@ export class AssistantDaemonService extends EventEmitter {
       feishu: {
         ...this.config.feishu,
         webhookUrl: createWebhookUrl(this.config.host, this.config.port, this.config.feishu.endpointPath),
+        websocketRunning: Boolean(this.feishuWsClient),
+        websocketReconnectAt: this.feishuWsClient
+          ? (() => {
+              const info = this.feishuWsClient?.getReconnectInfo();
+              if (!info?.nextConnectTime) return null;
+              return new Date(info.nextConnectTime).toISOString();
+            })()
+          : null,
       },
       relay: {
         ...this.config.relay,
@@ -363,10 +418,12 @@ export class AssistantDaemonService extends EventEmitter {
     };
   }
 
-  async start(input?: Partial<AssistantDaemonConfig>): Promise<AssistantDaemonStatus> {
+  async start(input?: AssistantDaemonConfigPatch): Promise<AssistantDaemonStatus> {
     await this.ensureLoaded();
     this.config = mergeConfig(this.config, input);
     this.config.enabled = true;
+    this.feishuClient = null;
+    this.feishuEventDispatcher = null;
     await this.persistConfig();
     await this.startServerIfNeeded();
     this.emitStatus();
@@ -382,10 +439,12 @@ export class AssistantDaemonService extends EventEmitter {
     return this.getStatus();
   }
 
-  async setConfig(input?: Partial<AssistantDaemonConfig>): Promise<AssistantDaemonStatus> {
+  async setConfig(input?: AssistantDaemonConfigPatch): Promise<AssistantDaemonStatus> {
     await this.ensureLoaded();
     const previousListeningAddress = `${this.config.host}:${this.config.port}`;
     this.config = mergeConfig(this.config, input);
+    this.feishuClient = null;
+    this.feishuEventDispatcher = null;
     await this.persistConfig();
     const nextListeningAddress = `${this.config.host}:${this.config.port}`;
     if (!this.config.enabled) {
@@ -396,6 +455,7 @@ export class AssistantDaemonService extends EventEmitter {
     } else if (this.config.enabled && !this.listening) {
       await this.startServerIfNeeded();
     }
+    await this.syncFeishuTransport();
     await this.syncWeixinSidecar();
     this.emitStatus();
     return this.getStatus();
@@ -409,7 +469,7 @@ export class AssistantDaemonService extends EventEmitter {
   private async loadConfig(): Promise<void> {
     try {
       const raw = await fs.readFile(this.getConfigPath(), 'utf-8');
-      this.config = normalizeConfig(JSON.parse(raw) as Partial<AssistantDaemonConfig>);
+      this.config = normalizeConfig(JSON.parse(raw) as AssistantDaemonConfigPatch);
     } catch {
       this.config = normalizeConfig(DEFAULT_CONFIG);
       await this.persistConfig();
@@ -524,11 +584,83 @@ export class AssistantDaemonService extends EventEmitter {
     return false;
   }
 
+  private getFeishuClient(): lark.Client {
+    if (this.feishuClient) {
+      return this.feishuClient;
+    }
+    if (!this.config.feishu.appId || !this.config.feishu.appSecret) {
+      throw new Error('Feishu appId/appSecret is not configured');
+    }
+    this.feishuClient = new lark.Client({
+      appId: this.config.feishu.appId,
+      appSecret: this.config.feishu.appSecret,
+    });
+    return this.feishuClient;
+  }
+
+  private getFeishuEventDispatcher(): lark.EventDispatcher {
+    if (this.feishuEventDispatcher) {
+      return this.feishuEventDispatcher;
+    }
+    const dispatcher = new lark.EventDispatcher({
+      verificationToken: this.config.feishu.verificationToken,
+      encryptKey: this.config.feishu.encryptKey,
+      loggerLevel: lark.LoggerLevel.warn,
+    }).register({
+      'im.message.receive_v1': async (data: any) => {
+        await this.handleFeishuMessageEvent(data);
+      },
+    });
+    this.feishuEventDispatcher = dispatcher;
+    return dispatcher;
+  }
+
+  private async syncFeishuTransport(): Promise<void> {
+    if (!this.config.enabled || this.lockState !== 'owner') {
+      this.stopFeishuLongConnection();
+      return;
+    }
+    const shouldRunWs = this.config.feishu.enabled
+      && this.config.feishu.receiveMode === 'websocket'
+      && Boolean(this.config.feishu.appId && this.config.feishu.appSecret);
+    if (!shouldRunWs) {
+      this.stopFeishuLongConnection();
+      return;
+    }
+    if (this.feishuWsClient) {
+      return;
+    }
+    const wsClient = new lark.WSClient({
+      appId: this.config.feishu.appId as string,
+      appSecret: this.config.feishu.appSecret as string,
+      loggerLevel: lark.LoggerLevel.warn,
+      autoReconnect: true,
+    });
+    this.feishuWsClient = wsClient;
+    await wsClient.start({
+      eventDispatcher: this.getFeishuEventDispatcher(),
+    });
+    this.emitLog('info', 'Feishu websocket listener started.', {
+      mode: this.config.feishu.receiveMode,
+    });
+  }
+
+  private stopFeishuLongConnection(): void {
+    if (!this.feishuWsClient) return;
+    try {
+      this.feishuWsClient.close({ force: true });
+    } catch {
+      // ignore close failures
+    }
+    this.feishuWsClient = null;
+  }
+
   private async startServerIfNeeded(): Promise<void> {
     if (!this.config.enabled) {
       return;
     }
     if (this.server && this.listening) {
+      await this.syncFeishuTransport();
       await this.syncWeixinSidecar();
       return;
     }
@@ -560,6 +692,7 @@ export class AssistantDaemonService extends EventEmitter {
 
     this.listening = true;
     this.lastError = null;
+    await this.syncFeishuTransport();
     await this.syncWeixinSidecar();
     this.emitLog('info', 'Assistant daemon listening.', {
       host: this.config.host,
@@ -568,6 +701,7 @@ export class AssistantDaemonService extends EventEmitter {
   }
 
   private async stopServerInternals(options?: { preserveEnabledState?: boolean }): Promise<void> {
+    this.stopFeishuLongConnection();
     await this.stopWeixinSidecar();
     if (this.server) {
       const server = this.server;
@@ -587,9 +721,13 @@ export class AssistantDaemonService extends EventEmitter {
       await this.stopWeixinSidecar();
       return;
     }
+    const command = this.config.weixin.sidecarCommand || 'node';
+    const args = this.config.weixin.sidecarArgs?.length
+      ? this.config.weixin.sidecarArgs
+      : [this.getWeixinBootstrapScriptPath()];
     const shouldRun = this.config.weixin.enabled
       && this.config.weixin.autoStartSidecar
-      && Boolean(this.config.weixin.sidecarCommand);
+      && Boolean(command);
     if (!shouldRun) {
       await this.stopWeixinSidecar();
       return;
@@ -602,10 +740,11 @@ export class AssistantDaemonService extends EventEmitter {
       ...process.env,
       REDCONVERT_RELAY_URL: createWebhookUrl(this.config.host, this.config.port, this.config.weixin.endpointPath),
       REDCONVERT_RELAY_TOKEN: this.config.weixin.authToken || this.config.relay.authToken || '',
+      WEIXIN_CLAW_CURSOR_FILE: this.getWeixinCursorPath(),
       ...this.config.weixin.sidecarEnv,
     };
-    const child = spawn(this.config.weixin.sidecarCommand as string, this.config.weixin.sidecarArgs || [], {
-      cwd: this.config.weixin.sidecarCwd || process.cwd(),
+    const child = spawn(command, args, {
+      cwd: this.config.weixin.sidecarCwd || path.dirname(this.getWeixinBootstrapScriptPath()),
       env,
       stdio: 'pipe',
     });
@@ -629,8 +768,8 @@ export class AssistantDaemonService extends EventEmitter {
     });
     this.emitLog('info', 'Started weixin sidecar process.', {
       pid: child.pid,
-      command: this.config.weixin.sidecarCommand,
-      args: this.config.weixin.sidecarArgs || [],
+      command,
+      args,
     });
   }
 
@@ -669,20 +808,20 @@ export class AssistantDaemonService extends EventEmitter {
       }
 
       if (url.pathname === this.config.feishu.endpointPath && this.config.feishu.enabled) {
-        const body = await readJsonBody(req);
-        await this.handleFeishuEvent(body, res);
+        const body = await readRequestBody(req);
+        await this.handleFeishuEvent(body, req, res);
         return;
       }
 
       if (url.pathname === this.config.relay.endpointPath && this.config.relay.enabled) {
-        const body = await readJsonBody(req);
-        await this.handleRelayIngress(body, res, 'relay');
+        const body = await readRequestBody(req);
+        await this.handleRelayIngress(body.json, res, 'relay');
         return;
       }
 
       if (url.pathname === this.config.weixin.endpointPath && this.config.weixin.enabled) {
-        const body = await readJsonBody(req);
-        await this.handleRelayIngress(body, res, 'weixin');
+        const body = await readRequestBody(req);
+        await this.handleRelayIngress(body.json, res, 'weixin');
         return;
       }
 
@@ -698,83 +837,22 @@ export class AssistantDaemonService extends EventEmitter {
     }
   }
 
-  private async handleFeishuEvent(body: Record<string, unknown>, res: http.ServerResponse): Promise<void> {
-    const challenge = String(body.challenge || '').trim();
-    if (challenge) {
-      sendJson(res, 200, { challenge });
-      return;
-    }
-
-    const expectedToken = this.config.feishu.verificationToken;
-    const bodyToken = String(body.token || '').trim();
-    if (expectedToken && bodyToken !== expectedToken) {
-      sendJson(res, 403, { success: false, error: 'Invalid Feishu verification token' });
-      return;
-    }
-
-    const event = (body.event && typeof body.event === 'object' && !Array.isArray(body.event))
-      ? body.event as Record<string, unknown>
-      : {};
-    const header = (body.header && typeof body.header === 'object' && !Array.isArray(body.header))
-      ? body.header as Record<string, unknown>
-      : {};
-    const eventType = String(header.event_type || body.type || '').trim();
-    if (eventType !== 'im.message.receive_v1') {
-      sendJson(res, 200, { success: true, ignored: true, eventType });
-      return;
-    }
-
-    const message = (event.message && typeof event.message === 'object' && !Array.isArray(event.message))
-      ? event.message as Record<string, unknown>
-      : {};
-    const sender = (event.sender && typeof event.sender === 'object' && !Array.isArray(event.sender))
-      ? event.sender as Record<string, unknown>
-      : {};
-    const senderId = (sender.sender_id && typeof sender.sender_id === 'object' && !Array.isArray(sender.sender_id))
-      ? sender.sender_id as Record<string, unknown>
-      : {};
-    const messageType = String(message.message_type || '').trim();
-    const text = parseFeishuTextContent(message.content);
-    const messageId = String(message.message_id || '').trim() || undefined;
-    if (messageType !== 'text' || !text) {
-      sendJson(res, 200, { success: true, ignored: true, reason: 'unsupported-message' });
-      return;
-    }
-    if (this.isDuplicateMessage('feishu', messageId)) {
-      sendJson(res, 200, { success: true, ignored: true, reason: 'duplicate' });
-      return;
-    }
-
-    const inbound: AssistantDaemonIngressMessage = {
-      provider: 'feishu',
-      peerId: String(message.chat_id || senderId.open_id || senderId.user_id || 'feishu-chat').trim(),
-      userId: String(senderId.user_id || senderId.open_id || '').trim() || undefined,
-      userName: String((sender as Record<string, unknown>).sender_type || '').trim() || undefined,
-      messageId,
-      text,
-      waitForReply: false,
-      metadata: {
-        chatId: String(message.chat_id || '').trim() || undefined,
-        messageId,
-      },
-    };
-
-    sendJson(res, 200, { success: true, accepted: true });
-    void this.enqueueInboundMessage(inbound).then(async (result) => {
-      try {
-        await this.sendFeishuReply(inbound, result.response);
-      } catch (error) {
-        const messageText = extractErrorMessage(error);
-        this.emitLog('error', 'Failed to send Feishu reply.', {
-          error: messageText,
-          chatId: inbound.metadata?.chatId,
-        });
-      }
-    }).catch((error) => {
-      this.emitLog('error', 'Failed to process Feishu inbound message.', {
-        error: extractErrorMessage(error),
-      });
+  private async handleFeishuEvent(
+    body: { raw: string; json: Record<string, unknown> },
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+  ): Promise<void> {
+    const challenge = lark.generateChallenge(body.json, {
+      encryptKey: this.config.feishu.encryptKey || '',
     });
+    if (challenge.isChallenge) {
+      sendJson(res, 200, challenge.challenge);
+      return;
+    }
+
+    const assigned = Object.assign(Object.create({ headers: req.headers }), body.json);
+    await this.getFeishuEventDispatcher().invoke(assigned);
+    sendJson(res, 200, { success: true, accepted: true });
   }
 
   private resolveRelayAuthToken(provider: 'relay' | 'weixin'): string | undefined {
@@ -913,67 +991,84 @@ export class AssistantDaemonService extends EventEmitter {
     }
   }
 
-  private async getFeishuTenantAccessToken(): Promise<string> {
-    if (!this.config.feishu.appId || !this.config.feishu.appSecret) {
-      throw new Error('Feishu appId/appSecret is not configured');
+  private async handleFeishuMessageEvent(data: any): Promise<void> {
+    const message = (data?.message && typeof data.message === 'object') ? data.message as Record<string, unknown> : {};
+    const sender = (data?.sender && typeof data.sender === 'object') ? data.sender as Record<string, unknown> : {};
+    const senderId = (sender.sender_id && typeof sender.sender_id === 'object')
+      ? sender.sender_id as Record<string, unknown>
+      : {};
+    const messageType = String(message.message_type || '').trim();
+    const text = parseFeishuTextContent(message.content);
+    const messageId = String(message.message_id || '').trim() || undefined;
+    if (messageType !== 'text' || !text) {
+      return;
     }
-    const now = Date.now();
-    if (this.feishuTokenCache && this.feishuTokenCache.expiresAtMs - 60_000 > now) {
-      return this.feishuTokenCache.token;
+    if (this.isDuplicateMessage('feishu', messageId)) {
+      return;
     }
 
-    const response = await fetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
+    const inbound: AssistantDaemonIngressMessage = {
+      provider: 'feishu',
+      peerId: String(message.chat_id || senderId.open_id || senderId.user_id || 'feishu-chat').trim(),
+      userId: String(senderId.user_id || senderId.open_id || '').trim() || undefined,
+      userName: String(sender.name || sender.sender_type || '').trim() || undefined,
+      messageId,
+      text,
+      waitForReply: false,
+      metadata: {
+        chatId: String(message.chat_id || '').trim() || undefined,
+        openId: String(senderId.open_id || '').trim() || undefined,
+        userId: String(senderId.user_id || '').trim() || undefined,
+        messageId,
       },
-      body: JSON.stringify({
-        app_id: this.config.feishu.appId,
-        app_secret: this.config.feishu.appSecret,
-      }),
-    });
-    const payload = await response.json() as Record<string, unknown>;
-    if (!response.ok || Number(payload.code || 0) !== 0) {
-      throw new Error(`Feishu token request failed: ${String(payload.msg || response.statusText || 'unknown')}`);
-    }
-    const token = String(payload.tenant_access_token || '').trim();
-    const expire = Number(payload.expire || 0);
-    if (!token) {
-      throw new Error('Feishu tenant_access_token is empty');
-    }
-    this.feishuTokenCache = {
-      token,
-      expiresAtMs: Date.now() + Math.max(300, expire) * 1000,
     };
-    return token;
+
+    void this.enqueueInboundMessage(inbound).then(async (result) => {
+      try {
+        await this.sendFeishuReply(inbound, result.response);
+      } catch (error) {
+        const messageText = extractErrorMessage(error);
+        this.emitLog('error', 'Failed to send Feishu reply.', {
+          error: messageText,
+          chatId: inbound.metadata?.chatId,
+        });
+      }
+    }).catch((error) => {
+      this.emitLog('error', 'Failed to process Feishu inbound message.', {
+        error: extractErrorMessage(error),
+      });
+    });
   }
 
   private async sendFeishuReply(message: AssistantDaemonIngressMessage, responseText: string): Promise<void> {
     const chatId = String(message.metadata?.chatId || '').trim();
-    if (!chatId) {
-      throw new Error('Feishu chatId is missing');
+    const openId = String(message.metadata?.openId || '').trim();
+    const userId = String(message.metadata?.userId || '').trim();
+    const receiveIdType = this.config.feishu.replyUsingChatId
+      ? 'chat_id'
+      : (openId ? 'open_id' : (userId ? 'user_id' : 'chat_id'));
+    const receiveId = receiveIdType === 'open_id'
+      ? openId
+      : receiveIdType === 'user_id'
+        ? userId
+        : chatId;
+    if (!receiveId) {
+      throw new Error('Feishu receive_id is missing');
     }
-    const token = await this.getFeishuTenantAccessToken();
-    const body = {
-      receive_id: chatId,
-      msg_type: 'text',
-      content: JSON.stringify({
-        text: responseText,
-      }),
-      uuid: randomUUID(),
-    };
-    const response = await fetch('https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
+    const client = this.getFeishuClient();
+    await client.im.v1.message.create({
+      params: {
+        receive_id_type: receiveIdType,
       },
-      body: JSON.stringify(body),
+      data: {
+        receive_id: receiveId,
+        msg_type: 'text',
+        content: JSON.stringify({
+          text: responseText,
+        }),
+        uuid: randomUUID(),
+      },
     });
-    const payload = await response.json().catch(() => ({})) as Record<string, unknown>;
-    if (!response.ok || Number(payload.code || 0) !== 0) {
-      throw new Error(`Feishu send message failed: ${String(payload.msg || response.statusText || 'unknown')}`);
-    }
   }
 }
 

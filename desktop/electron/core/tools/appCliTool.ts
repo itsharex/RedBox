@@ -68,6 +68,7 @@ import {
     searchSubjects,
 } from '../subjectsLibraryStore';
 import { generateImagesToMediaLibrary } from '../imageGenerationService';
+import { generateVideosToMediaLibrary } from '../videoGenerationService';
 import { SkillManager } from '../skillManager';
 import {
     getMcpServers,
@@ -108,6 +109,26 @@ interface GeneratedImageCliResult {
     aspectRatio?: string;
     size: string;
     quality: string;
+    count: number;
+    assets: Array<{
+        id: string;
+        projectId?: string;
+        relativePath?: string;
+        absolutePath?: string | null;
+        previewUrl?: string | null;
+        prompt?: string;
+        createdAt: string;
+    }>;
+}
+
+interface GeneratedVideoCliResult {
+    provider: string;
+    model: string;
+    generationMode?: 'text-to-video' | 'reference-guided' | 'first-last-frame';
+    referenceImageCount?: number;
+    aspectRatio?: string;
+    resolution: '720p' | '1080p';
+    durationSeconds: number;
     count: number;
     assets: Array<{
         id: string;
@@ -307,7 +328,6 @@ function helpText(): string {
         '- knowledge list --source redbook',
         '- advisors list',
         '- manuscripts read --path "redclaw/xxx.md"',
-        '- manuscripts organize --dry-run true',
         '- manuscripts write --path "redclaw/xxx.md" --content "...markdown..."',
         '- redclaw create --goal "做一条民宿选题"',
         '- subjects search --query "张三 Z001 跑鞋"',
@@ -328,6 +348,9 @@ function helpText(): string {
         '- media list --limit 100',
         '- media bind --asset-id media_xxx --manuscript-path "redclaw/rc_xxx.md"',
         '- image generate --prompt "..." --project-id rc_xxx --count 2',
+        '- video generate --prompt "海边日落镜头" --mode text-to-video --duration 8',
+        '- video generate --prompt "让主体做一个推镜短视频" --mode reference-guided --reference-images "/abs/a.jpg"',
+        '- video generate --prompt "从白天切到夜晚" --mode first-last-frame --reference-images "/abs/first.jpg,/abs/last.jpg"',
         '- mcp list',
         '- mcp import-local',
         '- mcp tools --id filesystem',
@@ -457,6 +480,37 @@ export class AppCliTool extends DeclarativeTool<typeof AppCliParamsSchema> {
                     },
                 };
             }
+            if (parsed.namespace === 'video' && parsed.action === 'generate') {
+                const videoResult = result as GeneratedVideoCliResult;
+                const lines = [
+                    `Generated ${videoResult.count} video(s).`,
+                    `provider=${videoResult.provider} model=${videoResult.model}`,
+                ];
+                if (videoResult.generationMode) {
+                    lines.push(`mode=${videoResult.generationMode}`);
+                }
+                if (videoResult.aspectRatio) {
+                    lines.push(`aspectRatio=${videoResult.aspectRatio}`);
+                }
+                lines.push(`resolution=${videoResult.resolution}`);
+                lines.push(`duration=${videoResult.durationSeconds}s`);
+                if (videoResult.assets.length > 0) {
+                    lines.push(
+                        ...videoResult.assets.map((asset, index) =>
+                            `${index + 1}. ${asset.id}${asset.previewUrl ? ` -> ${asset.previewUrl}` : ''}`
+                        )
+                    );
+                }
+                return {
+                    success: true,
+                    llmContent: lines.join('\n'),
+                    display: 'video generate',
+                    data: {
+                        kind: 'generated-videos',
+                        ...videoResult,
+                    },
+                };
+            }
             if (parsed.namespace === 'manuscripts' && (parsed.action === 'write' || parsed.action === 'create')) {
                 const info = result as {
                     success?: boolean;
@@ -516,6 +570,8 @@ export class AppCliTool extends DeclarativeTool<typeof AppCliParamsSchema> {
                 return this.handleSubjects(parsed, payload);
             case 'image':
                 return this.handleImage(parsed, payload);
+            case 'video':
+                return this.handleVideo(parsed, payload);
             case 'mcp':
                 return this.handleMcp(parsed, payload);
             case 'settings':
@@ -1337,6 +1393,61 @@ export class AppCliTool extends DeclarativeTool<typeof AppCliParamsSchema> {
                 createdAt: asset.createdAt,
             })),
         } satisfies GeneratedImageCliResult;
+    }
+
+    private async handleVideo(parsed: ParsedCommand, payload: Record<string, unknown>) {
+        if (parsed.action !== 'generate') {
+            throw new Error(`Unsupported video action: ${parsed.action}`);
+        }
+        const prompt = requireString(readFlag(parsed.flags, 'prompt') || payload.prompt, 'prompt');
+        const generationModeRaw = readFlag(parsed.flags, 'mode', 'generation-mode') || payload.generationMode;
+        const generationMode = (() => {
+            const normalized = String(generationModeRaw || '').trim().toLowerCase();
+            if (normalized === 'reference-guided' || normalized === 'first-last-frame' || normalized === 'text-to-video') {
+                return normalized as 'reference-guided' | 'first-last-frame' | 'text-to-video';
+            }
+            return undefined;
+        })();
+        const referenceImagesRaw = readFlag(parsed.flags, 'reference-images', 'refs') || payload.referenceImages;
+        const directReferenceImages = Array.isArray(referenceImagesRaw)
+            ? referenceImagesRaw.map((item) => String(item || '').trim()).filter(Boolean).slice(0, 2)
+            : String(referenceImagesRaw || '')
+                .split(',')
+                .map((item) => item.trim())
+                .filter(Boolean)
+                .slice(0, 2);
+        const result = await generateVideosToMediaLibrary({
+            prompt,
+            projectId: readFlag(parsed.flags, 'project-id') || (payload.projectId as string | undefined),
+            title: readFlag(parsed.flags, 'title') || (payload.title as string | undefined),
+            generationMode,
+            referenceImages: directReferenceImages,
+            count: parseNumber(readFlag(parsed.flags, 'count') || payload.count),
+            model: readFlag(parsed.flags, 'model') || (payload.model as string | undefined),
+            aspectRatio: readFlag(parsed.flags, 'ratio', 'aspect-ratio') || (payload.aspectRatio as string | undefined),
+            resolution: (readFlag(parsed.flags, 'resolution', 'size') || payload.resolution) as '720p' | '1080p' | undefined,
+            durationSeconds: parseNumber(readFlag(parsed.flags, 'duration', 'seconds') || payload.durationSeconds || payload.seconds),
+            generateAudio: parseBoolean(readFlag(parsed.flags, 'audio', 'generate-audio') || payload.generateAudio),
+        });
+        return {
+            provider: result.provider,
+            model: result.model,
+            generationMode,
+            referenceImageCount: directReferenceImages.length,
+            aspectRatio: result.aspectRatio,
+            resolution: result.resolution,
+            durationSeconds: result.durationSeconds,
+            count: result.assets.length,
+            assets: result.assets.map((asset) => ({
+                id: asset.id,
+                projectId: asset.projectId,
+                relativePath: asset.relativePath,
+                absolutePath: asset.relativePath ? getAbsoluteMediaPath(asset.relativePath) : null,
+                previewUrl: asset.relativePath ? toAppAssetUrl(getAbsoluteMediaPath(asset.relativePath)) : null,
+                prompt: asset.prompt,
+                createdAt: asset.createdAt,
+            })),
+        } satisfies GeneratedVideoCliResult;
     }
 
     private async handleMcp(parsed: ParsedCommand, payload: Record<string, unknown>) {

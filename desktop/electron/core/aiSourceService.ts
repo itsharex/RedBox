@@ -1,4 +1,9 @@
 import { normalizeApiBaseUrl, safeUrlJoin } from './urlUtils';
+import {
+  hasModelCapability,
+  inferModelCapabilities,
+  type ModelCapability,
+} from '../../shared/modelCapabilities';
 
 export type AiProtocol = 'openai' | 'anthropic' | 'gemini';
 
@@ -12,6 +17,7 @@ export interface AiSourceConnectionInput {
 
 export interface AiModelInfo {
   id: string;
+  capabilities?: ModelCapability[];
 }
 
 export interface AiConnectionTestResult {
@@ -104,7 +110,7 @@ const normalizeGeminiNativeBaseUrl = (baseURL: string): string => {
 };
 
 const toModelInfoList = (modelIds: string[]): AiModelInfo[] => {
-  return modelIds.map((id) => ({ id }));
+  return modelIds.map((id) => ({ id, capabilities: inferModelCapabilities(id) }));
 };
 
 const dedupeModelIds = (modelIds: string[]): string[] => {
@@ -114,7 +120,7 @@ const dedupeModelIds = (modelIds: string[]): string[] => {
 const isLikelyImageModelId = (modelId: string): boolean => {
   const normalized = String(modelId || '').trim().toLowerCase();
   if (!normalized) return false;
-  return IMAGE_MODEL_KEYWORDS.some((keyword) => normalized.includes(keyword));
+  return hasModelCapability(modelId, 'image') || IMAGE_MODEL_KEYWORDS.some((keyword) => normalized.includes(keyword));
 };
 
 const filterImageModels = (models: AiModelInfo[]): AiModelInfo[] => {

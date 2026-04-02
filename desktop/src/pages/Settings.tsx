@@ -35,9 +35,12 @@ import {
   DASHSCOPE_LOCKED_IMAGE_MODEL,
   IMAGE_ASPECT_RATIO_OPTIONS,
   PasswordInput,
+  type AiModelDescriptor,
   createAiSourceDraftFromPreset,
+  buildModelCapabilityBadges,
   createAiSourceFromPreset,
   createDefaultMcpServer,
+  filterAiModelsByCapability,
   generateAiSourceId,
   inferImageTemplateByProvider,
   isImageTemplateRemoteModelFetchEnabled,
@@ -51,7 +54,9 @@ import {
   resolveImageModelFetchPresetId,
   resolveImageModelFetchProtocol,
   stringifyEnvRecord,
+  toAiModelDescriptor,
 } from './settings/shared';
+import { type ModelCapability } from '../../shared/modelCapabilities';
 import { hasOfficialAiPanel, loadOfficialAiPanelModule, type OfficialAiPanelProps } from '../features/official';
 import {
   ExperimentalSettingsSection,
@@ -67,6 +72,113 @@ const DEFAULT_CHAT_MAX_TOKENS = 262144;
 const DEFAULT_CHAT_MAX_TOKENS_DEEPSEEK = 131072;
 const DEVELOPER_MODE_UNLOCK_TAP_COUNT = 7;
 const DEVELOPER_MODE_TTL_MS = 24 * 60 * 60 * 1000;
+
+type AssistantDaemonStatus = Awaited<ReturnType<typeof window.ipcRenderer.assistantDaemon.getStatus>>;
+
+type AssistantDaemonDraft = {
+  enabled: boolean;
+  autoStart: boolean;
+  keepAliveWhenNoWindow: boolean;
+  host: string;
+  port: string;
+  feishu: {
+    enabled: boolean;
+    receiveMode: 'webhook' | 'websocket';
+    endpointPath: string;
+    verificationToken: string;
+    encryptKey: string;
+    appId: string;
+    appSecret: string;
+    replyUsingChatId: boolean;
+  };
+  relay: {
+    enabled: boolean;
+    endpointPath: string;
+    authToken: string;
+  };
+  weixin: {
+    enabled: boolean;
+    endpointPath: string;
+    authToken: string;
+    autoStartSidecar: boolean;
+    cursorFile: string;
+    sidecarCommand: string;
+    sidecarArgs: string;
+    sidecarCwd: string;
+    sidecarEnvText: string;
+  };
+};
+
+const createDefaultAssistantDaemonDraft = (): AssistantDaemonDraft => ({
+  enabled: false,
+  autoStart: true,
+  keepAliveWhenNoWindow: true,
+  host: '127.0.0.1',
+  port: '31937',
+  feishu: {
+    enabled: false,
+    receiveMode: 'webhook',
+    endpointPath: '/hooks/feishu/events',
+    verificationToken: '',
+    encryptKey: '',
+    appId: '',
+    appSecret: '',
+    replyUsingChatId: true,
+  },
+  relay: {
+    enabled: true,
+    endpointPath: '/hooks/channel/relay',
+    authToken: '',
+  },
+  weixin: {
+    enabled: false,
+    endpointPath: '/hooks/weixin/relay',
+    authToken: '',
+    autoStartSidecar: false,
+    cursorFile: '',
+    sidecarCommand: '',
+    sidecarArgs: '',
+    sidecarCwd: '',
+    sidecarEnvText: '',
+  },
+});
+
+const assistantDaemonStatusToDraft = (status?: AssistantDaemonStatus | null): AssistantDaemonDraft => {
+  if (!status) return createDefaultAssistantDaemonDraft();
+  return {
+    enabled: Boolean(status.enabled),
+    autoStart: Boolean(status.autoStart),
+    keepAliveWhenNoWindow: Boolean(status.keepAliveWhenNoWindow),
+    host: String(status.host || '127.0.0.1'),
+    port: String(status.port || 31937),
+    feishu: {
+      enabled: Boolean(status.feishu?.enabled),
+      receiveMode: status.feishu?.receiveMode === 'websocket' ? 'websocket' : 'webhook',
+      endpointPath: String(status.feishu?.endpointPath || '/hooks/feishu/events'),
+      verificationToken: String(status.feishu?.verificationToken || ''),
+      encryptKey: String(status.feishu?.encryptKey || ''),
+      appId: String(status.feishu?.appId || ''),
+      appSecret: String(status.feishu?.appSecret || ''),
+      replyUsingChatId: status.feishu?.replyUsingChatId !== false,
+    },
+    relay: {
+      enabled: status.relay?.enabled !== false,
+      endpointPath: String(status.relay?.endpointPath || '/hooks/channel/relay'),
+      authToken: String(status.relay?.authToken || ''),
+    },
+    weixin: {
+      enabled: Boolean(status.weixin?.enabled),
+      endpointPath: String(status.weixin?.endpointPath || '/hooks/weixin/relay'),
+      authToken: String(status.weixin?.authToken || ''),
+      autoStartSidecar: Boolean(status.weixin?.autoStartSidecar),
+      cursorFile: String(status.weixin?.cursorFile || ''),
+      sidecarCommand: String(status.weixin?.sidecarCommand || ''),
+      sidecarArgs: Array.isArray(status.weixin?.sidecarArgs) ? status.weixin.sidecarArgs.join(' ') : '',
+      sidecarCwd: String(status.weixin?.sidecarCwd || ''),
+      sidecarEnvText: stringifyEnvRecord(status.weixin?.sidecarEnv || {}),
+    },
+  };
+};
 
 type RuntimeSessionListItem = {
   id: string;
@@ -150,6 +262,9 @@ export function Settings() {
     image_endpoint: '',
     image_api_key: '',
     image_model: 'gpt-image-1',
+    video_endpoint: '',
+    video_api_key: '',
+    video_model: '',
     image_provider_template: 'openai-images',
     image_aspect_ratio: '3:4',
     image_size: '',
@@ -158,6 +273,9 @@ export function Settings() {
     model_name_chatroom: '',
     model_name_knowledge: '',
     model_name_redclaw: '',
+    search_provider: 'duckduckgo',
+    search_endpoint: '',
+    search_api_key: '',
     redclaw_compact_target_tokens: '256000',
     chat_max_tokens_default: String(DEFAULT_CHAT_MAX_TOKENS),
     chat_max_tokens_deepseek: String(DEFAULT_CHAT_MAX_TOKENS_DEEPSEEK),
@@ -179,8 +297,9 @@ export function Settings() {
   const [transcriptionSourceId, setTranscriptionSourceId] = useState('');
   const [embeddingSourceId, setEmbeddingSourceId] = useState('');
   const [imageSourceId, setImageSourceId] = useState('');
+  const [videoSourceId, setVideoSourceId] = useState('');
 
-  const [modelsBySource, setModelsBySource] = useState<Record<string, Array<{ id: string }>>>({});
+  const [modelsBySource, setModelsBySource] = useState<Record<string, AiModelDescriptor[]>>({});
   const [isTesting, setIsTesting] = useState(false);
   const [testStatus, setTestStatus] = useState<'idle' | 'success' | 'error'>('idle');
   const [testMsg, setTestMsg] = useState('');
@@ -215,6 +334,10 @@ export function Settings() {
   const [runtimeTaskActionRunning, setRuntimeTaskActionRunning] = useState<Record<string, 'resume' | 'cancel' | undefined>>({});
   const [backgroundTaskActionRunning, setBackgroundTaskActionRunning] = useState<Record<string, 'cancel' | undefined>>({});
   const [status, setStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  const [assistantDaemonStatus, setAssistantDaemonStatus] = useState<AssistantDaemonStatus | null>(null);
+  const [assistantDaemonDraft, setAssistantDaemonDraft] = useState<AssistantDaemonDraft>(() => createDefaultAssistantDaemonDraft());
+  const [assistantDaemonLogs, setAssistantDaemonLogs] = useState<string[]>([]);
+  const [assistantDaemonBusy, setAssistantDaemonBusy] = useState(false);
   const [showScopedModelOverrides, setShowScopedModelOverrides] = useState(false);
   const [developerVersionTapCount, setDeveloperVersionTapCount] = useState(0);
   const fetchModelsRequestRef = useRef(0);
@@ -240,11 +363,23 @@ export function Settings() {
   }, [modelsBySource]);
 
   const getSourceModelList = useCallback((source: AiSourceConfig) => {
-    return normalizeSourceModels([
-      ...(source.models || []),
-      source.model,
-    ]);
-  }, []);
+    const merged = new Map<string, AiModelDescriptor>();
+    for (const raw of [...(source.models || []), source.model]) {
+      const descriptor = toAiModelDescriptor(raw);
+      if (!descriptor) continue;
+      merged.set(descriptor.id, descriptor);
+    }
+    for (const remoteModel of (modelsBySource[source.id] || [])) {
+      const descriptor = toAiModelDescriptor(remoteModel);
+      if (!descriptor) continue;
+      const previous = merged.get(descriptor.id);
+      merged.set(descriptor.id, {
+        id: descriptor.id,
+        capabilities: Array.from(new Set([...(previous?.capabilities || []), ...descriptor.capabilities])),
+      });
+    }
+    return Array.from(merged.values());
+  }, [modelsBySource]);
 
   const getAiSourceById = useCallback((sourceId: string): AiSourceConfig | null => {
     const normalizedSourceId = String(sourceId || '').trim();
@@ -252,14 +387,23 @@ export function Settings() {
     return aiSources.find((source) => source.id === normalizedSourceId) || null;
   }, [aiSources]);
 
-  const pickBestModelForSource = useCallback((source: AiSourceConfig | null, preferredModel?: string): string => {
+  const pickBestModelForSource = useCallback((
+    source: AiSourceConfig | null,
+    preferredModel?: string,
+    capability: ModelCapability = 'chat',
+  ): string => {
     if (!source) return '';
     const normalizedPreferredModel = String(preferredModel || '').trim();
     const sourceModels = getSourceModelList(source);
-    if (normalizedPreferredModel && sourceModels.includes(normalizedPreferredModel)) {
+    const matchingModels = filterAiModelsByCapability(sourceModels, capability);
+    if (normalizedPreferredModel && matchingModels.some((item) => item.id === normalizedPreferredModel)) {
       return normalizedPreferredModel;
     }
-    return String(source.model || sourceModels[0] || '').trim();
+    const currentDefault = String(source.model || '').trim();
+    if (currentDefault && matchingModels.some((item) => item.id === currentDefault)) {
+      return currentDefault;
+    }
+    return String(matchingModels[0]?.id || currentDefault || sourceModels[0]?.id || '').trim();
   }, [getSourceModelList]);
 
   const resolveLinkedSourceId = useCallback((options: {
@@ -279,7 +423,7 @@ export function Settings() {
       let score = 0;
       const sourceEndpoint = String(source.baseURL || '').trim();
       const sourceApiKey = String(source.apiKey || '').trim();
-      const sourceModels = getSourceModelList(source);
+      const sourceModels = getSourceModelList(source).map((item) => item.id);
       if (normalizedEndpoint && sourceEndpoint === normalizedEndpoint) score += 4;
       if (normalizedApiKey && sourceApiKey && sourceApiKey === normalizedApiKey) score += 2;
       if (normalizedModel && sourceModels.includes(normalizedModel)) score += 1;
@@ -312,13 +456,14 @@ export function Settings() {
     return { provider: 'openai-compatible', template: 'openai-images' };
   }, []);
 
-  const handleLinkedSourceChange = useCallback((feature: 'transcription' | 'embedding' | 'image', nextSourceId: string) => {
+  const handleLinkedSourceChange = useCallback((feature: 'transcription' | 'embedding' | 'image' | 'video', nextSourceId: string) => {
     const source = getAiSourceById(nextSourceId);
     if (!source) return;
 
     if (feature === 'transcription') setTranscriptionSourceId(nextSourceId);
     if (feature === 'embedding') setEmbeddingSourceId(nextSourceId);
     if (feature === 'image') setImageSourceId(nextSourceId);
+    if (feature === 'video') setVideoSourceId(nextSourceId);
 
     setFormData((prev) => {
       if (feature === 'transcription') {
@@ -326,7 +471,7 @@ export function Settings() {
           ...prev,
           transcription_endpoint: String(source.baseURL || '').trim(),
           transcription_key: String(source.apiKey || '').trim(),
-          transcription_model: pickBestModelForSource(source, prev.transcription_model),
+          transcription_model: pickBestModelForSource(source, prev.transcription_model, 'transcription'),
         };
       }
       if (feature === 'embedding') {
@@ -334,7 +479,18 @@ export function Settings() {
           ...prev,
           embedding_endpoint: String(source.baseURL || '').trim(),
           embedding_key: String(source.apiKey || '').trim(),
-          embedding_model: pickBestModelForSource(source, prev.embedding_model),
+          embedding_model: pickBestModelForSource(source, prev.embedding_model, 'embedding'),
+        };
+      }
+      if (feature === 'video') {
+        const nextVideoModels = filterAiModelsByCapability(getSourceModelList(source), 'video');
+        return {
+          ...prev,
+          video_endpoint: String(source.baseURL || '').trim(),
+          video_api_key: String(source.apiKey || '').trim(),
+          video_model: nextVideoModels.some((item) => item.id === String(prev.video_model || '').trim())
+            ? String(prev.video_model || '').trim()
+            : String(nextVideoModels[0]?.id || '').trim(),
         };
       }
 
@@ -342,7 +498,7 @@ export function Settings() {
       const nextTemplate = inferImageTemplateByProvider(nextRouting.provider, nextRouting.template);
       const nextModel = nextTemplate === 'dashscope-wan-native'
         ? DASHSCOPE_LOCKED_IMAGE_MODEL
-        : pickBestModelForSource(source, prev.image_model);
+        : pickBestModelForSource(source, prev.image_model, 'image');
 
       return {
         ...prev,
@@ -357,7 +513,7 @@ export function Settings() {
 
   const defaultSourceModels = useMemo(() => {
     if (!defaultAiSource) return [];
-    return getSourceModelList(defaultAiSource);
+    return filterAiModelsByCapability(getSourceModelList(defaultAiSource), 'chat');
   }, [defaultAiSource, getSourceModelList]);
 
   const selectedTranscriptionSource = useMemo(() => {
@@ -372,23 +528,31 @@ export function Settings() {
     return getAiSourceById(imageSourceId);
   }, [getAiSourceById, imageSourceId]);
 
+  const selectedVideoSource = useMemo(() => {
+    return getAiSourceById(videoSourceId);
+  }, [getAiSourceById, videoSourceId]);
+
   const transcriptionSourceModels = useMemo(() => {
-    return selectedTranscriptionSource ? getSourceModelList(selectedTranscriptionSource) : [];
+    return selectedTranscriptionSource ? filterAiModelsByCapability(getSourceModelList(selectedTranscriptionSource), 'transcription') : [];
   }, [getSourceModelList, selectedTranscriptionSource]);
 
   const embeddingSourceModels = useMemo(() => {
-    return selectedEmbeddingSource ? getSourceModelList(selectedEmbeddingSource) : [];
+    return selectedEmbeddingSource ? filterAiModelsByCapability(getSourceModelList(selectedEmbeddingSource), 'embedding') : [];
   }, [getSourceModelList, selectedEmbeddingSource]);
 
   const imageSourceModels = useMemo(() => {
-    return selectedImageSource ? getSourceModelList(selectedImageSource) : [];
+    return selectedImageSource ? filterAiModelsByCapability(getSourceModelList(selectedImageSource), 'image') : [];
   }, [getSourceModelList, selectedImageSource]);
+
+  const videoSourceModels = useMemo(() => {
+    return selectedVideoSource ? filterAiModelsByCapability(getSourceModelList(selectedVideoSource), 'video') : [];
+  }, [getSourceModelList, selectedVideoSource]);
 
   const allConfiguredModels = useMemo(() => {
     const collected: string[] = [];
     for (const source of aiSources) {
       const models = getSourceModelList(source);
-      collected.push(...models);
+      collected.push(...models.map((item) => item.id));
     }
     return normalizeSourceModels(collected);
   }, [aiSources, getSourceModelList]);
@@ -565,6 +729,7 @@ export function Settings() {
     loadSettings();
     checkTools();
     loadBrowserPluginStatus();
+    loadAssistantDaemonStatus();
     loadVectorStats();
     loadAppVersion();
 
@@ -575,7 +740,32 @@ export function Settings() {
     return () => {
       window.ipcRenderer.off('youtube:install-progress', handleProgress);
     };
-  }, []);
+  }, [loadAssistantDaemonStatus]);
+
+  useEffect(() => {
+    const handleDaemonStatus = (_: unknown, status: AssistantDaemonStatus) => {
+      setAssistantDaemonStatus(status);
+      setAssistantDaemonDraft((prev) => {
+        if (assistantDaemonBusy) return prev;
+        return assistantDaemonStatusToDraft(status);
+      });
+    };
+    const handleDaemonLog = (_: unknown, payload: { at?: string; level?: string; message?: string; details?: Record<string, unknown> }) => {
+      const line = [
+        payload?.at || new Date().toISOString(),
+        payload?.level || 'info',
+        payload?.message || '',
+        payload?.details ? JSON.stringify(payload.details) : '',
+      ].filter(Boolean).join(' | ');
+      setAssistantDaemonLogs((prev) => [line, ...prev].slice(0, 40));
+    };
+    window.ipcRenderer.on('assistant:daemon-status', handleDaemonStatus);
+    window.ipcRenderer.on('assistant:daemon-log', handleDaemonLog);
+    return () => {
+      window.ipcRenderer.off('assistant:daemon-status', handleDaemonStatus);
+      window.ipcRenderer.off('assistant:daemon-log', handleDaemonLog);
+    };
+  }, [assistantDaemonBusy]);
 
   useEffect(() => {
     let memoryPollTimer: number | null = null;
@@ -890,8 +1080,12 @@ export function Settings() {
       });
       if (requestId !== fetchModelsRequestRef.current) return;
 
-      const deduped = Array.from(new Set((models || []).map((item) => String(item.id || '').trim()).filter(Boolean)))
-        .map((id) => ({ id }));
+      const deduped = Array.from(new Map(
+        (models || [])
+          .map((item) => toAiModelDescriptor(item))
+          .filter((item): item is AiModelDescriptor => Boolean(item))
+          .map((item) => [item.id, item]),
+      ).values());
       setModelsBySource((prev) => ({ ...prev, [source.id]: deduped }));
       updateAiSource(source.id, (prev) => {
         const fetchedIds = deduped.map((item) => item.id);
@@ -1129,6 +1323,25 @@ export function Settings() {
     formData.image_endpoint,
     formData.image_api_key,
     formData.image_model,
+    resolveLinkedSourceId,
+  ]);
+
+  useEffect(() => {
+    const nextSourceId = resolveLinkedSourceId({
+      endpoint: formData.video_endpoint || formData.api_endpoint,
+      apiKey: formData.video_api_key || formData.api_key,
+      model: formData.video_model,
+      fallbackId: defaultAiSourceId,
+    });
+    setVideoSourceId((prev) => prev === nextSourceId ? prev : nextSourceId);
+  }, [
+    aiSources,
+    defaultAiSourceId,
+    formData.api_endpoint,
+    formData.api_key,
+    formData.video_endpoint,
+    formData.video_api_key,
+    formData.video_model,
     resolveLinkedSourceId,
   ]);
 
@@ -1701,6 +1914,9 @@ export function Settings() {
             }
             return settings.image_model || 'gpt-image-1';
           })(),
+          video_endpoint: settings.video_endpoint || '',
+          video_api_key: settings.video_api_key || '',
+          video_model: settings.video_model || '',
           image_aspect_ratio: settings.image_aspect_ratio || '3:4',
           image_size: '',
           image_quality: settings.image_quality || 'standard',
@@ -1708,6 +1924,9 @@ export function Settings() {
           model_name_chatroom: settings.model_name_chatroom || '',
           model_name_knowledge: settings.model_name_knowledge || '',
           model_name_redclaw: settings.model_name_redclaw || '',
+          search_provider: settings.search_provider || 'duckduckgo',
+          search_endpoint: settings.search_endpoint || '',
+          search_api_key: settings.search_api_key || '',
           redclaw_compact_target_tokens: String(settings.redclaw_compact_target_tokens || 256000),
           chat_max_tokens_default: sanitizeChatMaxTokensInput(String(settings.chat_max_tokens_default || DEFAULT_CHAT_MAX_TOKENS), DEFAULT_CHAT_MAX_TOKENS),
           chat_max_tokens_deepseek: sanitizeChatMaxTokensInput(String(settings.chat_max_tokens_deepseek || DEFAULT_CHAT_MAX_TOKENS_DEEPSEEK), DEFAULT_CHAT_MAX_TOKENS_DEEPSEEK),
@@ -1783,6 +2002,94 @@ export function Settings() {
       });
     }
   };
+
+  async function loadAssistantDaemonStatus() {
+    try {
+      const status = await window.ipcRenderer.assistantDaemon.getStatus();
+      setAssistantDaemonStatus(status);
+      setAssistantDaemonDraft(assistantDaemonStatusToDraft(status));
+    } catch (error) {
+      console.error('Failed to load assistant daemon status', error);
+    }
+  }
+
+  const buildAssistantDaemonPayload = useCallback(() => ({
+    enabled: assistantDaemonDraft.enabled,
+    autoStart: assistantDaemonDraft.autoStart,
+    keepAliveWhenNoWindow: assistantDaemonDraft.keepAliveWhenNoWindow,
+    host: String(assistantDaemonDraft.host || '').trim(),
+    port: Number(assistantDaemonDraft.port || 0) || undefined,
+    feishu: {
+      enabled: assistantDaemonDraft.feishu.enabled,
+      receiveMode: assistantDaemonDraft.feishu.receiveMode,
+      endpointPath: String(assistantDaemonDraft.feishu.endpointPath || '').trim(),
+      verificationToken: String(assistantDaemonDraft.feishu.verificationToken || '').trim() || undefined,
+      encryptKey: String(assistantDaemonDraft.feishu.encryptKey || '').trim() || undefined,
+      appId: String(assistantDaemonDraft.feishu.appId || '').trim() || undefined,
+      appSecret: String(assistantDaemonDraft.feishu.appSecret || '').trim() || undefined,
+      replyUsingChatId: assistantDaemonDraft.feishu.replyUsingChatId,
+    },
+    relay: {
+      enabled: assistantDaemonDraft.relay.enabled,
+      endpointPath: String(assistantDaemonDraft.relay.endpointPath || '').trim(),
+      authToken: String(assistantDaemonDraft.relay.authToken || '').trim() || undefined,
+    },
+    weixin: {
+      enabled: assistantDaemonDraft.weixin.enabled,
+      endpointPath: String(assistantDaemonDraft.weixin.endpointPath || '').trim(),
+      authToken: String(assistantDaemonDraft.weixin.authToken || '').trim() || undefined,
+      autoStartSidecar: assistantDaemonDraft.weixin.autoStartSidecar,
+      cursorFile: String(assistantDaemonDraft.weixin.cursorFile || '').trim() || undefined,
+      sidecarCommand: String(assistantDaemonDraft.weixin.sidecarCommand || '').trim() || undefined,
+      sidecarArgs: String(assistantDaemonDraft.weixin.sidecarArgs || '').trim()
+        ? String(assistantDaemonDraft.weixin.sidecarArgs || '').trim().split(/\s+/)
+        : undefined,
+      sidecarCwd: String(assistantDaemonDraft.weixin.sidecarCwd || '').trim() || undefined,
+      sidecarEnv: parseEnvText(assistantDaemonDraft.weixin.sidecarEnvText || ''),
+    },
+  }), [assistantDaemonDraft]);
+
+  const handleSaveAssistantDaemonConfig = useCallback(async () => {
+    setAssistantDaemonBusy(true);
+    try {
+      const status = await window.ipcRenderer.assistantDaemon.setConfig(buildAssistantDaemonPayload()) as AssistantDaemonStatus;
+      setAssistantDaemonStatus(status);
+      setAssistantDaemonDraft(assistantDaemonStatusToDraft(status));
+    } catch (error) {
+      console.error('Failed to save assistant daemon config', error);
+      window.alert(`保存后台通信配置失败：${String(error)}`);
+    } finally {
+      setAssistantDaemonBusy(false);
+    }
+  }, [buildAssistantDaemonPayload]);
+
+  const handleStartAssistantDaemon = useCallback(async () => {
+    setAssistantDaemonBusy(true);
+    try {
+      const status = await window.ipcRenderer.assistantDaemon.start(buildAssistantDaemonPayload()) as AssistantDaemonStatus;
+      setAssistantDaemonStatus(status);
+      setAssistantDaemonDraft(assistantDaemonStatusToDraft(status));
+    } catch (error) {
+      console.error('Failed to start assistant daemon', error);
+      window.alert(`启动后台值守失败：${String(error)}`);
+    } finally {
+      setAssistantDaemonBusy(false);
+    }
+  }, [buildAssistantDaemonPayload]);
+
+  const handleStopAssistantDaemon = useCallback(async () => {
+    setAssistantDaemonBusy(true);
+    try {
+      const status = await window.ipcRenderer.assistantDaemon.stop() as AssistantDaemonStatus;
+      setAssistantDaemonStatus(status);
+      setAssistantDaemonDraft(assistantDaemonStatusToDraft(status));
+    } catch (error) {
+      console.error('Failed to stop assistant daemon', error);
+      window.alert(`停止后台值守失败：${String(error)}`);
+    } finally {
+      setAssistantDaemonBusy(false);
+    }
+  }, []);
 
   const loadVectorStats = async () => {
     try {
@@ -1910,9 +2217,18 @@ export function Settings() {
       const resolvedTranscriptionSource = getAiSourceById(transcriptionSourceId) || defaultSource || null;
       const resolvedEmbeddingSource = getAiSourceById(embeddingSourceId) || defaultSource || null;
       const resolvedImageSource = getAiSourceById(imageSourceId) || defaultSource || null;
+      const resolvedVideoSource = getAiSourceById(videoSourceId) || defaultSource || null;
       const resolvedTranscriptionModel = String(formData.transcription_model || pickBestModelForSource(resolvedTranscriptionSource) || '').trim();
       const resolvedEmbeddingModel = String(formData.embedding_model || pickBestModelForSource(resolvedEmbeddingSource) || '').trim();
       const resolvedImageModel = String(formData.image_model || pickBestModelForSource(resolvedImageSource) || '').trim();
+      const resolvedVideoModel = String(
+        formData.video_model ||
+        filterAiModelsByCapability(
+          resolvedVideoSource ? getSourceModelList(resolvedVideoSource) : [],
+          'video',
+        )[0]?.id ||
+        ''
+      ).trim();
       const selectedImageModel = String(resolvedImageModel || '').trim();
       if (!selectedImageModel) {
         throw new Error('请填写生图模型（可手动输入或从列表选择）');
@@ -1950,6 +2266,9 @@ export function Settings() {
         image_endpoint: String(resolvedImageSource?.baseURL || formData.image_endpoint || '').trim(),
         image_api_key: String(resolvedImageSource?.apiKey || formData.image_api_key || '').trim(),
         image_model: resolvedImageModel,
+        video_endpoint: String(resolvedVideoSource?.baseURL || formData.video_endpoint || '').trim(),
+        video_api_key: String(resolvedVideoSource?.apiKey || formData.video_api_key || '').trim(),
+        video_model: resolvedVideoModel,
         ai_sources_json: JSON.stringify(sanitizedSources),
         default_ai_source_id: resolvedDefaultSourceId || defaultSource?.id || '',
         mcp_servers_json: JSON.stringify(mcpServers),
@@ -2022,6 +2341,15 @@ export function Settings() {
                 handleRefreshDebugLogs={loadRecentDebugLogs}
                 handleOpenDebugLogDir={openDebugLogDirectory}
                 handleVersionTap={handleVersionTap}
+                assistantDaemonStatus={assistantDaemonStatus}
+                assistantDaemonDraft={assistantDaemonDraft}
+                setAssistantDaemonDraft={setAssistantDaemonDraft}
+                assistantDaemonLogs={assistantDaemonLogs}
+                assistantDaemonBusy={assistantDaemonBusy}
+                handleReloadAssistantDaemonStatus={loadAssistantDaemonStatus}
+                handleSaveAssistantDaemonConfig={handleSaveAssistantDaemonConfig}
+                handleStartAssistantDaemon={handleStartAssistantDaemon}
+                handleStopAssistantDaemon={handleStopAssistantDaemon}
               />
             )}
 
@@ -2122,7 +2450,11 @@ export function Settings() {
                             }}
                             className="w-full"
                             placeholder="请先为默认源添加模型"
-                            options={defaultSourceModels.map((modelId) => ({ id: modelId, label: modelId }))}
+                            options={defaultSourceModels.map((model) => ({
+                              id: model.id,
+                              label: model.id,
+                              badges: buildModelCapabilityBadges(model.capabilities),
+                            }))}
                           />
                         </div>
                       </div>
@@ -2389,14 +2721,14 @@ export function Settings() {
                                   {isModelListExpanded && (
                                     sourceModels.length ? (
                                       <div className="space-y-1">
-                                        {sourceModels.map((modelId) => {
-                                          const isDefaultModel = source.model === modelId;
+                                        {sourceModels.map((model) => {
+                                          const isDefaultModel = source.model === model.id;
                                           return (
-                                            <div key={modelId} className="flex items-center justify-between gap-2 rounded border border-border bg-surface-primary px-2.5 py-1.5">
-                                              <div className="min-w-0 flex items-center gap-2">
+                                            <div key={model.id} className="flex items-center justify-between gap-2 rounded border border-border bg-surface-primary px-2.5 py-1.5">
+                                              <div className="min-w-0 flex items-center gap-2 flex-wrap">
                                                 <button
                                                   type="button"
-                                                  onClick={() => handleSetSourceDefaultModel(source.id, modelId)}
+                                                  onClick={() => handleSetSourceDefaultModel(source.id, model.id)}
                                                   className={clsx(
                                                     'text-[10px] px-1.5 py-0.5 rounded border',
                                                     isDefaultModel
@@ -2406,11 +2738,19 @@ export function Settings() {
                                                 >
                                                   默认
                                                 </button>
-                                                <span className="text-xs text-text-primary truncate">{modelId}</span>
+                                                <span className="text-xs text-text-primary truncate">{model.id}</span>
+                                                {buildModelCapabilityBadges(model.capabilities).map((badge) => (
+                                                  <span
+                                                    key={`${model.id}-${badge.text}`}
+                                                    className="px-1.5 py-0.5 rounded text-[10px] leading-none border border-border text-text-tertiary bg-surface-secondary/50 whitespace-nowrap"
+                                                  >
+                                                    {badge.text}
+                                                  </span>
+                                                ))}
                                               </div>
                                               <button
                                                 type="button"
-                                                onClick={() => handleRemoveSourceModel(source.id, modelId)}
+                                                onClick={() => handleRemoveSourceModel(source.id, model.id)}
                                                 className="p-1 text-text-tertiary hover:text-red-500 hover:bg-red-500/10 rounded transition-colors"
                                                 title="删除模型"
                                               >
@@ -2477,13 +2817,12 @@ export function Settings() {
                         <AiModelSelect
                           value={formData.transcription_model}
                           onChange={(modelId) => setFormData((d) => ({ ...d, transcription_model: modelId }))}
-                          options={transcriptionSourceModels.map((modelId) => {
-                            const isRecommended = String(modelId).trim().toLowerCase() === 'step-asr';
+                          options={transcriptionSourceModels.map((model) => {
+                            const isRecommended = String(model.id).trim().toLowerCase() === 'step-asr';
                             return {
-                              id: modelId,
-                              label: modelId,
-                              badgeText: isRecommended ? '推荐' : undefined,
-                              badgeTone: isRecommended ? 'recommended' as const : 'neutral' as const,
+                              id: model.id,
+                              label: model.id,
+                              badges: buildModelCapabilityBadges(model.capabilities, { recommended: isRecommended }),
                             };
                           })}
                           disabled={!transcriptionSourceModels.length}
@@ -2523,7 +2862,11 @@ export function Settings() {
                             className="w-full"
                             disabled={!embeddingSourceModels.length}
                             placeholder="请先在该源中添加模型"
-                            options={embeddingSourceModels.map((modelId) => ({ id: modelId, label: modelId }))}
+                            options={embeddingSourceModels.map((model) => ({
+                              id: model.id,
+                              label: model.id,
+                              badges: buildModelCapabilityBadges(model.capabilities),
+                            }))}
                           />
                         </div>
                       </div>
@@ -2562,7 +2905,11 @@ export function Settings() {
                               placeholder={isDashscopeImageTemplate ? DASHSCOPE_LOCKED_IMAGE_MODEL : '请先在该源中添加模型'}
                               options={isDashscopeImageTemplate
                                 ? [{ id: DASHSCOPE_LOCKED_IMAGE_MODEL, label: DASHSCOPE_LOCKED_IMAGE_MODEL }]
-                                : imageSourceModels.map((modelId) => ({ id: modelId, label: modelId }))}
+                                : imageSourceModels.map((model) => ({
+                                  id: model.id,
+                                  label: model.id,
+                                  badges: buildModelCapabilityBadges(model.capabilities),
+                                }))}
                             />
                           </div>
                         </div>
@@ -2571,6 +2918,46 @@ export function Settings() {
                         </p>
                       </div>
 
+                    </div>
+                  </div>
+
+                  <div className="pt-4 border-t border-border">
+                    <h3 className="text-sm font-medium text-text-primary mb-4">生视频模型设置</h3>
+
+                    <div className="rounded-xl border border-border bg-surface-secondary/20 p-3 space-y-3">
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        <div className="group">
+                          <label className="block text-xs font-medium text-text-secondary mb-1.5">
+                            生视频 AI 源
+                          </label>
+                          <AiSourceSelect
+                            value={videoSourceId}
+                            sources={aiSources}
+                            onChange={(nextSourceId) => handleLinkedSourceChange('video', nextSourceId)}
+                            className="w-full"
+                          />
+                        </div>
+                        <div className="group">
+                          <label className="block text-xs font-medium text-text-secondary mb-1.5">
+                            生视频模型
+                          </label>
+                          <AiModelSelect
+                            value={formData.video_model}
+                            onChange={(modelId) => setFormData((d) => ({ ...d, video_model: modelId }))}
+                            className="w-full"
+                            disabled={!videoSourceModels.length}
+                            placeholder="请先在该源中添加视频模型"
+                            options={videoSourceModels.map((model) => ({
+                              id: model.id,
+                              label: model.id,
+                              badges: buildModelCapabilityBadges(model.capabilities),
+                            }))}
+                          />
+                        </div>
+                      </div>
+                      <p className="text-[11px] text-text-tertiary">
+                        生视频会自动复用所选 AI 源的 Endpoint 与 API Key。当前已支持 Gemini 官方视频模型，以及 OpenAI 兼容的视频生成接口（包括 RedBox 官方视频路由）。
+                      </p>
                     </div>
                   </div>
 
@@ -3000,9 +3387,17 @@ export function Settings() {
                             key={item.id}
                             type="button"
                             onClick={() => setSourceModelDrafts((prev) => ({ ...prev, [addModelModalSource.id]: item.id }))}
-                            className="px-2 py-1 text-[11px] rounded border border-border hover:bg-surface-secondary transition-colors"
+                            className="px-2 py-1 text-[11px] rounded border border-border hover:bg-surface-secondary transition-colors flex items-center gap-1.5"
                           >
-                            {item.id}
+                            <span>{item.id}</span>
+                            {buildModelCapabilityBadges(item.capabilities).map((badge) => (
+                              <span
+                                key={`${item.id}-${badge.text}`}
+                                className="px-1 py-0.5 rounded text-[10px] leading-none border border-border text-text-tertiary bg-surface-secondary/50 whitespace-nowrap"
+                              >
+                                {badge.text}
+                              </span>
+                            ))}
                           </button>
                         ))}
                       </div>

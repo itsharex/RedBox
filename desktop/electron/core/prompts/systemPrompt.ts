@@ -261,7 +261,7 @@ function getCoreMandates(interactive: boolean, hasSkills: boolean): string {
 
     if (hasSkills) {
         mandates += `
-- **Skill Guidance:** Once a skill is activated via \`activate_skill\`, its instructions are returned wrapped in \`<activated_skill>\` tags. You MUST treat the content within \`<instructions>\` as expert procedural guidance, prioritizing these specialized rules for the duration of the task.`;
+- **Skill Guidance:** When a task clearly matches a specialized workflow, load it with \`skill\` before proceeding. Once loaded, the skill instructions are returned inside \`<activated_skill>\` and \`<instructions>\` tags. Treat that content as expert procedural guidance for the current task.`;
     }
 
     return mandates;
@@ -319,23 +319,27 @@ function getSkillsSection(skills: SkillDefinition[]): string {
         .map(skill => `  <skill>
     <name>${skill.name}</name>
     <description>${skill.description}</description>
+    ${skill.whenToUse ? `<when_to_use>${skill.whenToUse}</when_to_use>` : ''}
+    ${skill.aliases?.length ? `<aliases>${skill.aliases.join(', ')}</aliases>` : ''}
+    ${skill.executionContext ? `<context>${skill.executionContext}</context>` : ''}
+    ${skill.paths?.length ? `<paths>${skill.paths.join(', ')}</paths>` : ''}
   </skill>`)
         .join('\n');
 
     return `# Available Skills
 
-You have access to specialized skills. **IMPORTANT: Only activate a skill when the user EXPLICITLY requests it by name.**
+You have access to specialized skills. Keep skill bodies out of context until they are actually needed.
 
 <available_skills>
 ${skillsXml}
 </available_skills>
 
 ## ⚠️ Skill Activation Rules
-1. **DO NOT** automatically activate skills for normal tasks
-2. **DO NOT** call \`activate_skill\` with empty parameters
-3. **ONLY** activate a skill when user says something like "使用XX技能" or "用XX技能帮我..."
-4. For creating/editing articles, use \`write_file\` directly - NO skill activation needed
-5. For exploring workspace, use \`explore_workspace\` - NO skill activation needed`;
+1. Load a skill when the task clearly matches its description, workflow, or the user names it explicitly
+2. Prefer \`skill({ "skill": "skill-name" })\`; \`activate_skill\` is legacy compatibility only
+3. Do not load multiple overlapping skills unless the task genuinely needs them
+4. Do not call the skill tool with empty parameters
+5. If a skill is loaded, follow its instructions for the current task until they conflict with newer user instructions`;
 }
 
 function getOperationalGuidelines(interactive: boolean): string {

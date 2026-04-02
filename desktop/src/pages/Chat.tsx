@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { Send, Terminal, Loader2, StopCircle, Trash2, Plus, ChevronDown, Mic, ArrowUp, MessageSquare, X, PanelLeftClose, PanelLeft, Sparkles, Edit, Users, Paperclip, FileX } from 'lucide-react';
+import { Send, Terminal, Loader2, StopCircle, Trash2, Plus, ChevronDown, Mic, ArrowUp, MessageSquare, X, PanelLeftClose, PanelLeft, Sparkles, Edit, Users, Paperclip, FileX, Square } from 'lucide-react';
 import { clsx } from 'clsx';
 import { ToolConfirmDialog } from '../components/ToolConfirmDialog';
 import { MessageItem, Message, ToolEvent, SkillEvent } from '../components/MessageItem';
@@ -85,6 +85,23 @@ interface ChatErrorEventPayload {
   statusCode?: number;
   errorCode?: string;
   category?: string;
+}
+
+interface ChatModelOption {
+  key: string;
+  modelName: string;
+  sourceName: string;
+  baseURL: string;
+  apiKey: string;
+  isDefault?: boolean;
+}
+
+interface ChatSettingsSnapshot {
+  api_endpoint?: string;
+  api_key?: string;
+  model_name?: string;
+  ai_sources_json?: string;
+  default_ai_source_id?: string;
 }
 
 const AUTO_SCROLL_BOTTOM_THRESHOLD_PX = 80;
@@ -201,6 +218,82 @@ function deriveChatErrorPresentation(payload: ChatErrorEventPayload | string | n
   };
 }
 
+function decodeBase64DataUrl(dataUrl: string): string {
+  const raw = String(dataUrl || '');
+  const parts = raw.split(',');
+  return parts.length > 1 ? parts[1] : raw;
+}
+
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(decodeBase64DataUrl(String(reader.result || '')));
+    reader.onerror = () => reject(reader.error || new Error('音频读取失败'));
+    reader.readAsDataURL(blob);
+  });
+}
+
+function buildChatModelOptions(settings?: ChatSettingsSnapshot | null): ChatModelOption[] {
+  if (!settings) return [];
+
+  const options: ChatModelOption[] = [];
+  const defaultSourceId = String(settings.default_ai_source_id || '').trim();
+
+  try {
+    const parsed = JSON.parse(String(settings.ai_sources_json || '[]')) as Array<Record<string, unknown>>;
+    if (Array.isArray(parsed)) {
+      for (const item of parsed) {
+        if (!item || typeof item !== 'object') continue;
+        const sourceId = String(item.id || '').trim();
+        const sourceName = String(item.name || sourceId || 'AI 源').trim();
+        const baseURL = String(item.baseURL || item.baseUrl || '').trim();
+        const apiKey = String(item.apiKey || item.key || '').trim();
+        const candidates = Array.from(new Set(
+          [
+            ...((Array.isArray(item.models) ? item.models : []).map((value) => String(value || '').trim())),
+            String(item.model || item.modelName || '').trim(),
+          ].filter(Boolean),
+        ));
+        for (const modelName of candidates) {
+          options.push({
+            key: `${sourceId || baseURL || sourceName}::${modelName}`,
+            modelName,
+            sourceName,
+            baseURL,
+            apiKey,
+            isDefault: Boolean(sourceId && sourceId === defaultSourceId && modelName === String(item.model || item.modelName || '').trim()),
+          });
+        }
+      }
+    }
+  } catch {
+    // ignore malformed ai_sources_json
+  }
+
+  const fallbackModel = String(settings.model_name || '').trim();
+  if (fallbackModel) {
+    options.push({
+      key: `fallback::${fallbackModel}`,
+      modelName: fallbackModel,
+      sourceName: '当前默认源',
+      baseURL: String(settings.api_endpoint || '').trim(),
+      apiKey: String(settings.api_key || '').trim(),
+      isDefault: true,
+    });
+  }
+
+  const deduped = new Map<string, ChatModelOption>();
+  for (const option of options) {
+    const uniqueKey = `${option.baseURL}::${option.modelName}`;
+    const existing = deduped.get(uniqueKey);
+    if (!existing || option.isDefault) {
+      deduped.set(uniqueKey, option);
+    }
+  }
+
+  return Array.from(deduped.values());
+}
+
 export function Chat({
   pendingMessage,
   onMessageConsumed,
@@ -216,7 +309,7 @@ export function Chat({
   welcomeTitle = '有什么可以帮您？',
   welcomeSubtitle = '我可以帮您阅读和编辑稿件、分析内容、提供创作建议',
   contentLayout = 'default',
-  allowFileUpload = false,
+  allowFileUpload = true,
 }: ChatProps) {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
@@ -240,9 +333,18 @@ export function Chat({
   const [contextUsage, setContextUsage] = useState<ChatContextUsage | null>(null);
   const [errorNotice, setErrorNotice] = useState<string | null>(null);
   const [pendingAttachment, setPendingAttachment] = useState<UploadedFileAttachment | null>(null);
+  const [chatModelOptions, setChatModelOptions] = useState<ChatModelOption[]>([]);
+  const [selectedChatModelKey, setSelectedChatModelKey] = useState('');
+  const [showModelPicker, setShowModelPicker] = useState(false);
+  const [isRecordingAudio, setIsRecordingAudio] = useState(false);
+  const [isTranscribingAudio, setIsTranscribingAudio] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const modelPickerRef = useRef<HTMLDivElement>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaChunksRef = useRef<Blob[]>([]);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
   
   // Throttle buffer for streaming updates
   const pendingUpdateRef = useRef<{ content: string } | null>(null);
@@ -288,6 +390,57 @@ export function Chat({
     }
   }, []);
 
+  const selectedChatModel = chatModelOptions.find((item) => item.key === selectedChatModelKey) || null;
+
+  const buildPendingAssistantTimeline = useCallback((label: string): ProcessItem[] => ([
+    {
+      id: `phase_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      type: 'phase',
+      title: label,
+      content: '',
+      status: 'running',
+      timestamp: Date.now(),
+    },
+  ]), []);
+
+  const closeModelPicker = useCallback(() => {
+    setShowModelPicker(false);
+  }, []);
+
+  const syncInputHeight = useCallback(() => {
+    if (!inputRef.current) return;
+    inputRef.current.style.height = 'auto';
+    inputRef.current.style.height = `${Math.min(inputRef.current.scrollHeight, 300)}px`;
+  }, []);
+
+  const loadChatModelOptions = useCallback(async () => {
+    try {
+      const settings = await window.ipcRenderer.getSettings() as ChatSettingsSnapshot | undefined;
+      const options = buildChatModelOptions(settings);
+      setChatModelOptions(options);
+      setSelectedChatModelKey((current) => {
+        if (current && options.some((item) => item.key === current)) return current;
+        return options.find((item) => item.isDefault)?.key || options[0]?.key || '';
+      });
+    } catch (error) {
+      console.error('Failed to load chat model options:', error);
+    }
+  }, []);
+
+  const cleanupAudioCapture = useCallback(() => {
+    if (mediaRecorderRef.current) {
+      mediaRecorderRef.current.ondataavailable = null;
+      mediaRecorderRef.current.onstop = null;
+      mediaRecorderRef.current.onerror = null;
+      mediaRecorderRef.current = null;
+    }
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+      mediaStreamRef.current = null;
+    }
+    mediaChunksRef.current = [];
+  }, []);
+
   const loadChatRooms = useCallback(async (options?: { silent?: boolean }) => {
     const silent = Boolean(options?.silent);
     if (!silent) {
@@ -318,6 +471,28 @@ export function Chat({
       pendingMessageHandledRef.current = false;
     }
   }, [pendingMessage]);
+
+  useEffect(() => {
+    void loadChatModelOptions();
+  }, [loadChatModelOptions]);
+
+  useEffect(() => {
+    if (!showModelPicker) return;
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!modelPickerRef.current) return;
+      if (!modelPickerRef.current.contains(event.target as Node)) {
+        setShowModelPicker(false);
+      }
+    };
+    document.addEventListener('mousedown', handlePointerDown);
+    return () => document.removeEventListener('mousedown', handlePointerDown);
+  }, [showModelPicker]);
+
+  useEffect(() => {
+    return () => {
+      cleanupAudioCapture();
+    };
+  }, [cleanupAudioCapture]);
 
   useEffect(() => {
     if (messages.length === 0) return;
@@ -434,7 +609,9 @@ export function Chat({
         role: 'ai',
         content: '',
         tools: [],
-        timeline: [],
+        timeline: (
+          pendingMessage.taskHints?.forceMultiAgent || pendingMessage.attachment?.type === 'wander-references'
+        ) ? buildPendingAssistantTimeline('任务已提交') : [],
         isStreaming: true
       };
 
@@ -455,6 +632,11 @@ export function Chat({
         message: pendingMessage.content,
         displayContent: pendingMessage.displayContent,
         attachment: pendingMessage.attachment,
+        modelConfig: selectedChatModel ? {
+          apiKey: selectedChatModel.apiKey,
+          baseURL: selectedChatModel.baseURL,
+          modelName: selectedChatModel.modelName,
+        } : undefined,
         taskHints: pendingMessage.taskHints,
       });
 
@@ -463,7 +645,7 @@ export function Chat({
     };
 
     sendPendingMessage();
-  }, [pendingMessage, isProcessing, onMessageConsumed, fixedSessionId, currentSessionId]);
+  }, [pendingMessage, isProcessing, onMessageConsumed, fixedSessionId, currentSessionId, selectedChatModel, buildPendingAssistantTimeline]);
 
   const loadSessions = async () => {
     try {
@@ -795,17 +977,27 @@ export function Chat({
         const lastMsg = prev[prev.length - 1];
         if (!lastMsg || lastMsg.role !== 'ai') return prev;
 
+        const now = Date.now();
         const newTimeline = [...lastMsg.timeline];
-        // If the last item was running, mark it as done? No, phases can overlap or supersede.
-        // Let's just add a new phase item.
-        
+        for (let i = newTimeline.length - 1; i >= 0; i -= 1) {
+          const item = newTimeline[i];
+          if (item.type === 'phase' && item.status === 'running') {
+            newTimeline[i] = {
+              ...item,
+              status: 'done',
+              duration: now - item.timestamp
+            };
+            break;
+          }
+        }
+
         newTimeline.push({
           id: Math.random().toString(36),
           type: 'phase',
           title: name,
           content: '',
-          status: 'running', // Phases are transient, but let's show them
-          timestamp: Date.now()
+          status: 'running',
+          timestamp: now
         });
 
         return [...prev.slice(0, -1), { ...lastMsg, timeline: newTimeline }];
@@ -1131,7 +1323,16 @@ export function Chat({
         const lastMsg = prev[prev.length - 1];
         if (lastMsg && lastMsg.role === 'ai') {
           const mergedContent = mergeAssistantContent(lastMsg.content || '', finalContent);
-          return [...prev.slice(0, -1), { ...lastMsg, content: mergedContent, isStreaming: false }];
+          const now = Date.now();
+          const timeline: ProcessItem[] = (lastMsg.timeline || []).map((item) => {
+            if (item.status !== 'running') return item;
+            return {
+              ...item,
+              status: 'done',
+              duration: now - item.timestamp,
+            } as ProcessItem;
+          });
+          return [...prev.slice(0, -1), { ...lastMsg, content: mergedContent, timeline, isStreaming: false }];
         }
         if (finalContent) {
           return [
@@ -1174,7 +1375,16 @@ export function Chat({
       setMessages(prev => {
         const lastMsg = prev[prev.length - 1];
         if (lastMsg && lastMsg.role === 'ai' && lastMsg.isStreaming) {
-          return [...prev.slice(0, -1), { ...lastMsg, content: formatted, isStreaming: false }];
+          const now = Date.now();
+          const timeline: ProcessItem[] = (lastMsg.timeline || []).map((item) => {
+            if (item.status !== 'running') return item;
+            return {
+              ...item,
+              status: item.type === 'tool-call' ? 'failed' : 'done',
+              duration: now - item.timestamp,
+            } as ProcessItem;
+          });
+          return [...prev.slice(0, -1), { ...lastMsg, content: formatted, timeline, isStreaming: false }];
         }
         return [
           ...prev,
@@ -1257,6 +1467,108 @@ export function Chat({
     }
   }, [currentSessionId, isProcessing]);
 
+  const getChatModelConfig = useCallback(() => {
+    if (!selectedChatModel) return undefined;
+    return {
+      apiKey: selectedChatModel.apiKey,
+      baseURL: selectedChatModel.baseURL,
+      modelName: selectedChatModel.modelName,
+    };
+  }, [selectedChatModel]);
+
+  const transcribeAudioBlob = useCallback(async (blob: Blob) => {
+    setIsTranscribingAudio(true);
+    setErrorNotice(null);
+    try {
+      const audioBase64 = await blobToBase64(blob);
+      const result = await window.ipcRenderer.chat.transcribeAudio({
+        audioBase64,
+        mimeType: blob.type || 'audio/webm',
+        fileName: `chat_audio_${Date.now()}.webm`,
+      });
+      if (!result?.success || !String(result.text || '').trim()) {
+        throw new Error(result?.error || '语音转文字失败');
+      }
+      setInput((prev) => {
+        const current = String(prev || '').trim();
+        const next = String(result.text || '').trim();
+        return current ? `${current}${current.endsWith('\n') ? '' : '\n'}${next}` : next;
+      });
+      requestAnimationFrame(() => {
+        inputRef.current?.focus();
+        syncInputHeight();
+      });
+    } catch (error) {
+      setErrorNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsTranscribingAudio(false);
+    }
+  }, [syncInputHeight]);
+
+  const stopAudioRecording = useCallback(() => {
+    const recorder = mediaRecorderRef.current;
+    if (!recorder) return;
+    if (recorder.state !== 'inactive') {
+      recorder.stop();
+    } else {
+      cleanupAudioCapture();
+      setIsRecordingAudio(false);
+    }
+  }, [cleanupAudioCapture]);
+
+  const startAudioRecording = useCallback(async () => {
+    if (isProcessing || isTranscribingAudio) return;
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setErrorNotice('当前环境不支持麦克风录音');
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const preferredMimeType = typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : 'audio/webm';
+      const recorder = new MediaRecorder(stream, preferredMimeType ? { mimeType: preferredMimeType } : undefined);
+      mediaStreamRef.current = stream;
+      mediaRecorderRef.current = recorder;
+      mediaChunksRef.current = [];
+
+      recorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          mediaChunksRef.current.push(event.data);
+        }
+      };
+      recorder.onerror = () => {
+        setErrorNotice('录音失败，请检查麦克风权限');
+        cleanupAudioCapture();
+        setIsRecordingAudio(false);
+      };
+      recorder.onstop = () => {
+        const chunks = [...mediaChunksRef.current];
+        cleanupAudioCapture();
+        setIsRecordingAudio(false);
+        if (!chunks.length) return;
+        void transcribeAudioBlob(new Blob(chunks, { type: recorder.mimeType || preferredMimeType || 'audio/webm' }));
+      };
+
+      recorder.start();
+      setIsRecordingAudio(true);
+      setErrorNotice(null);
+    } catch (error) {
+      cleanupAudioCapture();
+      setIsRecordingAudio(false);
+      setErrorNotice(error instanceof Error ? error.message : '无法访问麦克风');
+    }
+  }, [cleanupAudioCapture, isProcessing, isTranscribingAudio, transcribeAudioBlob]);
+
+  const handleAudioInput = useCallback(() => {
+    if (isRecordingAudio) {
+      stopAudioRecording();
+      return;
+    }
+    void startAudioRecording();
+  }, [isRecordingAudio, startAudioRecording, stopAudioRecording]);
+
   const sendMessage = (content: string, attachment?: UploadedFileAttachment) => {
     shouldAutoScrollRef.current = true;
     setErrorNotice(null);
@@ -1293,6 +1605,7 @@ export function Chat({
       message: normalizedContent || displayText,
       displayContent: displayText,
       attachment,
+      modelConfig: getChatModelConfig(),
       taskHints: undefined,
     });
   };
@@ -1538,10 +1851,7 @@ export function Chat({
                     value={input}
                     onChange={(e) => {
                       setInput(e.target.value);
-                      if (inputRef.current) {
-                        inputRef.current.style.height = 'auto';
-                        inputRef.current.style.height = `${Math.min(inputRef.current.scrollHeight, 300)}px`;
-                      }
+                      syncInputHeight();
                     }}
                     onKeyDown={(e) => {
                       if (e.key === 'Enter' && !e.shiftKey) {
@@ -1561,20 +1871,62 @@ export function Chat({
                       <button type="button" onClick={() => void pickAttachment()} className="p-2 text-text-tertiary hover:text-text-secondary transition-colors" title="添加文件">
                         <Plus className="w-[18px] h-[18px]" />
                       </button>
-                      <div className="flex items-center gap-4 px-2">
-                        <button type="button" className="flex items-center gap-1.5 text-text-tertiary hover:text-text-secondary transition-colors text-[13px] font-medium">
-                          <span>GPT-5.4</span>
-                          <ChevronDown className="w-3.5 h-3.5" />
+                      <div ref={modelPickerRef} className="relative flex items-center gap-4 px-2">
+                        <button
+                          type="button"
+                          onClick={() => setShowModelPicker((prev) => !prev)}
+                          className="flex items-center gap-1.5 text-text-tertiary hover:text-text-secondary transition-colors text-[13px] font-medium"
+                        >
+                          <span className="max-w-[180px] truncate">{selectedChatModel?.modelName || '默认模型'}</span>
+                          <ChevronDown className={clsx('w-3.5 h-3.5 transition-transform', showModelPicker && 'rotate-180')} />
                         </button>
-                        <button type="button" className="flex items-center gap-1.5 text-text-tertiary hover:text-text-secondary transition-colors text-[13px] font-medium">
-                          <span>高</span>
-                          <ChevronDown className="w-3.5 h-3.5" />
-                        </button>
+                        {showModelPicker && (
+                          <div className="absolute left-0 bottom-full mb-2 w-72 max-h-72 overflow-auto rounded-xl border border-border bg-surface-primary shadow-xl z-[130]">
+                            {chatModelOptions.length ? chatModelOptions.map((option) => {
+                              const active = option.key === selectedChatModelKey;
+                              return (
+                                <button
+                                  key={option.key}
+                                  type="button"
+                                  onClick={() => {
+                                    setSelectedChatModelKey(option.key);
+                                    closeModelPicker();
+                                  }}
+                                  className={clsx(
+                                    'w-full px-3 py-2.5 text-left transition-colors',
+                                    active ? 'bg-accent-primary/10 text-text-primary' : 'hover:bg-surface-secondary/50 text-text-secondary'
+                                  )}
+                                >
+                                  <div className="text-sm font-medium truncate">{option.modelName}</div>
+                                  <div className="text-[11px] text-text-tertiary truncate">{option.sourceName}</div>
+                                </button>
+                              );
+                            }) : (
+                              <div className="px-3 py-2 text-sm text-text-tertiary">请先在设置里配置模型源</div>
+                            )}
+                          </div>
+                        )}
                       </div>
                     </div>
                     <div className="flex items-center gap-2">
-                      <button type="button" className="p-2 text-text-tertiary hover:text-text-secondary transition-colors" title="语音输入">
-                        <Mic className="w-[18px] h-[18px]" />
+                      <button
+                        type="button"
+                        onClick={handleAudioInput}
+                        disabled={isTranscribingAudio}
+                        className={clsx(
+                          'p-2 transition-colors',
+                          isRecordingAudio ? 'text-red-500 hover:text-red-600' : 'text-text-tertiary hover:text-text-secondary',
+                          isTranscribingAudio && 'opacity-60 cursor-not-allowed'
+                        )}
+                        title={isTranscribingAudio ? '语音转录中' : isRecordingAudio ? '停止录音并转写' : '语音输入'}
+                      >
+                        {isTranscribingAudio ? (
+                          <Loader2 className="w-[18px] h-[18px] animate-spin" />
+                        ) : isRecordingAudio ? (
+                          <Square className="w-[18px] h-[18px] fill-current" />
+                        ) : (
+                          <Mic className="w-[18px] h-[18px]" />
+                        )}
                       </button>
                       <button type="submit" disabled={(!input.trim() && !pendingAttachment) || isProcessing} className={clsx("w-9 h-9 flex items-center justify-center rounded-full transition-all duration-200", input.trim() || pendingAttachment ? "bg-[#b4b2a8] text-white hover:bg-accent-primary" : "bg-[#edebe4] text-white opacity-60")}>
                         {isProcessing ? <Loader2 className="w-4 h-4 animate-spin text-[#b4b2a8]" /> : <ArrowUp className="w-5 h-5" />}
@@ -1582,7 +1934,7 @@ export function Chat({
                     </div>
                   </div>
                 </div>
-                {allowFileUpload && pendingAttachment && (
+                {pendingAttachment && (
                   <div className="mt-3 mx-4 rounded-lg border border-border bg-surface-secondary/60 px-3 py-2 text-xs text-text-secondary flex items-center justify-between">
                     <span className="truncate">附件: {pendingAttachment.name}</span>
                     <button type="button" onClick={() => setPendingAttachment(null)} className="ml-2 text-text-tertiary hover:text-text-primary">
@@ -1656,7 +2008,7 @@ export function Chat({
 
                 <form onSubmit={handleSubmit} className="relative w-full">
                   <ToolConfirmDialog request={confirmRequest} onConfirm={handleConfirmTool} onCancel={handleCancelTool} />
-                  {allowFileUpload && pendingAttachment && (
+                  {pendingAttachment && (
                     <div className="mb-3 rounded-lg border border-border bg-surface-secondary/60 px-3 py-2 text-xs text-text-secondary flex items-center justify-between">
                       <span className="truncate">附件: {pendingAttachment.name}</span>
                       <button type="button" onClick={() => setPendingAttachment(null)} className="ml-2 text-text-tertiary hover:text-text-primary"><FileX className="w-3.5 h-3.5" /></button>
@@ -1668,10 +2020,7 @@ export function Chat({
                       value={input}
                       onChange={(e) => {
                         setInput(e.target.value);
-                        if (inputRef.current) {
-                          inputRef.current.style.height = 'auto';
-                          inputRef.current.style.height = `${Math.min(inputRef.current.scrollHeight, 300)}px`;
-                        }
+                        syncInputHeight();
                       }}
                       onKeyDown={(e) => {
                         if (e.key === 'Enter' && !e.shiftKey) {
@@ -1690,22 +2039,66 @@ export function Chat({
                         <button type="button" onClick={() => void pickAttachment()} className="p-2 text-text-tertiary hover:text-text-secondary transition-colors" title="添加文件">
                           <Plus className="w-[18px] h-[18px]" />
                         </button>
-                        <div className="flex items-center gap-4 px-2">
-                          <button type="button" className="flex items-center gap-1.5 text-text-tertiary hover:text-text-secondary transition-colors text-[13px] font-medium">
-                            <span>GPT-5.4</span>
-                            <ChevronDown className="w-3.5 h-3.5" />
+                        <div ref={modelPickerRef} className="relative flex items-center gap-4 px-2">
+                          <button
+                            type="button"
+                            onClick={() => setShowModelPicker((prev) => !prev)}
+                            className="flex items-center gap-1.5 text-text-tertiary hover:text-text-secondary transition-colors text-[13px] font-medium"
+                          >
+                            <span className="max-w-[180px] truncate">{selectedChatModel?.modelName || '默认模型'}</span>
+                            <ChevronDown className={clsx('w-3.5 h-3.5 transition-transform', showModelPicker && 'rotate-180')} />
                           </button>
-                          <button type="button" className="flex items-center gap-1.5 text-text-tertiary hover:text-text-secondary transition-colors text-[13px] font-medium">
-                            <span>高</span>
-                            <ChevronDown className="w-3.5 h-3.5" />
-                          </button>
+                          {showModelPicker && (
+                            <div className="absolute left-0 bottom-full mb-2 w-72 max-h-72 overflow-auto rounded-xl border border-border bg-surface-primary shadow-xl z-[130]">
+                              {chatModelOptions.length ? chatModelOptions.map((option) => {
+                                const active = option.key === selectedChatModelKey;
+                                return (
+                                  <button
+                                    key={option.key}
+                                    type="button"
+                                    onClick={() => {
+                                      setSelectedChatModelKey(option.key);
+                                      closeModelPicker();
+                                    }}
+                                    className={clsx(
+                                      'w-full px-3 py-2.5 text-left transition-colors',
+                                      active ? 'bg-accent-primary/10 text-text-primary' : 'hover:bg-surface-secondary/50 text-text-secondary'
+                                    )}
+                                  >
+                                    <div className="text-sm font-medium truncate">{option.modelName}</div>
+                                    <div className="text-[11px] text-text-tertiary truncate">{option.sourceName}</div>
+                                  </button>
+                                );
+                              }) : (
+                                <div className="px-3 py-2 text-sm text-text-tertiary">请先在设置里配置模型源</div>
+                              )}
+                            </div>
+                          )}
                         </div>
                       </div>
                       <div className="flex items-center gap-2">
                         {isProcessing ? (
                           <button type="button" onClick={handleCancel} className="p-2 text-red-500 hover:bg-red-50 rounded-lg transition-colors" title="停止生成"><StopCircle className="w-5 h-5" /></button>
                         ) : (
-                          <button type="button" className="p-2 text-text-tertiary hover:text-text-secondary transition-colors" title="语音输入"><Mic className="w-[18px] h-[18px]" /></button>
+                          <button
+                            type="button"
+                            onClick={handleAudioInput}
+                            disabled={isTranscribingAudio}
+                            className={clsx(
+                              'p-2 transition-colors',
+                              isRecordingAudio ? 'text-red-500 hover:text-red-600' : 'text-text-tertiary hover:text-text-secondary',
+                              isTranscribingAudio && 'opacity-60 cursor-not-allowed'
+                            )}
+                            title={isTranscribingAudio ? '语音转录中' : isRecordingAudio ? '停止录音并转写' : '语音输入'}
+                          >
+                            {isTranscribingAudio ? (
+                              <Loader2 className="w-[18px] h-[18px] animate-spin" />
+                            ) : isRecordingAudio ? (
+                              <Square className="w-[18px] h-[18px] fill-current" />
+                            ) : (
+                              <Mic className="w-[18px] h-[18px]" />
+                            )}
+                          </button>
                         )}
                         <button type="submit" disabled={(!input.trim() && !pendingAttachment) || isProcessing} className={clsx("w-9 h-9 flex items-center justify-center rounded-full transition-all duration-200", input.trim() || pendingAttachment ? "bg-[#b4b2a8] text-white hover:bg-accent-primary" : "bg-[#edebe4] text-white opacity-60")}>
                           {isProcessing ? <Loader2 className="w-4 h-4 animate-spin text-[#b4b2a8]" /> : <ArrowUp className="w-5 h-5" />}

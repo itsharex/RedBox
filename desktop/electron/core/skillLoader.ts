@@ -13,6 +13,14 @@ export interface SkillDefinition {
     body: string;
     baseDir: string;
     aliases: string[];
+    whenToUse?: string;
+    allowedTools?: string[];
+    argumentHint?: string;
+    userInvocable?: boolean;
+    executionContext?: 'inline' | 'fork';
+    agent?: string;
+    effort?: string;
+    paths?: string[];
     sourceScope: SkillSourceScope;
     isBuiltin?: boolean;
     disabled?: boolean;
@@ -60,6 +68,19 @@ function inferSkillDescription(body: string): string {
 
 function parseAliases(data: Record<string, unknown>): string[] {
     const value = data.aliases;
+    if (Array.isArray(value)) {
+        return value.map((item) => String(item || '').trim()).filter(Boolean);
+    }
+    if (typeof value === 'string') {
+        return value
+            .split(',')
+            .map((item) => item.trim())
+            .filter(Boolean);
+    }
+    return [];
+}
+
+function parseStringList(value: unknown): string[] {
     if (Array.isArray(value)) {
         return value.map((item) => String(item || '').trim()).filter(Boolean);
     }
@@ -134,6 +155,20 @@ export async function loadSkillFromFile(
             body,
             baseDir: path.dirname(absolutePath),
             aliases: parseAliases(data),
+            whenToUse: typeof data.when_to_use === 'string'
+                ? data.when_to_use.trim()
+                : (typeof data['when-to-use'] === 'string' ? data['when-to-use'].trim() : undefined),
+            allowedTools: parseStringList(data['allowed-tools'] ?? data.allowed_tools),
+            argumentHint: typeof data['argument-hint'] === 'string'
+                ? data['argument-hint'].trim()
+                : (typeof data.argument_hint === 'string' ? data.argument_hint.trim() : undefined),
+            userInvocable: data['user-invocable'] === undefined
+                ? true
+                : Boolean(data['user-invocable']),
+            executionContext: data.context === 'fork' ? 'fork' : 'inline',
+            agent: typeof data.agent === 'string' && data.agent.trim() ? data.agent.trim() : undefined,
+            effort: typeof data.effort === 'string' && data.effort.trim() ? data.effort.trim() : undefined,
+            paths: parseStringList(data.paths),
             sourceScope,
         };
     } catch (error) {

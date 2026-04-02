@@ -41,6 +41,11 @@ const extractNodeText = (value: React.ReactNode): string => {
   return '';
 };
 
+const isVideoAssetUrl = (value: string): boolean => {
+  const normalized = String(value || '').trim().toLowerCase();
+  return ['.mp4', '.webm', '.mov', '.m4v'].some((ext) => normalized.includes(ext));
+};
+
 function InlineCopyButton({ text, label = '复制' }: { text: string; label?: string }) {
   const [copied, setCopied] = useState(false);
 
@@ -293,6 +298,18 @@ export const MessageItem = memo(({
     });
   };
 
+  const handleMediaContextMenu = (event: React.MouseEvent<HTMLElement>, source: string) => {
+    event.preventDefault();
+    const normalized = resolveAssetUrl(String(source || '').trim());
+    if (!normalized) return;
+    setImageMenu({
+      visible: true,
+      x: event.clientX,
+      y: event.clientY,
+      src: normalized,
+    });
+  };
+
   const handleCopyImage = async () => {
     if (!imageMenu.src) return;
     try {
@@ -327,15 +344,27 @@ export const MessageItem = memo(({
   const markdownComponents = useMemo<Components>(() => ({
     ...MARKDOWN_COMPONENTS,
     img({ src, alt }: any) {
-      const imageUrl = resolveAssetUrl(String(src || '').trim());
-      if (!imageUrl) return <span className="text-xs text-text-tertiary">图片地址无效</span>;
+      const mediaUrl = resolveAssetUrl(String(src || '').trim());
+      if (!mediaUrl) return <span className="text-xs text-text-tertiary">资源地址无效</span>;
+      if (isVideoAssetUrl(mediaUrl)) {
+        return (
+          <video
+            src={mediaUrl}
+            controls
+            preload="metadata"
+            className="my-3 max-h-[32rem] w-full max-w-full rounded-xl border border-border bg-surface-secondary shadow-sm"
+            onContextMenu={(event) => handleMediaContextMenu(event, mediaUrl)}
+            title="右键复制或在文件夹中打开"
+          />
+        );
+      }
       return (
         <img
-          src={imageUrl}
+          src={mediaUrl}
           alt={alt || ''}
           className="my-3 max-h-[28rem] w-auto max-w-full cursor-zoom-in rounded-xl border border-border bg-surface-secondary object-contain shadow-sm"
-          onClick={() => setPreviewImage({ src: imageUrl, alt: alt || '' })}
-          onContextMenu={(event) => handleImageContextMenu(event, imageUrl)}
+          onClick={() => setPreviewImage({ src: mediaUrl, alt: alt || '' })}
+          onContextMenu={(event) => handleImageContextMenu(event, mediaUrl)}
           title="点击预览，右键复制或在文件夹中打开"
         />
       );

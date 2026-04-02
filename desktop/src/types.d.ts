@@ -198,8 +198,8 @@ declare global {
 
   interface Window {
     ipcRenderer: {
-      saveSettings: (settings: { api_endpoint: string; api_key: string; model_name: string; model_name_wander?: string; model_name_chatroom?: string; model_name_knowledge?: string; model_name_redclaw?: string; workspace_dir?: string; active_space_id?: string; role_mapping?: Record<string, string> | string; transcription_model?: string; transcription_endpoint?: string; transcription_key?: string; embedding_endpoint?: string; embedding_key?: string; embedding_model?: string; ai_sources_json?: string; default_ai_source_id?: string; image_provider?: string; image_endpoint?: string; image_api_key?: string; image_model?: string; image_provider_template?: string; image_aspect_ratio?: string; image_size?: string; image_quality?: string; mcp_servers_json?: string; redclaw_compact_target_tokens?: number; wander_deep_think_enabled?: boolean; debug_log_enabled?: boolean; developer_mode_enabled?: boolean; developer_mode_unlocked_at?: string | null; chat_max_tokens_default?: number; chat_max_tokens_deepseek?: number }) => Promise<unknown>;
-      getSettings: () => Promise<{ api_endpoint: string; api_key: string; model_name: string; model_name_wander?: string; model_name_chatroom?: string; model_name_knowledge?: string; model_name_redclaw?: string; workspace_dir?: string; active_space_id?: string; role_mapping?: string; transcription_model?: string; transcription_endpoint?: string; transcription_key?: string; embedding_endpoint?: string; embedding_key?: string; embedding_model?: string; ai_sources_json?: string; default_ai_source_id?: string; image_provider?: string; image_endpoint?: string; image_api_key?: string; image_model?: string; image_provider_template?: string; image_aspect_ratio?: string; image_size?: string; image_quality?: string; mcp_servers_json?: string; redclaw_compact_target_tokens?: number; wander_deep_think_enabled?: boolean; debug_log_enabled?: boolean; developer_mode_enabled?: boolean; developer_mode_unlocked_at?: string | null; chat_max_tokens_default?: number; chat_max_tokens_deepseek?: number } | undefined>;
+      saveSettings: (settings: { api_endpoint: string; api_key: string; model_name: string; model_name_wander?: string; model_name_chatroom?: string; model_name_knowledge?: string; model_name_redclaw?: string; search_provider?: string; search_endpoint?: string; search_api_key?: string; workspace_dir?: string; active_space_id?: string; role_mapping?: Record<string, string> | string; transcription_model?: string; transcription_endpoint?: string; transcription_key?: string; embedding_endpoint?: string; embedding_key?: string; embedding_model?: string; ai_sources_json?: string; default_ai_source_id?: string; image_provider?: string; image_endpoint?: string; image_api_key?: string; image_model?: string; video_endpoint?: string; video_api_key?: string; video_model?: string; image_provider_template?: string; image_aspect_ratio?: string; image_size?: string; image_quality?: string; mcp_servers_json?: string; redclaw_compact_target_tokens?: number; wander_deep_think_enabled?: boolean; debug_log_enabled?: boolean; developer_mode_enabled?: boolean; developer_mode_unlocked_at?: string | null; chat_max_tokens_default?: number; chat_max_tokens_deepseek?: number }) => Promise<unknown>;
+      getSettings: () => Promise<{ api_endpoint: string; api_key: string; model_name: string; model_name_wander?: string; model_name_chatroom?: string; model_name_knowledge?: string; model_name_redclaw?: string; search_provider?: string; search_endpoint?: string; search_api_key?: string; workspace_dir?: string; active_space_id?: string; role_mapping?: string; transcription_model?: string; transcription_endpoint?: string; transcription_key?: string; embedding_endpoint?: string; embedding_key?: string; embedding_model?: string; ai_sources_json?: string; default_ai_source_id?: string; image_provider?: string; image_endpoint?: string; image_api_key?: string; image_model?: string; video_endpoint?: string; video_api_key?: string; video_model?: string; image_provider_template?: string; image_aspect_ratio?: string; image_size?: string; image_quality?: string; mcp_servers_json?: string; redclaw_compact_target_tokens?: number; wander_deep_think_enabled?: boolean; debug_log_enabled?: boolean; developer_mode_enabled?: boolean; developer_mode_unlocked_at?: string | null; chat_max_tokens_default?: number; chat_max_tokens_deepseek?: number } | undefined>;
       debug: {
         getStatus: () => Promise<{ enabled: boolean; logDirectory: string }>;
         getRecent: (limit?: number) => Promise<{ lines: string[] }>;
@@ -387,7 +387,7 @@ declare global {
         prepare: () => Promise<{ success: boolean; path: string; alreadyPrepared?: boolean; error?: string }>;
         openDir: () => Promise<{ success: boolean; path: string; error?: string }>;
       };
-      fetchModels: (config: { apiKey: string, baseURL: string, presetId?: string, protocol?: 'openai' | 'anthropic' | 'gemini', purpose?: 'chat' | 'image' }) => Promise<{ id: string }[]>;
+      fetchModels: (config: { apiKey: string, baseURL: string, presetId?: string, protocol?: 'openai' | 'anthropic' | 'gemini', purpose?: 'chat' | 'image' }) => Promise<Array<{ id: string; capabilities?: Array<'chat' | 'image' | 'video' | 'audio' | 'transcription' | 'embedding'> }>>;
       aiRoles: {
         list: () => Promise<RoleSpec[]>;
       };
@@ -439,6 +439,7 @@ declare global {
         };
       }) => void;
         pickAttachment: (payload?: { sessionId?: string }) => Promise<{ success?: boolean; canceled?: boolean; error?: string; attachment?: unknown }>;
+        transcribeAudio: (payload: { audioBase64: string; mimeType?: string; fileName?: string }) => Promise<{ success?: boolean; text?: string; error?: string }>;
         cancel: (data?: { sessionId?: string } | string) => void;
         confirmTool: (callId: string, confirmed: boolean) => void;
         getSessions: () => Promise<ChatSession[]>;
@@ -639,6 +640,122 @@ declare global {
         removeLongCycle: (payload: { taskId: string }) => Promise<{ success: boolean; error?: string }>;
         setLongCycleEnabled: (payload: { taskId: string; enabled: boolean }) => Promise<{ success: boolean; error?: string }>;
         runLongCycleNow: (payload: { taskId: string }) => Promise<{ success: boolean; error?: string }>;
+      };
+      assistantDaemon: {
+        getStatus: () => Promise<{
+          enabled: boolean;
+          autoStart: boolean;
+          keepAliveWhenNoWindow: boolean;
+          host: string;
+          port: number;
+          listening: boolean;
+          lockState: 'owner' | 'passive';
+          blockedBy: string | null;
+          lastError: string | null;
+          activeTaskCount: number;
+          queuedPeerCount: number;
+          inFlightKeys: string[];
+          feishu: {
+            enabled: boolean;
+            receiveMode: 'webhook' | 'websocket';
+            endpointPath: string;
+            verificationToken?: string;
+            encryptKey?: string;
+            appId?: string;
+            appSecret?: string;
+            replyUsingChatId: boolean;
+            webhookUrl: string;
+            websocketRunning: boolean;
+            websocketReconnectAt?: string | null;
+          };
+          relay: {
+            enabled: boolean;
+            endpointPath: string;
+            authToken?: string;
+            webhookUrl: string;
+          };
+          weixin: {
+            enabled: boolean;
+            endpointPath: string;
+            authToken?: string;
+            autoStartSidecar: boolean;
+            cursorFile?: string;
+            sidecarCommand?: string;
+            sidecarArgs?: string[];
+            sidecarCwd?: string;
+            sidecarEnv?: Record<string, string>;
+            webhookUrl: string;
+            sidecarRunning: boolean;
+            sidecarPid?: number;
+          };
+        }>;
+        start: (payload?: {
+          enabled?: boolean;
+          autoStart?: boolean;
+          keepAliveWhenNoWindow?: boolean;
+          host?: string;
+          port?: number;
+          feishu?: {
+            enabled?: boolean;
+            receiveMode?: 'webhook' | 'websocket';
+            endpointPath?: string;
+            verificationToken?: string;
+            encryptKey?: string;
+            appId?: string;
+            appSecret?: string;
+            replyUsingChatId?: boolean;
+          };
+          relay?: {
+            enabled?: boolean;
+            endpointPath?: string;
+            authToken?: string;
+          };
+          weixin?: {
+            enabled?: boolean;
+            endpointPath?: string;
+            authToken?: string;
+            autoStartSidecar?: boolean;
+            cursorFile?: string;
+            sidecarCommand?: string;
+            sidecarArgs?: string[];
+            sidecarCwd?: string;
+            sidecarEnv?: Record<string, string>;
+          };
+        }) => Promise<unknown>;
+        stop: () => Promise<unknown>;
+        setConfig: (payload?: {
+          enabled?: boolean;
+          autoStart?: boolean;
+          keepAliveWhenNoWindow?: boolean;
+          host?: string;
+          port?: number;
+          feishu?: {
+            enabled?: boolean;
+            receiveMode?: 'webhook' | 'websocket';
+            endpointPath?: string;
+            verificationToken?: string;
+            encryptKey?: string;
+            appId?: string;
+            appSecret?: string;
+            replyUsingChatId?: boolean;
+          };
+          relay?: {
+            enabled?: boolean;
+            endpointPath?: string;
+            authToken?: string;
+          };
+          weixin?: {
+            enabled?: boolean;
+            endpointPath?: string;
+            authToken?: string;
+            autoStartSidecar?: boolean;
+            cursorFile?: string;
+            sidecarCommand?: string;
+            sidecarArgs?: string[];
+            sidecarCwd?: string;
+            sidecarEnv?: Record<string, string>;
+          };
+        }) => Promise<unknown>;
       };
       mcp: {
         list: () => Promise<{ success: boolean; servers: Array<{

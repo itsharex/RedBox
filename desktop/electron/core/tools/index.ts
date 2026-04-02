@@ -26,7 +26,7 @@ export {
 export { LspTool } from './lspTool';
 export { TodoWriteTool, TodoReadTool } from './todoTool';
 export { PlanModeEnterTool, PlanModeExitTool } from './planTool';
-export { SkillManageTool, SkillInstallTool } from './skillTool';
+export { SkillTool, SkillManageTool, SkillInstallTool } from './skillTool';
 export { WebSearchTool } from './searchTool';
 
 // 导入工具类型
@@ -48,7 +48,7 @@ import {
 import { LspTool } from './lspTool';
 import { TodoWriteTool, TodoReadTool } from './todoTool';
 import { PlanModeEnterTool, PlanModeExitTool } from './planTool';
-import { SkillManageTool, SkillInstallTool } from './skillTool';
+import { SkillTool, SkillManageTool, SkillInstallTool } from './skillTool';
 import { WebSearchTool } from './searchTool';
 import { WriteFileTool } from './writeFileTool';
 import { EditTool } from './editTool';
@@ -191,6 +191,16 @@ const ensureBuiltinToolDescriptorsRegistered = (): void => {
         artifactOutput: ['web-results'],
         retryPolicy: 'safe-retry',
         create: () => new WebSearchTool(),
+    });
+    register({
+        name: 'skill',
+        displayName: 'Skill',
+        description: 'Load a specialized skill into the current run.',
+        kind: ToolKind.Other,
+        contexts: publicAllContexts,
+        visibility: 'public',
+        requiresContext: null,
+        create: ({ skillManager, onSkillActivated }) => (skillManager ? new SkillTool(skillManager, onSkillActivated) : null),
     });
     register({
         name: 'calculator',
@@ -378,7 +388,12 @@ const ensureBuiltinToolDescriptorsRegistered = (): void => {
  * 创建所有内置工具实例
  * 注意：核心文件操作工具 (read, write, list 等) 现在由 ChatServiceV2 内部的 Vercel AI SDK 工具处理
  */
-export function createBuiltinTools(options: { chatService?: any; pack?: BuiltinToolPack } = {}): ToolDefinition<unknown, ToolResult>[] {
+export function createBuiltinTools(options: {
+    chatService?: any;
+    skillManager?: any;
+    onSkillActivated?: (payload: { name: string; description: string }) => void;
+    pack?: BuiltinToolPack;
+} = {}): ToolDefinition<unknown, ToolResult>[] {
     ensureBuiltinToolDescriptorsRegistered();
     return createBuiltinToolInstances(options);
 }
@@ -400,6 +415,7 @@ export const BUILTIN_TOOL_NAMES = [
     'app_cli',
     'list_dir',
     'web_search',
+    'skill',
     'calculator',
     'save_memory',
     'redclaw_update_profile_doc',

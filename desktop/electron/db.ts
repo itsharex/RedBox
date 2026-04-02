@@ -5,7 +5,56 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { resolveAssetSourceToPath } from './core/localAssetManager';
 
-const dbPath = path.join(app.getPath('userData'), 'redconvert.db');
+const getLegacyUserDataDirs = (): string[] => {
+  const currentUserData = path.resolve(app.getPath('userData'));
+  const parentDir = path.dirname(currentUserData);
+  const currentBaseName = path.basename(currentUserData);
+  const candidates = [
+    'RedBox',
+    'red-convert-desktop',
+    'RedConvert',
+    'redconvert-desktop',
+    'com.redbox.app',
+    app.name,
+  ];
+  return Array.from(new Set(
+    candidates
+      .map((name) => String(name || '').trim())
+      .filter(Boolean)
+      .filter((name) => name !== currentBaseName)
+      .map((name) => path.join(parentDir, name))
+      .filter((candidate) => path.resolve(candidate) !== currentUserData),
+  ));
+};
+
+const migrateLegacyUserDataFileIfNeeded = (fileName: string): string => {
+  const currentPath = path.join(app.getPath('userData'), fileName);
+  try {
+    if (fs.existsSync(currentPath) && fs.statSync(currentPath).size > 0) {
+      return currentPath;
+    }
+  } catch {
+    // fall through to legacy probe
+  }
+
+  for (const legacyDir of getLegacyUserDataDirs()) {
+    const legacyPath = path.join(legacyDir, fileName);
+    try {
+      if (!fs.existsSync(legacyPath)) continue;
+      if (fs.statSync(legacyPath).size <= 0) continue;
+      fs.mkdirSync(path.dirname(currentPath), { recursive: true });
+      fs.copyFileSync(legacyPath, currentPath);
+      console.log(`[UserDataMigration] migrated ${fileName} from ${legacyPath} to ${currentPath}`);
+      return currentPath;
+    } catch (error) {
+      console.warn(`[UserDataMigration] failed to migrate ${fileName} from ${legacyPath}:`, error);
+    }
+  }
+
+  return currentPath;
+};
+
+const dbPath = migrateLegacyUserDataFileIfNeeded('redconvert.db');
 const db = new Database(dbPath);
 
 const DEFAULT_SPACE_ID = 'default';
@@ -55,6 +104,9 @@ const initDb = () => {
       image_endpoint TEXT,
       image_api_key TEXT,
       image_model TEXT,
+      video_endpoint TEXT,
+      video_api_key TEXT,
+      video_model TEXT,
       image_provider_template TEXT,
       image_aspect_ratio TEXT,
       image_size TEXT,
@@ -313,6 +365,15 @@ const initDb = () => {
     db.exec(`ALTER TABLE settings ADD COLUMN image_model TEXT;`);
   } catch { /* Column already exists */ }
   try {
+    db.exec(`ALTER TABLE settings ADD COLUMN video_endpoint TEXT;`);
+  } catch { /* Column already exists */ }
+  try {
+    db.exec(`ALTER TABLE settings ADD COLUMN video_api_key TEXT;`);
+  } catch { /* Column already exists */ }
+  try {
+    db.exec(`ALTER TABLE settings ADD COLUMN video_model TEXT;`);
+  } catch { /* Column already exists */ }
+  try {
     db.exec(`ALTER TABLE settings ADD COLUMN image_provider_template TEXT;`);
   } catch { /* Column already exists */ }
   try {
@@ -359,6 +420,15 @@ const initDb = () => {
   } catch { /* Column already exists */ }
   try {
     db.exec(`ALTER TABLE settings ADD COLUMN model_name_redclaw TEXT;`);
+  } catch { /* Column already exists */ }
+  try {
+    db.exec(`ALTER TABLE settings ADD COLUMN search_provider TEXT;`);
+  } catch { /* Column already exists */ }
+  try {
+    db.exec(`ALTER TABLE settings ADD COLUMN search_endpoint TEXT;`);
+  } catch { /* Column already exists */ }
+  try {
+    db.exec(`ALTER TABLE settings ADD COLUMN search_api_key TEXT;`);
   } catch { /* Column already exists */ }
 
   try {
@@ -442,11 +512,14 @@ export const saveSettings = (settings: {
   api_endpoint?: string;
   api_key?: string;
   model_name?: string;
-  model_name_wander?: string;
-  model_name_chatroom?: string;
-  model_name_knowledge?: string;
-  model_name_redclaw?: string;
-  role_mapping?: string;
+    model_name_wander?: string;
+    model_name_chatroom?: string;
+    model_name_knowledge?: string;
+    model_name_redclaw?: string;
+    search_provider?: string;
+    search_endpoint?: string;
+    search_api_key?: string;
+    role_mapping?: string;
   workspace_dir?: string;
   active_space_id?: string;
   transcription_model?: string;
@@ -461,6 +534,9 @@ export const saveSettings = (settings: {
   image_endpoint?: string;
   image_api_key?: string;
   image_model?: string;
+  video_endpoint?: string;
+  video_api_key?: string;
+  video_model?: string;
   image_provider_template?: string;
   image_aspect_ratio?: string;
   image_size?: string;
@@ -475,8 +551,8 @@ export const saveSettings = (settings: {
   chat_max_tokens_deepseek?: number;
 }) => {
   const stmt = db.prepare(`
-    INSERT INTO settings (id, api_endpoint, api_key, model_name, model_name_wander, model_name_chatroom, model_name_knowledge, model_name_redclaw, role_mapping, workspace_dir, active_space_id, transcription_model, transcription_endpoint, transcription_key, embedding_endpoint, embedding_key, embedding_model, ai_sources_json, default_ai_source_id, image_provider, image_endpoint, image_api_key, image_model, image_provider_template, image_aspect_ratio, image_size, image_quality, mcp_servers_json, redclaw_compact_target_tokens, wander_deep_think_enabled, debug_log_enabled, developer_mode_enabled, developer_mode_unlocked_at, chat_max_tokens_default, chat_max_tokens_deepseek)
-    VALUES (1, @api_endpoint, @api_key, @model_name, @model_name_wander, @model_name_chatroom, @model_name_knowledge, @model_name_redclaw, @role_mapping, @workspace_dir, @active_space_id, @transcription_model, @transcription_endpoint, @transcription_key, @embedding_endpoint, @embedding_key, @embedding_model, @ai_sources_json, @default_ai_source_id, @image_provider, @image_endpoint, @image_api_key, @image_model, @image_provider_template, @image_aspect_ratio, @image_size, @image_quality, @mcp_servers_json, @redclaw_compact_target_tokens, @wander_deep_think_enabled, @debug_log_enabled, @developer_mode_enabled, @developer_mode_unlocked_at, @chat_max_tokens_default, @chat_max_tokens_deepseek)
+    INSERT INTO settings (id, api_endpoint, api_key, model_name, model_name_wander, model_name_chatroom, model_name_knowledge, model_name_redclaw, role_mapping, workspace_dir, active_space_id, transcription_model, transcription_endpoint, transcription_key, embedding_endpoint, embedding_key, embedding_model, ai_sources_json, default_ai_source_id, image_provider, image_endpoint, image_api_key, image_model, video_endpoint, video_api_key, video_model, image_provider_template, image_aspect_ratio, image_size, image_quality, mcp_servers_json, redclaw_compact_target_tokens, wander_deep_think_enabled, debug_log_enabled, developer_mode_enabled, developer_mode_unlocked_at, chat_max_tokens_default, chat_max_tokens_deepseek)
+    VALUES (1, @api_endpoint, @api_key, @model_name, @model_name_wander, @model_name_chatroom, @model_name_knowledge, @model_name_redclaw, @role_mapping, @workspace_dir, @active_space_id, @transcription_model, @transcription_endpoint, @transcription_key, @embedding_endpoint, @embedding_key, @embedding_model, @ai_sources_json, @default_ai_source_id, @image_provider, @image_endpoint, @image_api_key, @image_model, @video_endpoint, @video_api_key, @video_model, @image_provider_template, @image_aspect_ratio, @image_size, @image_quality, @mcp_servers_json, @redclaw_compact_target_tokens, @wander_deep_think_enabled, @debug_log_enabled, @developer_mode_enabled, @developer_mode_unlocked_at, @chat_max_tokens_default, @chat_max_tokens_deepseek)
     ON CONFLICT(id) DO UPDATE SET
       api_endpoint = @api_endpoint,
       api_key = @api_key,
@@ -500,6 +576,9 @@ export const saveSettings = (settings: {
       image_endpoint = @image_endpoint,
       image_api_key = @image_api_key,
       image_model = @image_model,
+      video_endpoint = @video_endpoint,
+      video_api_key = @video_api_key,
+      video_model = @video_model,
       image_provider_template = @image_provider_template,
       image_aspect_ratio = @image_aspect_ratio,
       image_size = @image_size,
@@ -521,6 +600,9 @@ export const saveSettings = (settings: {
     model_name_chatroom?: string;
     model_name_knowledge?: string;
     model_name_redclaw?: string;
+    search_provider?: string;
+    search_endpoint?: string;
+    search_api_key?: string;
     role_mapping?: string;
     workspace_dir?: string;
     active_space_id?: string;
@@ -536,6 +618,9 @@ export const saveSettings = (settings: {
     image_endpoint?: string;
     image_api_key?: string;
     image_model?: string;
+    video_endpoint?: string;
+    video_api_key?: string;
+    video_model?: string;
     image_provider_template?: string;
     image_aspect_ratio?: string;
     image_size?: string;
@@ -564,6 +649,9 @@ export const saveSettings = (settings: {
     model_name_chatroom: String(settings.model_name_chatroom ?? current?.model_name_chatroom ?? '').trim(),
     model_name_knowledge: String(settings.model_name_knowledge ?? current?.model_name_knowledge ?? '').trim(),
     model_name_redclaw: String(settings.model_name_redclaw ?? current?.model_name_redclaw ?? '').trim(),
+    search_provider: String(settings.search_provider ?? current?.search_provider ?? 'duckduckgo').trim() || 'duckduckgo',
+    search_endpoint: String(settings.search_endpoint ?? current?.search_endpoint ?? '').trim(),
+    search_api_key: String(settings.search_api_key ?? current?.search_api_key ?? '').trim(),
     role_mapping: settings.role_mapping === undefined
       ? (current?.role_mapping || '{}')
       : typeof settings.role_mapping === 'object'
@@ -583,6 +671,9 @@ export const saveSettings = (settings: {
     image_endpoint: settings.image_endpoint ?? current?.image_endpoint ?? '',
     image_api_key: settings.image_api_key ?? current?.image_api_key ?? '',
     image_model: settings.image_model ?? current?.image_model ?? '',
+    video_endpoint: settings.video_endpoint ?? current?.video_endpoint ?? '',
+    video_api_key: settings.video_api_key ?? current?.video_api_key ?? '',
+    video_model: settings.video_model ?? current?.video_model ?? '',
     image_provider_template: settings.image_provider_template ?? current?.image_provider_template ?? '',
     image_aspect_ratio: settings.image_aspect_ratio ?? current?.image_aspect_ratio ?? '',
     image_size: settings.image_size ?? current?.image_size ?? '',
@@ -626,6 +717,9 @@ export const getSettings = () => {
     model_name_chatroom?: string;
     model_name_knowledge?: string;
     model_name_redclaw?: string;
+    search_provider?: string;
+    search_endpoint?: string;
+    search_api_key?: string;
     role_mapping?: string;
     workspace_dir?: string;
     active_space_id?: string;
@@ -641,6 +735,9 @@ export const getSettings = () => {
     image_endpoint?: string;
     image_api_key?: string;
     image_model?: string;
+    video_endpoint?: string;
+    video_api_key?: string;
+    video_model?: string;
     image_provider_template?: string;
     image_aspect_ratio?: string;
     image_size?: string;
@@ -658,6 +755,9 @@ export const getSettings = () => {
   // Ensure workspace_dir has a default value
   if (result && !result.workspace_dir) {
     result.workspace_dir = getDefaultWorkspaceDir();
+  }
+  if (result && !result.search_provider) {
+    result.search_provider = 'duckduckgo';
   }
   if (result?.workspace_dir) {
     result.workspace_dir = normalizeWorkspaceDir(result.workspace_dir);

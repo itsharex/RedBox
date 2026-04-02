@@ -9,7 +9,8 @@ export type BackgroundTaskKind =
   | 'long-cycle'
   | 'heartbeat'
   | 'memory-maintenance'
-  | 'headless-runtime';
+  | 'headless-runtime'
+  | 'external-message';
 
 export type BackgroundTaskStatus = 'running' | 'completed' | 'failed' | 'cancelled';
 export type BackgroundTaskPhase =

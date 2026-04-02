@@ -3,6 +3,8 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { getWorkspacePaths } from '../../db';
+import { buildMcpPromptSection } from '../mcpPromptSummary';
+import { SkillManager } from '../skillManager';
 import { createBuiltinTools } from '../tools';
 import type { BuiltinToolPack } from '../tools/catalog';
 import { getCoreSystemPrompt, type SystemPromptOptions } from './systemPrompt';
@@ -108,6 +110,15 @@ export async function buildProjectContextContent(
     sections.push(`## ${normalizeDisplayPath(memoryPath, workspacePaths)}\n${memoryContent}`);
   }
 
+  const mcpPromptSection = buildMcpPromptSection({
+    maxVisibleServers: 4,
+    maxChars: 1200,
+    includeDiscoveryGuide: true,
+  });
+  if (mcpPromptSection) {
+    sections.push(mcpPromptSection);
+  }
+
   if (!sections.length) {
     return '';
   }
@@ -197,11 +208,14 @@ export async function buildRuntimeBaseSystemPrompt(params?: {
   workspacePaths?: WorkspacePaths;
 }): Promise<string> {
   const toolPack = resolveBuiltinToolPack(params?.runtimeMode);
+  const workspacePaths = params?.workspacePaths || getWorkspacePaths();
+  const skillManager = new SkillManager();
+  await skillManager.discoverSkills(workspacePaths.base);
   return buildDefaultSystemPrompt({
-    skills: [],
-    tools: createBuiltinTools({ pack: toolPack }),
+    skills: skillManager.getSkills(),
+    tools: createBuiltinTools({ pack: toolPack, skillManager }),
     interactive: params?.interactive ?? true,
     customRules: params?.customRules,
-    workspacePaths: params?.workspacePaths,
+    workspacePaths,
   });
 }

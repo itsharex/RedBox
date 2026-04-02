@@ -74,6 +74,7 @@ import {
   type MediaAsset,
 } from './core/mediaLibraryStore';
 import { generateImagesToMediaLibrary } from './core/imageGenerationService';
+import { generateVideosToMediaLibrary } from './core/videoGenerationService';
 import { buildRuntimeBaseSystemPrompt } from './core/prompts/defaultPromptBuilder';
 import {
   listCoverAssets,
@@ -90,6 +91,7 @@ import { loadOfficialFeatureModule } from './officialFeatureBridge';
 import { getMemoryMaintenanceService } from './core/memoryMaintenanceService';
 import { getBackgroundTaskRegistry } from './core/backgroundTaskRegistry';
 import { getHeadlessWorkerProcessManager } from './core/headlessWorkerProcessManager';
+import { getAssistantDaemonService } from './core/assistantDaemonService';
 import { generateAdvisorPersonaDocument } from './core/advisorPersonaGenerator';
 import {
   getDebugLogDirectory,
@@ -203,6 +205,7 @@ const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL']
 let redClawRunnerListenersAttached = false;
 let backgroundTaskRegistryListenersAttached = false;
 let advisorYoutubeRunnerListenersAttached = false;
+let assistantDaemonListenersAttached = false;
 const DOWNLOAD_RETRY_DELAYS_MS = [0, 600, 1600];
 const XHS_ASSET_REQUEST_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 RedBox/1.0',
@@ -376,6 +379,9 @@ const normalizeSettingsInput = (settings: Record<string, unknown>) => {
   if (Object.prototype.hasOwnProperty.call(settings, 'image_endpoint')) {
     normalized.image_endpoint = normalizeApiBaseUrl(String(settings.image_endpoint || ''));
   }
+  if (Object.prototype.hasOwnProperty.call(settings, 'search_endpoint')) {
+    normalized.search_endpoint = normalizeApiBaseUrl(String(settings.search_endpoint || ''));
+  }
   if (Object.prototype.hasOwnProperty.call(settings, 'model_name_wander')) {
     normalized.model_name_wander = String(settings.model_name_wander || '').trim();
   }
@@ -390,6 +396,12 @@ const normalizeSettingsInput = (settings: Record<string, unknown>) => {
   }
   if (Object.prototype.hasOwnProperty.call(settings, 'ai_sources_json')) {
     normalized.ai_sources_json = normalizeAiSourceListJson(settings.ai_sources_json);
+  }
+  if (Object.prototype.hasOwnProperty.call(settings, 'search_provider')) {
+    normalized.search_provider = String(settings.search_provider || 'duckduckgo').trim().toLowerCase() || 'duckduckgo';
+  }
+  if (Object.prototype.hasOwnProperty.call(settings, 'search_api_key')) {
+    normalized.search_api_key = String(settings.search_api_key || '').trim();
   }
 
   return normalized;
@@ -609,14 +621,16 @@ function createWindow() {
 app.on('window-all-closed', async () => {
   if (process.platform !== 'darwin') {
     try {
-      const [keepRedClawAlive, keepAdvisorYoutubeAlive] = await Promise.all([
+      const [keepRedClawAlive, keepAdvisorYoutubeAlive, keepAssistantDaemonAlive] = await Promise.all([
         getRedClawBackgroundRunner().shouldKeepAliveWhenNoWindow(),
         getAdvisorYoutubeBackgroundRunner().shouldKeepAliveWhenNoWindow(),
+        getAssistantDaemonService().shouldKeepAliveWhenNoWindow(),
       ]);
-      if (keepRedClawAlive || keepAdvisorYoutubeAlive) {
+      if (keepRedClawAlive || keepAdvisorYoutubeAlive || keepAssistantDaemonAlive) {
         console.log('[BackgroundRunner] Keep app alive in background (no window).', {
           redclaw: keepRedClawAlive,
           advisorYoutube: keepAdvisorYoutubeAlive,
+          assistantDaemon: keepAssistantDaemonAlive,
         });
         win = null;
         return;
@@ -631,6 +645,7 @@ app.on('window-all-closed', async () => {
 
 app.on('before-quit', () => {
   void getHeadlessWorkerProcessManager().dispose();
+  void getAssistantDaemonService().dispose();
 });
 
 app.on('activate', () => {
@@ -720,6 +735,111 @@ async function ensureWorkspaceStructureFor(paths: ReturnType<typeof getWorkspace
     path.join(paths.base, 'chatrooms'),
   ];
   await Promise.all(dirs.map((dir) => fs.mkdir(dir, { recursive: true })));
+}
+
+const SUSPICIOUS_WORKSPACE_BASENAME_HINTS = [
+  '稿件',
+  '文稿',
+  'documents',
+  'document',
+  'manuscripts',
+  'manuscript',
+];
+
+const EXISTING_WORKSPACE_MARKERS = new Set([
+  'skills',
+  'knowledge',
+  'advisors',
+  'manuscripts',
+  'media',
+  'redclaw',
+  'memory',
+  'archives',
+  'chatrooms',
+]);
+
+const MARKDOWN_FILE_EXTENSIONS = new Set(['.md', '.markdown', '.mdx']);
+
+function normalizeWorkspaceHint(value: string): string {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[_-\s]+/g, '');
+}
+
+async function inspectWorkspaceBootstrapRisk(baseDir: string): Promise<{
+  shouldConfirm: boolean;
+  baseName: string;
+  markdownCount: number;
+}> {
+  const normalizedDir = String(baseDir || '').trim();
+  if (!normalizedDir) {
+    return { shouldConfirm: false, baseName: '', markdownCount: 0 };
+  }
+
+  try {
+    const stat = await fs.stat(normalizedDir);
+    if (!stat.isDirectory()) {
+      return { shouldConfirm: false, baseName: path.basename(normalizedDir), markdownCount: 0 };
+    }
+
+    const entries = await fs.readdir(normalizedDir, { withFileTypes: true });
+    const hasWorkspaceMarkers = entries.some((entry) => entry.isDirectory() && EXISTING_WORKSPACE_MARKERS.has(entry.name.toLowerCase()));
+    if (hasWorkspaceMarkers) {
+      return { shouldConfirm: false, baseName: path.basename(normalizedDir), markdownCount: 0 };
+    }
+
+    const baseName = path.basename(normalizedDir);
+    const normalizedBaseName = normalizeWorkspaceHint(baseName);
+    const suspiciousBaseName = SUSPICIOUS_WORKSPACE_BASENAME_HINTS.some((hint) => {
+      const normalizedHint = normalizeWorkspaceHint(hint);
+      return normalizedBaseName === normalizedHint || normalizedBaseName.includes(normalizedHint);
+    });
+    if (!suspiciousBaseName) {
+      return { shouldConfirm: false, baseName, markdownCount: 0 };
+    }
+
+    const markdownCount = entries.filter((entry) => {
+      return entry.isFile() && MARKDOWN_FILE_EXTENSIONS.has(path.extname(entry.name).toLowerCase());
+    }).length;
+
+    return {
+      shouldConfirm: markdownCount >= 5,
+      baseName,
+      markdownCount,
+    };
+  } catch {
+    return { shouldConfirm: false, baseName: path.basename(normalizedDir), markdownCount: 0 };
+  }
+}
+
+async function confirmWorkspaceBootstrapIfNeeded(
+  parent: BrowserWindow | null | undefined,
+  paths: ReturnType<typeof getWorkspacePaths>,
+): Promise<boolean> {
+  const risk = await inspectWorkspaceBootstrapRisk(paths.base);
+  if (!risk.shouldConfirm) {
+    return true;
+  }
+
+  const result = await showNativeMessageBox(parent, {
+    type: 'warning',
+    title: '确认工作区根目录',
+    message: '当前工作区路径看起来像一个现有稿件目录。',
+    detail: [
+      `目录路径：${paths.base}`,
+      `目录名：${risk.baseName}`,
+      `已检测到 ${risk.markdownCount} 个 Markdown 文件。`,
+      '如果继续，RedConvert 会在这个目录里创建 skills、knowledge、advisors、manuscripts、media、redclaw、memory、archives、chatrooms 等完整工作区结构。',
+      '如果这本来就是你的稿件目录，请返回设置，把工作区改成它的上一级目录。',
+    ].join('\n'),
+    buttons: ['继续创建工作区结构', '暂不创建'],
+    defaultId: 1,
+    cancelId: 1,
+    noLink: true,
+  });
+
+  return result.response === 0;
 }
 
 function toLocalFileUrl(absolutePath: string): string {
@@ -920,6 +1040,7 @@ async function refreshForSpaceChange() {
   await vectorStore.refreshCache();
   await getRedClawBackgroundRunner().reloadForWorkspaceChange();
   await getMemoryMaintenanceService().reloadForWorkspaceChange();
+  await getAssistantDaemonService().reloadForWorkspaceChange();
 
   win?.webContents.send('space:changed', { activeSpaceId: getActiveSpaceId() });
 }
@@ -951,6 +1072,20 @@ async function initializeBackgroundTaskRegistry() {
   }
 }
 
+async function initializeAssistantDaemon() {
+  const daemon = getAssistantDaemonService();
+  if (!assistantDaemonListenersAttached) {
+    daemon.on('status', (status) => {
+      win?.webContents.send('assistant:daemon-status', status);
+    });
+    daemon.on('log', (log) => {
+      win?.webContents.send('assistant:daemon-log', log);
+    });
+    assistantDaemonListenersAttached = true;
+  }
+  await daemon.init();
+}
+
 app.whenReady().then(async () => {
   const officialFeatureModule = await loadOfficialFeatureModule();
   if (officialFeatureModule?.registerOfficialFeatures) {
@@ -967,6 +1102,20 @@ app.whenReady().then(async () => {
     });
   }
 
+  try {
+    await officialFeatureModule?.syncOfficialAiRoutingOnStartup?.({
+      getSettings: () => (getSettings() || {}) as Record<string, unknown>,
+      saveSettings: (settings) => {
+        saveSettings(
+          normalizeSettingsInput(settings) as Parameters<typeof saveSettings>[0]
+        );
+      },
+      normalizeSettingsInput,
+    });
+  } catch (e) {
+    console.error('[official-feature] Failed to hydrate official auth on startup:', e);
+  }
+
   registerLocalAssetProtocols();
   createWindow();
 
@@ -977,27 +1126,18 @@ app.whenReady().then(async () => {
     bootstrapped = true;
 
     try {
-      await ensureWorkspaceStructureFor(getWorkspacePaths());
+      const workspacePaths = getWorkspacePaths();
+      const shouldBootstrapWorkspace = await confirmWorkspaceBootstrapIfNeeded(win, workspacePaths);
+      if (shouldBootstrapWorkspace) {
+        await ensureWorkspaceStructureFor(workspacePaths);
+      } else {
+        console.warn('[Workspace] Skipped workspace bootstrap because the configured directory looks like an existing manuscripts folder:', workspacePaths.base);
+      }
     } catch (e) {
       console.error('[Workspace] Failed to ensure workspace structure:', e);
     }
 
     await warmupBrowserPluginPrepared();
-
-    try {
-      await officialFeatureModule?.syncOfficialAiRoutingOnStartup?.({
-        getSettings: () => (getSettings() || {}) as Record<string, unknown>,
-        saveSettings: (settings) => {
-          saveSettings(
-            normalizeSettingsInput(settings) as Parameters<typeof saveSettings>[0]
-          );
-        },
-        normalizeSettingsInput,
-      });
-    } catch (e) {
-      console.error('[official-feature] Failed to sync optional official routing on startup:', e);
-    }
-
     try {
       await initializeRedClawBackgroundRunner();
     } catch (e) {
@@ -1008,6 +1148,12 @@ app.whenReady().then(async () => {
       await initializeBackgroundTaskRegistry();
     } catch (e) {
       console.error('[BackgroundTasks] Init failed:', e);
+    }
+
+    try {
+      await initializeAssistantDaemon();
+    } catch (e) {
+      console.error('[AssistantDaemon] Init failed:', e);
     }
 
     try {
@@ -1571,6 +1717,97 @@ ipcMain.handle('background-tasks:cancel', async (_, payload?: { taskId?: string 
 
 ipcMain.handle('background-workers:get-pool-state', async () => {
   return getHeadlessWorkerProcessManager().getPoolSnapshot();
+});
+
+ipcMain.handle('assistant:daemon-status', async () => {
+  return getAssistantDaemonService().getStatus();
+});
+
+ipcMain.handle('assistant:daemon-start', async (_, payload: {
+  autoStart?: boolean;
+  keepAliveWhenNoWindow?: boolean;
+  host?: string;
+  port?: number;
+  feishu?: {
+    enabled?: boolean;
+    receiveMode?: 'webhook' | 'websocket';
+    endpointPath?: string;
+    verificationToken?: string;
+    encryptKey?: string;
+    appId?: string;
+    appSecret?: string;
+    replyUsingChatId?: boolean;
+  };
+  relay?: {
+    enabled?: boolean;
+    endpointPath?: string;
+    authToken?: string;
+  };
+  weixin?: {
+    enabled?: boolean;
+    endpointPath?: string;
+    authToken?: string;
+    autoStartSidecar?: boolean;
+    cursorFile?: string;
+    sidecarCommand?: string;
+    sidecarArgs?: string[];
+    sidecarCwd?: string;
+    sidecarEnv?: Record<string, string>;
+  };
+} = {}) => {
+  try {
+    return await getAssistantDaemonService().start(payload);
+  } catch (error) {
+    return { success: false, error: String(error) };
+  }
+});
+
+ipcMain.handle('assistant:daemon-stop', async () => {
+  try {
+    return await getAssistantDaemonService().stop();
+  } catch (error) {
+    return { success: false, error: String(error) };
+  }
+});
+
+ipcMain.handle('assistant:daemon-set-config', async (_, payload: {
+  enabled?: boolean;
+  autoStart?: boolean;
+  keepAliveWhenNoWindow?: boolean;
+  host?: string;
+  port?: number;
+  feishu?: {
+    enabled?: boolean;
+    receiveMode?: 'webhook' | 'websocket';
+    endpointPath?: string;
+    verificationToken?: string;
+    encryptKey?: string;
+    appId?: string;
+    appSecret?: string;
+    replyUsingChatId?: boolean;
+  };
+  relay?: {
+    enabled?: boolean;
+    endpointPath?: string;
+    authToken?: string;
+  };
+  weixin?: {
+    enabled?: boolean;
+    endpointPath?: string;
+    authToken?: string;
+    autoStartSidecar?: boolean;
+    cursorFile?: string;
+    sidecarCommand?: string;
+    sidecarArgs?: string[];
+    sidecarCwd?: string;
+    sidecarEnv?: Record<string, string>;
+  };
+} = {}) => {
+  try {
+    return await getAssistantDaemonService().setConfig(payload);
+  } catch (error) {
+    return { success: false, error: String(error) };
+  }
 });
 
 ipcMain.handle('memory:add', async (_, { content, type, tags }) => {
@@ -2467,6 +2704,60 @@ ipcMain.handle('image-gen:generate', async (_, {
   }
 });
 
+ipcMain.handle('video-gen:generate', async (_, {
+  prompt,
+  projectId,
+  title,
+  model,
+  generationMode,
+  referenceImages,
+  aspectRatio,
+  count,
+  durationSeconds,
+  resolution,
+  generateAudio,
+}: {
+  prompt: string;
+  projectId?: string;
+  title?: string;
+  model?: string;
+  generationMode?: 'text-to-video' | 'reference-guided' | 'first-last-frame' | string;
+  referenceImages?: string[];
+  aspectRatio?: string;
+  count?: number;
+  durationSeconds?: number;
+  resolution?: '720p' | '1080p';
+  generateAudio?: boolean;
+}) => {
+  try {
+    const normalizedGenerationMode = (() => {
+      const value = String(generationMode || '').trim().toLowerCase();
+      if (value === 'text-to-video' || value === 'reference-guided' || value === 'first-last-frame') {
+        return value as 'text-to-video' | 'reference-guided' | 'first-last-frame';
+      }
+      return undefined;
+    })();
+    const result = await generateVideosToMediaLibrary({
+      prompt,
+      projectId,
+      title,
+      model,
+      generationMode: normalizedGenerationMode,
+      referenceImages,
+      aspectRatio,
+      count,
+      durationSeconds,
+      resolution,
+      generateAudio,
+    });
+    const assets = await Promise.all(result.assets.map((asset) => enrichMediaAsset(asset)));
+    return { success: true, assets };
+  } catch (error) {
+    console.error('Failed to generate videos:', error);
+    return { success: false, error: String(error) };
+  }
+});
+
 // 获取所有会话
 ipcMain.handle('chat:get-sessions', async () => {
   return getChatSessions();
@@ -2696,6 +2987,52 @@ ipcMain.handle('chat:pick-attachment', async (_, payload?: { sessionId?: string 
   }
 });
 
+ipcMain.handle('chat:transcribe-audio', async (_event, payload?: {
+  audioBase64?: string;
+  mimeType?: string;
+  fileName?: string;
+}) => {
+  const audioBase64 = String(payload?.audioBase64 || '').trim();
+  if (!audioBase64) {
+    return { success: false, error: '缺少音频数据' };
+  }
+
+  const mimeType = String(payload?.mimeType || 'audio/webm').trim().toLowerCase();
+  const requestedName = String(payload?.fileName || '').trim();
+  const extFromMime = (() => {
+    if (mimeType.includes('webm')) return '.webm';
+    if (mimeType.includes('wav')) return '.wav';
+    if (mimeType.includes('mpeg') || mimeType.includes('mp3')) return '.mp3';
+    if (mimeType.includes('mp4')) return '.mp4';
+    if (mimeType.includes('ogg')) return '.ogg';
+    if (mimeType.includes('aac')) return '.aac';
+    if (mimeType.includes('m4a')) return '.m4a';
+    return '.webm';
+  })();
+
+  const tempFileName = `${requestedName.replace(/[^\w.\-\u4e00-\u9fa5]+/g, '_') || `chat_audio_${Date.now()}`}${path.extname(requestedName) || extFromMime}`;
+  const tempFilePath = path.join(app.getPath('temp'), tempFileName);
+
+  try {
+    const audioBuffer = Buffer.from(audioBase64, 'base64');
+    await fs.writeFile(tempFilePath, audioBuffer);
+    const result = await transcribeVideoToText(tempFilePath);
+    if (!result.text) {
+      return { success: false, error: result.error || '转录失败' };
+    }
+    return { success: true, text: result.text };
+  } catch (error) {
+    console.error('[chat:transcribe-audio] Failed:', error);
+    return { success: false, error: error instanceof Error ? error.message : String(error) };
+  } finally {
+    try {
+      await fs.unlink(tempFilePath);
+    } catch {
+      // ignore cleanup failures
+    }
+  }
+});
+
 // 开始聊天（使用 ChatServiceV2）
 ipcMain.on('chat:send-message', async (event, { sessionId, message, displayContent, attachment, modelConfig, taskHints }) => {
   const resolveRuntimeModeForSession = (value: string): RuntimeMode => {
@@ -2708,6 +3045,12 @@ ipcMain.on('chat:send-message', async (event, { sessionId, message, displayConte
   };
   const sender = event.sender;
   const settings = (getSettings() || {}) as Record<string, unknown>;
+  const selectedModelConfig = (modelConfig && typeof modelConfig === 'object')
+    ? modelConfig as { apiKey?: string; baseURL?: string; modelName?: string }
+    : null;
+  const resolvedChatApiKey = String(selectedModelConfig?.apiKey || settings.api_key || '').trim();
+  const resolvedChatBaseURL = normalizeApiBaseUrl(String(selectedModelConfig?.baseURL || settings.api_endpoint || '').trim());
+  const resolvedModelName = String(selectedModelConfig?.modelName || settings.model_name || 'gpt-4o').trim();
   const rawAttachment = (attachment && typeof attachment === 'object')
     ? (attachment as Record<string, unknown>)
     : null;
@@ -2729,13 +3072,6 @@ ipcMain.on('chat:send-message', async (event, { sessionId, message, displayConte
         return {} as Record<string, unknown>;
       }
     })() : {};
-
-    const modelScope = resolveModelScopeFromContextType(String(sessionMeta.contextType || ''));
-    const resolvedModelName = resolveScopedModelName(
-      settings,
-      modelScope,
-      (settings.model_name as string) || 'gpt-4o'
-    );
     const requiresMultimodal = Boolean(rawAttachment.requiresMultimodal);
     if (requiresMultimodal && !isLikelyMultimodalModel(resolvedModelName)) {
       const kind = String(rawAttachment.kind || 'file');
@@ -2797,6 +3133,13 @@ ipcMain.on('chat:send-message', async (event, { sessionId, message, displayConte
     });
 
     if (routeAnalysis.shouldUseCoordinator && runtimeMode !== 'background-maintenance') {
+      sender.send('chat:phase-start', { name: '任务已进入协作模式' });
+      sender.send('chat:thought-start', {});
+      sender.send('chat:thought-delta', {
+        content: routeAnalysis.route.intent === 'manuscript_creation'
+          ? '正在接管创作任务并准备读取素材...'
+          : '正在接管任务并准备协作执行...',
+      });
       const baseSystemPrompt = await buildRuntimeBaseSystemPrompt({ runtimeMode, interactive: true });
       console.log('[chat:send-message] routed-to-coordinator', {
         sessionId,
@@ -2818,9 +3161,9 @@ ipcMain.on('chat:send-message', async (event, { sessionId, message, displayConte
         },
         baseSystemPrompt,
         llm: {
-          apiKey: String(settings.api_key || '').trim(),
-          baseURL: normalizeApiBaseUrl(String(settings.api_endpoint || '').trim()),
-          model: String(resolveScopedModelName(settings, 'redclaw', String(settings.model_name || 'gpt-4o-mini'))).trim(),
+          apiKey: resolvedChatApiKey,
+          baseURL: resolvedChatBaseURL,
+          model: resolvedModelName || String(resolveScopedModelName(settings, 'redclaw', String(settings.model_name || 'gpt-4o-mini'))).trim(),
         },
       });
       await getLongTaskCoordinator().maybeRun(prepared.task.id, {
@@ -2834,7 +3177,11 @@ ipcMain.on('chat:send-message', async (event, { sessionId, message, displayConte
     const service = getOrCreateChatService(sessionId, sender);
 
     // 发送消息
-    await service.sendMessage(outgoingMessage, sessionId);
+    await service.sendMessage(outgoingMessage, sessionId, {
+      apiKey: resolvedChatApiKey,
+      baseURL: resolvedChatBaseURL,
+      modelName: resolvedModelName,
+    });
     console.log('[chat:send-message] completed', { sessionId });
 
   } catch (err: unknown) {

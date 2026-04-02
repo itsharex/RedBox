@@ -92,6 +92,9 @@ function extByMime(mimeType: string): string {
   if (lower.includes('jpeg') || lower.includes('jpg')) return 'jpg';
   if (lower.includes('webp')) return 'webp';
   if (lower.includes('gif')) return 'gif';
+  if (lower.includes('mp4')) return 'mp4';
+  if (lower.includes('webm')) return 'webm';
+  if (lower.includes('quicktime') || lower.includes('mov')) return 'mov';
   return 'png';
 }
 
@@ -132,7 +135,7 @@ export async function listMediaAssets(limit = 200): Promise<MediaAsset[]> {
 
 export async function createGeneratedMediaAsset(input: {
   prompt: string;
-  imageBuffer: Buffer;
+  dataBuffer: Buffer;
   mimeType?: string;
   projectId?: string;
   provider?: string;
@@ -151,7 +154,7 @@ export async function createGeneratedMediaAsset(input: {
   const fileName = `${id}.${ext}`;
   const relativePath = normalizePathForStore(path.join('generated', fileName));
   const absolutePath = path.join(getMediaRootDir(), relativePath);
-  await fs.writeFile(absolutePath, input.imageBuffer);
+  await fs.writeFile(absolutePath, input.dataBuffer);
 
   const asset: MediaAsset = {
     id,

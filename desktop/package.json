@@ -36,6 +36,7 @@
       "electron/system-skills/**",
       ".private-runtime/**",
       ".plugin-runtime/**",
+      "scripts/**",
       "package.json",
       "redbox.png",
       "!node_modules/better-sqlite3/deps/**",
@@ -78,6 +79,7 @@
     "asarUnpack": [
       "**/*.node",
       "node_modules/ffmpeg-static/**",
+      "scripts/**",
       ".plugin-runtime/**",
       "dist-electron/workers/**"
     ],
@@ -106,6 +108,7 @@
     "@ai-sdk/anthropic": "^3.0.18",
     "@ai-sdk/openai": "^3.0.14",
     "@ai-sdk/openai-compatible": "^2.0.16",
+    "@larksuiteoapi/node-sdk": "^1.60.0",
     "@codemirror/lang-markdown": "^6.5.0",
     "@codemirror/language": "^6.12.1",
     "@codemirror/language-data": "^6.5.2",

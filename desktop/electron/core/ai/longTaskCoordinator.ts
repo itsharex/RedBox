@@ -4,11 +4,13 @@ import {
   getChatMessages,
   getChatSession,
   getSettings,
+  getWorkspacePaths,
 } from '../../db';
 import { getBackgroundTaskRegistry } from '../backgroundTaskRegistry';
 import { getHeadlessTaskSupervisor } from '../headlessTaskSupervisor';
 import { resolveScopedModelName, type ModelScope } from '../modelScopeSettings';
 import { QueryRuntime } from '../queryRuntime';
+import { SkillManager } from '../skillManager';
 import {
   ToolConfirmationOutcome,
   ToolExecutor,
@@ -77,17 +79,41 @@ type SubagentBatchResult = {
   output: SubagentOutput;
 };
 
-const normalizeRoleSequence = (task: AgentTaskSnapshot): RoleId[] => {
+type CoordinatorSourceContext = {
+  sourceContext: string;
+  attachmentType: string | null;
+  hasReferenceMaterials: boolean;
+};
+
+const normalizeRoleSequence = (task: AgentTaskSnapshot, context?: CoordinatorSourceContext): RoleId[] => {
   const byIntent = PREP_ROLE_SEQUENCE_BY_INTENT[task.intent as keyof typeof PREP_ROLE_SEQUENCE_BY_INTENT];
-  if (byIntent && byIntent.length > 0) return byIntent;
+  if (byIntent && byIntent.length > 0) {
+    if (
+      task.intent === 'manuscript_creation'
+      && context?.attachmentType === 'wander-references'
+      && context.hasReferenceMaterials
+    ) {
+      return byIntent.filter((roleId) => roleId !== 'planner');
+    }
+    return byIntent;
+  }
   const fallback = ROLE_SEQUENCE_BY_INTENT[task.taskType] || [];
   return fallback.filter((roleId) => roleId !== 'reviewer');
 };
 
-const normalizeRoleBatches = (task: AgentTaskSnapshot): RoleId[][] => {
+const normalizeRoleBatches = (task: AgentTaskSnapshot, context?: CoordinatorSourceContext): RoleId[][] => {
   const byIntent = PREP_ROLE_BATCHES_BY_INTENT[task.intent as keyof typeof PREP_ROLE_BATCHES_BY_INTENT];
-  if (byIntent && byIntent.length > 0) return byIntent;
-  return normalizeRoleSequence(task).map((roleId) => [roleId]);
+  if (byIntent && byIntent.length > 0) {
+    if (
+      task.intent === 'manuscript_creation'
+      && context?.attachmentType === 'wander-references'
+      && context.hasReferenceMaterials
+    ) {
+      return byIntent.filter((batch) => !batch.includes('planner'));
+    }
+    return byIntent;
+  }
+  return normalizeRoleSequence(task, context).map((roleId) => [roleId]);
 };
 
 const inferArtifactType = (roleId: RoleId): string => {
@@ -120,13 +146,21 @@ const shouldUseCoordinator = (task: AgentTaskSnapshot): boolean => {
   return Boolean(task.route?.requiresLongRunningTask || task.route?.requiresMultiAgent);
 };
 
-const buildCoordinatorSourceContext = (sessionId: string): string => {
+const buildCoordinatorSourceContext = (sessionId: string): CoordinatorSourceContext => {
   const messages = getChatMessages(sessionId);
   const latestUser = [...messages].reverse().find((item) => item.role === 'user' && String(item.content || '').trim());
-  if (!latestUser) return '';
+  if (!latestUser) {
+    return {
+      sourceContext: '',
+      attachmentType: null,
+      hasReferenceMaterials: false,
+    };
+  }
 
   const sections: string[] = [];
   const userContent = String(latestUser.content || '').trim();
+  let attachmentType: string | null = null;
+  let hasReferenceMaterials = false;
   if (userContent) {
     sections.push('## Original User Request');
     sections.push(userContent.slice(0, 6000));
@@ -136,8 +170,10 @@ const buildCoordinatorSourceContext = (sessionId: string): string => {
   if (attachmentRaw) {
     try {
       const attachment = JSON.parse(attachmentRaw) as Record<string, unknown>;
+      attachmentType = String(attachment?.type || '').trim() || null;
       if (attachment?.type === 'wander-references' && Array.isArray(attachment.items)) {
         const items = attachment.items as Array<Record<string, unknown>>;
+        hasReferenceMaterials = items.length > 0;
         sections.push('');
         sections.push('## Attached Reference Materials');
         sections.push(...items.map((item, index) => [
@@ -163,7 +199,11 @@ const buildCoordinatorSourceContext = (sessionId: string): string => {
     }
   }
 
-  return sections.filter(Boolean).join('\n');
+  return {
+    sourceContext: sections.filter(Boolean).join('\n'),
+    attachmentType,
+    hasReferenceMaterials,
+  };
 };
 
 const buildExecutionPrompt = (task: AgentTaskSnapshot, outputs: SubagentOutput[], sourceContext?: string): string => {
@@ -338,6 +378,32 @@ const emitCoordinatorThought = (content: string, options: CoordinatorRunOptions)
     return;
   }
   options.emitChatEvent?.('chat:thought-delta', { content });
+};
+
+const emitCoordinatorPhase = (name: string, options: CoordinatorRunOptions) => {
+  options.emitChatEvent?.('chat:phase-start', { name });
+};
+
+const getCoordinatorPhaseLabel = (batch: RoleId[]): string => {
+  if (batch.length === 1) {
+    switch (batch[0]) {
+      case 'planner':
+        return '规划执行方案';
+      case 'researcher':
+        return '读取素材与提炼要点';
+      case 'copywriter':
+        return '生成文案初稿';
+      case 'reviewer':
+        return '复核执行结果';
+      case 'image-director':
+        return '构思视觉方案';
+      case 'ops-coordinator':
+        return '编排执行任务';
+      default:
+        return `子角色处理中：${batch[0]}`;
+    }
+  }
+  return `并行处理中：${batch.join(' / ')}`;
 };
 
 export class LongTaskCoordinator {
@@ -538,16 +604,35 @@ export class LongTaskCoordinator {
 
     const sessionId = this.ensureOwnerSession(task);
     await backgroundRegistry.attachSession(backgroundTaskId, sessionId);
+    emitCoordinatorPhase('协调器已接管', options);
     options.emitChatEvent?.('chat:thought-start', {});
+    emitCoordinatorThought('正在读取任务上下文并准备协作链路...', options);
     await backgroundRegistry.appendTurn(backgroundTaskId, {
       source: 'system',
       text: '[coordinator] long task planning started',
     });
 
-    const prepRoles = normalizeRoleSequence(task);
-    const prepRoleBatches = normalizeRoleBatches(task);
+    const coordinatorContext = buildCoordinatorSourceContext(sessionId);
+    const prepRoles = normalizeRoleSequence(task, coordinatorContext);
+    const prepRoleBatches = normalizeRoleBatches(task, coordinatorContext);
     const outputs: SubagentOutput[] = [];
-    const sourceContext = buildCoordinatorSourceContext(sessionId);
+    const sourceContext = coordinatorContext.sourceContext;
+
+    if (prepRoles.length === 0) {
+      emitCoordinatorPhase('进入主执行链路', options);
+      emitCoordinatorThought('当前任务无需预备分工，直接开始执行。', options);
+    } else {
+      const plannerSkipped = !prepRoles.includes('planner')
+        && task.intent === 'manuscript_creation'
+        && coordinatorContext.attachmentType === 'wander-references';
+      emitCoordinatorPhase(plannerSkipped ? '跳过规划，直接处理素材' : '准备协作分工', options);
+      emitCoordinatorThought(
+        plannerSkipped
+          ? '已检测到漫步参考素材，跳过 planner，直接进入素材读取与文案生成。'
+          : `已进入多角色协作，准备角色：${prepRoles.join(' -> ')}`,
+        options,
+      );
+    }
 
     runtime.addTrace(task.id, 'coordinator.start', {
       route: task.route,
@@ -561,6 +646,7 @@ export class LongTaskCoordinator {
         throw new Error('Coordinator cancelled');
       }
       const isPlannerBatch = batch.length === 1 && batch[0] === 'planner';
+      emitCoordinatorPhase(getCoordinatorPhaseLabel(batch), options);
       if (isPlannerBatch) {
         runtime.startNode(task.id, 'plan', 'coordinator planner running');
       } else if (task.graph.some((node) => node.type === 'spawn_agents' && node.status !== 'completed')) {
@@ -643,9 +729,13 @@ export class LongTaskCoordinator {
 
     const executionToolPack = normalizeBuiltinPack(activeRole.allowedToolPack);
     const toolRegistry = new ToolRegistry();
-    toolRegistry.registerTools(createBuiltinTools({ pack: executionToolPack }));
+    const skillManager = new SkillManager();
+    await skillManager.discoverSkills(getWorkspacePaths().base);
+    toolRegistry.registerTools(createBuiltinTools({ pack: executionToolPack, skillManager }));
     const toolExecutor = new ToolExecutor(toolRegistry, async () => ToolConfirmationOutcome.ProceedOnce);
 
+    emitCoordinatorPhase('执行与工具调用', options);
+    emitCoordinatorThought('子角色预备完成，正在读取原始素材并进入执行。', options);
     runtime.startNode(task.id, 'execute_tools', `coordinator executing as ${activeRole.roleId}`);
     const queryRuntime = new QueryRuntime(
       toolRegistry,
@@ -699,6 +789,7 @@ export class LongTaskCoordinator {
 
     let repairResponse = '';
     if (task.intent === 'manuscript_creation' && !hasSuccessfulManuscriptWrite(sessionId)) {
+      emitCoordinatorPhase('补保存稿件', options);
       emitCoordinatorThought('检测到稿件尚未真实落盘，正在执行强制保存步骤...', options);
       runtime.addTrace(task.id, 'coordinator.save_repair.started', {
         sessionId,
@@ -780,6 +871,8 @@ You are in a repair-only pass. The manuscript must be saved for real before you 
     }
 
     if (task.graph.some((node) => node.type === 'review')) {
+      emitCoordinatorPhase('结果复核', options);
+      emitCoordinatorThought('主执行已完成，正在做最终复核。', options);
       runtime.startNode(task.id, 'review', 'reviewer validating coordinated execution');
       const reviewOutput = await runStructuredSubagent({
         llm,

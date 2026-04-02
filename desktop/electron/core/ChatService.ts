@@ -94,16 +94,20 @@ export class ChatService extends EventEmitter {
         super();
         this.config = config;
         this.sessionId = `legacy_chat_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        this.skillManager = new SkillManager();
 
         this.toolRegistry = new ToolRegistry();
-        this.toolRegistry.registerTools(createBuiltinTools({ chatService: this, pack: 'redclaw' }));
+        this.toolRegistry.registerTools(createBuiltinTools({
+            chatService: this,
+            skillManager: this.skillManager,
+            onSkillActivated: (payload) => this.emit('skill_activated', payload),
+            pack: 'redclaw',
+        }));
 
         this.toolExecutor = new ToolExecutor(
             this.toolRegistry,
             this.handleConfirmRequest.bind(this)
         );
-
-        this.skillManager = new SkillManager();
         if (config.projectRoot) {
             Instance.init(config.projectRoot);
         }
@@ -184,6 +188,13 @@ export class ChatService extends EventEmitter {
             this.emit('thinking', 'Processing your request...');
 
             this.addHistoryItem({ role: 'user', content: message });
+            const preactivatedSkills = await this.skillManager.preactivateMentionedSkills(message);
+            for (const item of preactivatedSkills) {
+                this.emit('skill_activated', {
+                    name: item.skill.name,
+                    description: item.skill.description,
+                });
+            }
             this.abortController = new AbortController();
             const runtime = new QueryRuntime(
                 this.toolRegistry,
@@ -200,6 +211,7 @@ export class ChatService extends EventEmitter {
                     systemPrompt: await buildDefaultSystemPrompt({
                         skills: this.skillManager.getSkills(),
                         tools: this.toolRegistry.getAllTools(),
+                        activatedSkillContent: this.skillManager.getActiveSkillContents().join('\n\n'),
                         interactive: true,
                     }),
                     messages: this.historyToRuntimeMessages(),

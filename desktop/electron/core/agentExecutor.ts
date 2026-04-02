@@ -53,13 +53,23 @@ export class AgentExecutor {
         private readonly config: AgentConfig,
         private readonly onEvent: (event: AgentEvent) => void,
     ) {
+        this.skillManager = new SkillManager();
         this.toolRegistry = new ToolRegistry();
-        this.toolRegistry.registerTools(createBuiltinTools({ pack: 'redclaw' }));
+        this.toolRegistry.registerTools(createBuiltinTools({
+            pack: 'redclaw',
+            skillManager: this.skillManager,
+            onSkillActivated: (payload) => {
+                this.onEvent({
+                    type: 'skill_activated',
+                    name: payload.name,
+                    description: payload.description,
+                });
+            },
+        }));
         this.toolExecutor = new ToolExecutor(
             this.toolRegistry,
             this.handleConfirmRequest.bind(this),
         );
-        this.skillManager = new SkillManager();
     }
 
     async initialize(): Promise<void> {
@@ -72,6 +82,14 @@ export class AgentExecutor {
     async run(message: string): Promise<void> {
         this.abortController = new AbortController();
         const signal = this.abortController.signal;
+        const preactivatedSkills = await this.skillManager.preactivateMentionedSkills(message);
+        for (const item of preactivatedSkills) {
+            this.onEvent({
+                type: 'skill_activated',
+                name: item.skill.name,
+                description: item.skill.description,
+            });
+        }
         const runtime = new QueryRuntime(
             this.toolRegistry,
             this.toolExecutor,
@@ -87,6 +105,7 @@ export class AgentExecutor {
                 systemPrompt: await buildDefaultSystemPrompt({
                     skills: this.skillManager.getSkills(),
                     tools: this.toolRegistry.getAllTools(),
+                    activatedSkillContent: this.skillManager.getActiveSkillContents().join('\n\n'),
                     interactive: true,
                 }),
                 messages: [],
@@ -228,7 +247,7 @@ export class AgentExecutor {
     }
 
     private handleToolResult(toolName: string, response: ToolCallResponse['result']): void {
-        if (toolName !== 'activate_skill' && toolName !== 'skill') {
+        if (toolName !== 'activate_skill') {
             return;
         }
         const content = response.llmContent || response.display || '';

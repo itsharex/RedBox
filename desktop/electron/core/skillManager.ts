@@ -146,19 +146,36 @@ export class SkillManager {
         const fileXml = files.length
             ? files.map((file) => `<file>${file}</file>`).join('\n')
             : '';
+        const metadataLines = [
+            `<name>${skill.name}</name>`,
+            `<description>${skill.description}</description>`,
+            skill.whenToUse ? `<when_to_use>${skill.whenToUse}</when_to_use>` : '',
+            skill.aliases?.length ? `<aliases>${skill.aliases.join(', ')}</aliases>` : '',
+            skill.allowedTools?.length ? `<allowed_tools>${skill.allowedTools.join(', ')}</allowed_tools>` : '',
+            skill.argumentHint ? `<argument_hint>${skill.argumentHint}</argument_hint>` : '',
+            skill.executionContext ? `<context>${skill.executionContext}</context>` : '',
+            skill.agent ? `<agent>${skill.agent}</agent>` : '',
+            skill.effort ? `<effort>${skill.effort}</effort>` : '',
+            skill.paths?.length ? `<paths>${skill.paths.join(', ')}</paths>` : '',
+            `<source_scope>${skill.sourceScope}</source_scope>`,
+            `<base_dir>${skill.baseDir}</base_dir>`,
+        ].filter(Boolean).join('\n');
 
         return [
-            `<skill_content name="${skill.name}">`,
-            `# Skill: ${skill.name}`,
-            '',
+            `<activated_skill name="${skill.name}">`,
+            '<metadata>',
+            metadataLines,
+            '</metadata>',
+            '<instructions>',
             skill.body.trim(),
             '',
             `Base directory for this skill: ${skill.baseDir}`,
             'Relative paths mentioned by this skill are resolved from the base directory above.',
+            '</instructions>',
             fileXml ? '<skill_files>' : '',
             fileXml,
             fileXml ? '</skill_files>' : '',
-            '</skill_content>',
+            '</activated_skill>',
         ].filter(Boolean).join('\n');
     }
 
@@ -168,9 +185,16 @@ export class SkillManager {
             return null;
         }
 
-        this.activeSkillNames.add(skillNameToKey(skill.name));
+        const key = skillNameToKey(skill.name);
+        const cached = this.activeSkillContents.get(key);
+        if (cached) {
+            this.activeSkillNames.add(key);
+            return cached;
+        }
+
+        this.activeSkillNames.add(key);
         const content = await this.renderActivatedSkill(skill);
-        this.activeSkillContents.set(skillNameToKey(skill.name), content);
+        this.activeSkillContents.set(key, content);
         return content;
     }
 
@@ -290,14 +314,24 @@ export class SkillManager {
                 '  <skill>',
                 `    <name>${skill.name}</name>`,
                 `    <description>${skill.description}</description>`,
+                skill.whenToUse ? `    <when_to_use>${skill.whenToUse}</when_to_use>` : '',
+                skill.aliases?.length ? `    <aliases>${skill.aliases.join(', ')}</aliases>` : '',
+                skill.allowedTools?.length ? `    <allowed_tools>${skill.allowedTools.join(', ')}</allowed_tools>` : '',
+                skill.argumentHint ? `    <argument_hint>${skill.argumentHint}</argument_hint>` : '',
+                skill.executionContext ? `    <context>${skill.executionContext}</context>` : '',
+                skill.agent ? `    <agent>${skill.agent}</agent>` : '',
+                skill.effort ? `    <effort>${skill.effort}</effort>` : '',
+                skill.paths?.length ? `    <paths>${skill.paths.join(', ')}</paths>` : '',
+                `    <source_scope>${skill.sourceScope}</source_scope>`,
                 `    <location>${skill.location}</location>`,
                 '  </skill>',
-            ].join('\n'))
+            ].filter(Boolean).join('\n'))
             .join('\n');
 
         return [
             'Skills provide specialized instructions and workflows for specific tasks.',
-            'When a task matches one of the skills below, use the `skill` tool to load the full instructions before proceeding.',
+            'Keep the full skill body out of context until needed.',
+            'When a task clearly matches one of the skills below, use the `skill` tool to load the full instructions before proceeding.',
             '<available_skills>',
             skillNodes,
             '</available_skills>',
@@ -318,6 +352,7 @@ export class SkillManager {
             'Load a specialized skill that provides domain-specific instructions and workflows.',
             '',
             'When a task matches one of the skills below, load it first so the conversation receives the full instructions and related file context.',
+            'Prefer the `skill` tool over direct guessing when a specialized workflow is likely to help.',
             '',
             'Available skills:',
             list,

@@ -194,7 +194,7 @@ export async function generateImagesToMediaLibrary(input: GenerateImagesInput): 
     for (const output of images.slice(0, count)) {
         const asset = await createGeneratedMediaAsset({
             prompt: normalizedPrompt,
-            imageBuffer: output.imageBuffer,
+            dataBuffer: output.imageBuffer,
             mimeType: output.mimeType,
             projectId: input.projectId?.trim() || undefined,
             provider,

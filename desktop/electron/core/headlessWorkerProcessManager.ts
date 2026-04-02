@@ -1,12 +1,14 @@
 import { app } from 'electron';
 import path from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
+import { getWorkspacePaths } from '../db';
 import { getBackgroundTaskRegistry } from './backgroundTaskRegistry';
 import { evaluateRuntimeToolPermission } from './runtimePermissions';
 import { applyToolResultBudget } from './toolResultBudget';
 import { getSessionRuntimeStore } from './sessionRuntimeStore';
 import { getToolResultStore } from './toolResultStore';
 import { summarizeToolBatch } from './toolBatchSummary';
+import { SkillManager } from './skillManager';
 import {
   createErrorResult,
   ToolErrorType,
@@ -813,7 +815,9 @@ export class HeadlessWorkerProcessManager {
         const runId = nextId('runtime_run');
         const registry = getBackgroundTaskRegistry();
         const toolRegistry = new ToolRegistry();
-        toolRegistry.registerTools(createBuiltinTools({ pack: input.toolPack }));
+        const skillManager = new SkillManager();
+        await skillManager.discoverSkills(getWorkspacePaths().base);
+        toolRegistry.registerTools(createBuiltinTools({ pack: input.toolPack, skillManager }));
         const onAttemptAbort = () => this.abortRuntimeRun(slot);
 
         this.currentAffinity('runtime', input.sessionId, slot.id);
@@ -948,7 +952,9 @@ export class HeadlessWorkerProcessManager {
     calls: ToolCallMessage[],
   ): Promise<HostedToolFeedback[]> {
     const registry = new ToolRegistry();
-    registry.registerTools(createBuiltinTools({ pack: run.toolPack }));
+    const skillManager = new SkillManager();
+    await skillManager.discoverSkills(getWorkspacePaths().base);
+    registry.registerTools(createBuiltinTools({ pack: run.toolPack, skillManager }));
     const executor = new ToolExecutor(registry, async () => ToolConfirmationOutcome.ProceedOnce);
 
     this.runtimeStore.appendTranscript({

@@ -14,6 +14,7 @@ import {
     createErrorResult,
     ToolErrorType,
 } from '../toolRegistry';
+import { searchWeb } from '../webSearchService';
 
 // 参数 Schema
 const SearchParamsSchema = z.object({
@@ -49,41 +50,7 @@ export class WebSearchTool extends DeclarativeTool<typeof SearchParamsSchema> {
 
         try {
             const maxResults = params.maxResults || 5;
-
-            // 使用 DuckDuckGo HTML 搜索
-            const encodedQuery = encodeURIComponent(params.query);
-            const response = await fetch(`https://html.duckduckgo.com/html/?q=${encodedQuery}`, {
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                }
-            });
-
-            if (!response.ok) {
-                throw new Error(`Search API error: ${response.status}`);
-            }
-
-            const html = await response.text();
-
-            // 解析结果
-            const results: { title: string; url: string; description: string }[] = [];
-            const resultRegex = /<a class="result__a" href="([^"]+)"[^>]*>([^<]+)<\/a>/g;
-            const descRegex = /<a class="result__snippet"[^>]*>([^<]+)<\/a>/g;
-
-            let match;
-            let index = 0;
-            while ((match = resultRegex.exec(html)) !== null && index < maxResults) {
-                const url = match[1];
-                const title = match[2].replace(/<[^>]+>/g, '');
-
-                // 尝试获取描述
-                const descMatch = descRegex.exec(html);
-                const description = descMatch ? descMatch[1].replace(/<[^>]+>/g, '') : '';
-
-                if (url && title) {
-                    results.push({ title, url, description });
-                    index++;
-                }
-            }
+            const results = await searchWeb(params.query, maxResults, { signal });
 
             if (results.length === 0) {
                 return createSuccessResult('No results found for the search query.');
@@ -93,7 +60,7 @@ export class WebSearchTool extends DeclarativeTool<typeof SearchParamsSchema> {
             const formattedResults = results.map((result, idx) => {
                 return `[${idx + 1}] ${result.title}
 URL: ${result.url}
-${result.description}
+${result.snippet}
 `;
             }).join('\n');
 

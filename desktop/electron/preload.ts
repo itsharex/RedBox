@@ -118,6 +118,7 @@ contextBridge.exposeInMainWorld('ipcRenderer', {
   chat: {
     send: (data: { sessionId?: string; message: string; displayContent?: string; attachment?: unknown; modelConfig?: unknown }) => ipcRenderer.send('chat:send-message', data),
     pickAttachment: (payload?: { sessionId?: string }) => ipcRenderer.invoke('chat:pick-attachment', payload || {}),
+    transcribeAudio: (payload: { audioBase64: string; mimeType?: string; fileName?: string }) => ipcRenderer.invoke('chat:transcribe-audio', payload),
     cancel: (data?: { sessionId?: string } | string) => ipcRenderer.send('chat:cancel', data),
     confirmTool: (callId: string, confirmed: boolean) => ipcRenderer.send('chat:confirm-tool', { callId, confirmed }),
     getSessions: () => ipcRenderer.invoke('chat:get-sessions'),
@@ -183,6 +184,76 @@ contextBridge.exposeInMainWorld('ipcRenderer', {
     removeLongCycle: (payload: { taskId: string }) => ipcRenderer.invoke('redclaw:runner-remove-long-cycle', payload),
     setLongCycleEnabled: (payload: { taskId: string; enabled: boolean }) => ipcRenderer.invoke('redclaw:runner-set-long-cycle-enabled', payload),
     runLongCycleNow: (payload: { taskId: string }) => ipcRenderer.invoke('redclaw:runner-run-long-cycle-now', payload),
+  },
+
+  assistantDaemon: {
+    getStatus: () => ipcRenderer.invoke('assistant:daemon-status'),
+    start: (payload?: {
+      autoStart?: boolean;
+      keepAliveWhenNoWindow?: boolean;
+      host?: string;
+      port?: number;
+      feishu?: {
+        enabled?: boolean;
+        receiveMode?: 'webhook' | 'websocket';
+        endpointPath?: string;
+        verificationToken?: string;
+        encryptKey?: string;
+        appId?: string;
+        appSecret?: string;
+        replyUsingChatId?: boolean;
+      };
+      relay?: {
+        enabled?: boolean;
+        endpointPath?: string;
+        authToken?: string;
+      };
+      weixin?: {
+        enabled?: boolean;
+        endpointPath?: string;
+        authToken?: string;
+        autoStartSidecar?: boolean;
+        cursorFile?: string;
+        sidecarCommand?: string;
+        sidecarArgs?: string[];
+        sidecarCwd?: string;
+        sidecarEnv?: Record<string, string>;
+      };
+    }) => ipcRenderer.invoke('assistant:daemon-start', payload || {}),
+    stop: () => ipcRenderer.invoke('assistant:daemon-stop'),
+    setConfig: (payload?: {
+      enabled?: boolean;
+      autoStart?: boolean;
+      keepAliveWhenNoWindow?: boolean;
+      host?: string;
+      port?: number;
+      feishu?: {
+        enabled?: boolean;
+        receiveMode?: 'webhook' | 'websocket';
+        endpointPath?: string;
+        verificationToken?: string;
+        encryptKey?: string;
+        appId?: string;
+        appSecret?: string;
+        replyUsingChatId?: boolean;
+      };
+      relay?: {
+        enabled?: boolean;
+        endpointPath?: string;
+        authToken?: string;
+      };
+      weixin?: {
+        enabled?: boolean;
+        endpointPath?: string;
+        authToken?: string;
+        autoStartSidecar?: boolean;
+        cursorFile?: string;
+        sidecarCommand?: string;
+        sidecarArgs?: string[];
+        sidecarCwd?: string;
+        sidecarEnv?: Record<string, string>;
+      };
+    }) => ipcRenderer.invoke('assistant:daemon-set-config', payload || {}),
   },
 
   // Skills

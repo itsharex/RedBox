@@ -8,6 +8,12 @@ import {
   findAiPresetById,
   inferPresetIdByEndpoint,
 } from '../../config/aiSources';
+import {
+  MODEL_CAPABILITY_META,
+  inferModelCapabilities,
+  normalizeModelCapabilities,
+  type ModelCapability,
+} from '../../../shared/modelCapabilities';
 
 const REDBOX_OFFICIAL_LOGO_URL = new URL('../../../redbox.png', import.meta.url).href;
 
@@ -236,8 +242,14 @@ export interface RuntimeToolResultItem {
 export interface OfficialModelInfo {
   id: string;
   capability?: string;
+  capabilities?: ModelCapability[];
   apiType?: string;
   ownedBy?: string;
+}
+
+export interface AiModelDescriptor {
+  id: string;
+  capabilities: ModelCapability[];
 }
 
 export type AiProtocol = 'openai' | 'anthropic' | 'gemini';
@@ -690,6 +702,10 @@ export interface AiModelOption {
   label?: string;
   badgeText?: string;
   badgeTone?: 'neutral' | 'recommended';
+  badges?: Array<{
+    text: string;
+    tone?: 'neutral' | 'recommended';
+  }>;
 }
 
 export const AiModelSelect = ({
@@ -712,6 +728,16 @@ export const AiModelSelect = ({
   const selectedOption = useMemo(() => {
     return options.find((item) => item.id === value) || null;
   }, [options, value]);
+  const resolveBadges = (option: AiModelOption | null | undefined) => {
+    if (!option) return [] as Array<{ text: string; tone?: 'neutral' | 'recommended' }>;
+    if (Array.isArray(option.badges) && option.badges.length > 0) {
+      return option.badges;
+    }
+    if (option.badgeText) {
+      return [{ text: option.badgeText, tone: option.badgeTone }];
+    }
+    return [] as Array<{ text: string; tone?: 'neutral' | 'recommended' }>;
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -750,18 +776,19 @@ export const AiModelSelect = ({
       >
         <span className="min-w-0 flex items-center gap-2">
           <span className="truncate">{selectedOption?.label || selectedOption?.id || placeholder}</span>
-          {selectedOption?.badgeText ? (
+          {resolveBadges(selectedOption).map((badge) => (
             <span
+              key={`${selectedOption?.id || 'selected'}-${badge.text}`}
               className={clsx(
-                'px-1.5 py-0.5 rounded text-[10px] leading-none border',
-                selectedOption.badgeTone === 'recommended'
+                'px-1.5 py-0.5 rounded text-[10px] leading-none border whitespace-nowrap',
+                badge.tone === 'recommended'
                   ? 'border-emerald-400/40 text-emerald-600 bg-emerald-500/10'
                   : 'border-border text-text-tertiary bg-surface-secondary/50'
               )}
             >
-              {selectedOption.badgeText}
+              {badge.text}
             </span>
-          ) : null}
+          ))}
         </span>
         <ChevronDown className={clsx('w-4 h-4 text-text-tertiary transition-transform', open && 'rotate-180')} />
       </button>
@@ -786,20 +813,21 @@ export const AiModelSelect = ({
                     active ? 'bg-accent-primary/10 text-text-primary' : 'hover:bg-surface-secondary/40 text-text-secondary'
                   )}
                 >
-                  <span className="min-w-0 flex items-center gap-2">
+                  <span className="min-w-0 flex items-center gap-2 flex-wrap">
                     <span className="truncate">{option.label || option.id}</span>
-                    {option.badgeText ? (
+                    {resolveBadges(option).map((badge) => (
                       <span
+                        key={`${option.id}-${badge.text}`}
                         className={clsx(
-                          'px-1.5 py-0.5 rounded text-[10px] leading-none border',
-                          option.badgeTone === 'recommended'
+                          'px-1.5 py-0.5 rounded text-[10px] leading-none border whitespace-nowrap',
+                          badge.tone === 'recommended'
                             ? 'border-emerald-400/40 text-emerald-600 bg-emerald-500/10'
                             : 'border-border text-text-tertiary bg-surface-secondary/50'
                         )}
                       >
-                        {option.badgeText}
+                        {badge.text}
                       </span>
-                    ) : null}
+                    ))}
                   </span>
                   <Check className={clsx('w-4 h-4', active ? 'opacity-100 text-accent-primary' : 'opacity-0')} />
                 </button>
@@ -1186,9 +1214,59 @@ export const extractAlipayPayQrContent = (order: Record<string, unknown>): strin
 
 export const filterOfficialModelsByCapability = (
   models: OfficialModelInfo[],
-  capability: 'chat' | 'stt' | 'image',
+  capability: 'chat' | 'stt' | 'image' | 'embedding' | 'video' | 'audio',
 ): OfficialModelInfo[] => {
-  return models.filter((item) => String(item.capability || '').trim().toLowerCase() === capability);
+  const normalizedCapability = capability === 'stt' ? 'transcription' : capability;
+  return models.filter((item) => {
+    const capabilities = Array.isArray(item.capabilities) && item.capabilities.length > 0
+      ? normalizeModelCapabilities(item.capabilities)
+      : normalizeModelCapabilities([
+        ...(item.capability ? [item.capability] : []),
+        ...inferModelCapabilities(item.id),
+      ]);
+    return capabilities.includes(normalizedCapability as ModelCapability);
+  });
+};
+
+export const toAiModelDescriptor = (
+  model: string | { id?: string; capabilities?: Array<ModelCapability | string | null | undefined> },
+): AiModelDescriptor | null => {
+  if (typeof model === 'string') {
+    const id = model.trim();
+    if (!id) return null;
+    return {
+      id,
+      capabilities: inferModelCapabilities(id),
+    };
+  }
+
+  const id = String(model?.id || '').trim();
+  if (!id) return null;
+  const capabilities = Array.isArray(model?.capabilities) && model.capabilities.length > 0
+    ? normalizeModelCapabilities(model.capabilities)
+    : inferModelCapabilities(id);
+  return { id, capabilities };
+};
+
+export const filterAiModelsByCapability = (
+  models: AiModelDescriptor[],
+  capability: ModelCapability,
+): AiModelDescriptor[] => {
+  return models.filter((item) => item.capabilities.includes(capability));
+};
+
+export const buildModelCapabilityBadges = (
+  capabilities: ModelCapability[],
+  options?: { recommended?: boolean },
+): Array<{ text: string; tone?: 'neutral' | 'recommended' }> => {
+  const badges: Array<{ text: string; tone?: 'neutral' | 'recommended' }> = capabilities.map((capability) => ({
+    text: MODEL_CAPABILITY_META[capability]?.shortLabel || capability,
+    tone: 'neutral' as const,
+  }));
+  if (options?.recommended) {
+    badges.unshift({ text: '推荐', tone: 'recommended' });
+  }
+  return badges;
 };
 
 export function PasswordInput({

@@ -25,7 +25,7 @@ const READ_ONLY_APP_ACTIONS = new Set([
 ]);
 
 const TRUSTED_INTERACTIVE_APP_ACTIONS = new Map<string, Set<string>>([
-  ['manuscripts', new Set(['write', 'create', 'rename', 'move', 'organize'])],
+  ['manuscripts', new Set(['write', 'create', 'rename', 'move'])],
   ['memory', new Set(['add', 'update', 'delete'])],
   ['redclaw', new Set([
     'create',
