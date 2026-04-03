@@ -57,8 +57,13 @@ interface UploadedFileAttachment {
   ext?: string;
   size?: number;
   absolutePath?: string;
+  originalAbsolutePath?: string;
   localUrl?: string;
   kind?: 'text' | 'image' | 'audio' | 'video' | 'binary' | string;
+  mimeType?: string;
+  storageMode?: 'staged' | string;
+  directUploadEligible?: boolean;
+  processingStrategy?: string;
   summary?: string;
   requiresMultimodal?: boolean;
 }

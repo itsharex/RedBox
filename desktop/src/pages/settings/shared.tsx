@@ -1133,6 +1133,7 @@ export const isLikelyImageModel = (modelId: string): boolean => {
   return id.includes('image')
     || id.includes('dall')
     || id.includes('seedream')
+    || id.includes('banana')
     || id.includes('wan')
     || id.includes('jimeng')
     || id.includes('flux')

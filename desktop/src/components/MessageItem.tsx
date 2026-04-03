@@ -151,8 +151,13 @@ export interface Message {
     ext?: string;
     size?: number;
     absolutePath?: string;
+    originalAbsolutePath?: string;
     localUrl?: string;
     kind?: 'text' | 'image' | 'audio' | 'video' | 'binary' | string;
+    mimeType?: string;
+    storageMode?: 'staged' | string;
+    directUploadEligible?: boolean;
+    processingStrategy?: string;
     summary?: string;
     requiresMultimodal?: boolean;
   };
@@ -454,6 +459,8 @@ export const MessageItem = memo(({
             {attachment.kind && <span>类型: {attachment.kind}</span>}
             {typeof attachment.size === 'number' && <span>大小: {Math.max(0, Math.round(attachment.size / 1024))} KB</span>}
             {attachment.ext && <span>.{String(attachment.ext).replace(/^\./, '')}</span>}
+            {attachment.storageMode === 'staged' && <span>已暂存</span>}
+            {attachment.directUploadEligible && <span>可直传</span>}
           </div>
           {attachment.summary && (
             <div className="mt-1.5 line-clamp-2 text-xs text-text-secondary">

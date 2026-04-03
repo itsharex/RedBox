@@ -22,9 +22,13 @@ export interface RuntimeTranscriptEnvelope {
   data: Record<string, unknown>;
 }
 
+export type RuntimeMessageContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } };
+
 export interface RuntimeMessage {
   role: 'system' | 'user' | 'assistant';
-  content: string;
+  content: string | RuntimeMessageContentPart[];
 }
 
 export interface RuntimeToolContext {
@@ -54,6 +58,7 @@ export interface RuntimeConfig {
   model: string;
   systemPrompt: string;
   messages: RuntimeMessage[];
+  userInputContent?: string | RuntimeMessageContentPart[];
   signal?: AbortSignal;
   maxTurns?: number;
   maxTimeMinutes?: number;

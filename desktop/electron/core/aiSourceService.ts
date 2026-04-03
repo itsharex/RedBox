@@ -49,6 +49,7 @@ const IMAGE_MODEL_KEYWORDS = [
   'dalle',
   'wan',
   'seedream',
+  'banana',
   'jimeng',
   'imagen',
   'flux',

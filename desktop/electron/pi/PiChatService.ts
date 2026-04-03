@@ -53,7 +53,7 @@ import { normalizeApiBaseUrl, safeUrlJoin } from '../core/urlUtils';
 import { logDebugEvent } from '../core/debugLogger';
 import { loadPrompt, renderPrompt } from '../prompts/runtime';
 import { getAgentRuntime, getTaskGraphRuntime, type PreparedRuntimeExecution, type RuntimeMode } from '../core/ai';
-import type { RuntimeEvent } from '../core/runtimeTypes';
+import type { RuntimeEvent, RuntimeMessageContentPart } from '../core/runtimeTypes';
 
 interface SessionMetadata {
   associatedFilePath?: string;
@@ -168,6 +168,10 @@ interface ChatModelOverrideConfig {
   apiKey?: string;
   baseURL?: string;
   modelName?: string;
+}
+
+interface ChatAttachmentRuntimeOptions {
+  userInputContent?: string | RuntimeMessageContentPart[];
 }
 
 const DEFAULT_REDCLAW_AUTO_COMPACT_TOKENS = 256000;
@@ -515,7 +519,12 @@ export class PiChatService {
     };
   }
 
-  async sendMessage(content: string, sessionId: string, modelOverride?: ChatModelOverrideConfig) {
+  async sendMessage(
+    content: string,
+    sessionId: string,
+    modelOverride?: ChatModelOverrideConfig,
+    attachmentRuntime?: ChatAttachmentRuntimeOptions,
+  ) {
     this.sessionId = sessionId;
     this.abortController = new AbortController();
     const signal = this.abortController.signal;
@@ -627,6 +636,7 @@ export class PiChatService {
           model: modelName,
           systemPrompt,
           messages: runtimeMessages,
+          userInputContent: attachmentRuntime?.userInputContent,
           signal,
           maxTurns,
           maxTimeMinutes,

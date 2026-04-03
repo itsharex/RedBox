@@ -110,7 +110,7 @@ export class QueryRuntime {
     let messages: RuntimeMessage[] = [
       { role: 'system', content: this.config.systemPrompt },
       ...this.config.messages,
-      { role: 'user', content: userInput },
+      { role: 'user', content: this.config.userInputContent ?? userInput },
     ];
 
     this.adapter.onEvent({ type: 'query_start', sessionId: this.config.sessionId, message: userInput });

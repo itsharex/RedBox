@@ -883,6 +883,44 @@ const IMAGE_ATTACHMENT_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif'
 const VIDEO_ATTACHMENT_EXTENSIONS = new Set(['mp4', 'mov', 'mkv', 'webm', 'avi', 'm4v']);
 const AUDIO_ATTACHMENT_EXTENSIONS = new Set(['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus']);
 
+function guessAttachmentMimeType(extension: string, kind?: string): string {
+  const ext = String(extension || '').trim().toLowerCase();
+  if (ext === 'txt') return 'text/plain';
+  if (ext === 'md' || ext === 'markdown' || ext === 'mdx') return 'text/markdown';
+  if (ext === 'json') return 'application/json';
+  if (ext === 'csv') return 'text/csv';
+  if (ext === 'tsv') return 'text/tab-separated-values';
+  if (ext === 'xml') return 'application/xml';
+  if (ext === 'html') return 'text/html';
+  if (ext === 'css') return 'text/css';
+  if (ext === 'js' || ext === 'mjs' || ext === 'cjs') return 'text/javascript';
+  if (ext === 'ts' || ext === 'tsx') return 'text/typescript';
+  if (ext === 'py') return 'text/x-python';
+  if (ext === 'pdf') return 'application/pdf';
+  if (ext === 'jpg' || ext === 'jpeg') return 'image/jpeg';
+  if (ext === 'png') return 'image/png';
+  if (ext === 'webp') return 'image/webp';
+  if (ext === 'gif') return 'image/gif';
+  if (ext === 'bmp') return 'image/bmp';
+  if (ext === 'svg') return 'image/svg+xml';
+  if (ext === 'mp4') return 'video/mp4';
+  if (ext === 'mov') return 'video/quicktime';
+  if (ext === 'webm') return 'video/webm';
+  if (ext === 'mkv') return 'video/x-matroska';
+  if (ext === 'avi') return 'video/x-msvideo';
+  if (ext === 'mp3') return 'audio/mpeg';
+  if (ext === 'wav') return 'audio/wav';
+  if (ext === 'm4a') return 'audio/mp4';
+  if (ext === 'aac') return 'audio/aac';
+  if (ext === 'ogg' || ext === 'opus') return 'audio/ogg';
+  if (ext === 'flac') return 'audio/flac';
+  if (kind === 'text') return 'text/plain';
+  if (kind === 'image') return 'image/png';
+  if (kind === 'audio') return 'audio/mpeg';
+  if (kind === 'video') return 'video/mp4';
+  return 'application/octet-stream';
+}
+
 const isLikelyMultimodalModel = (modelName: string): boolean => {
   const name = String(modelName || '').toLowerCase();
   if (!name) return false;
@@ -891,6 +929,7 @@ const isLikelyMultimodalModel = (modelName: string): boolean => {
 
 const buildAttachmentPromptSuffix = (attachment: Record<string, unknown>): string => {
   const absolutePath = String(attachment.absolutePath || '').trim();
+  const originalAbsolutePath = String(attachment.originalAbsolutePath || '').trim();
   const localUrl = String(attachment.localUrl || '').trim();
   const fileName = String(attachment.name || '').trim();
   const kind = String(attachment.kind || '').trim();
@@ -901,9 +940,12 @@ const buildAttachmentPromptSuffix = (attachment: Record<string, unknown>): strin
     '',
     '[用户上传附件]',
     `文件名: ${fileName || path.basename(absolutePath)}`,
-    `文件路径: ${absolutePath}`,
+    `工作暂存路径: ${absolutePath}`,
     `附件类型: ${kind || 'unknown'}`,
   ];
+  if (originalAbsolutePath && originalAbsolutePath !== absolutePath) {
+    lines.push(`原始路径: ${originalAbsolutePath}`);
+  }
   if (localUrl) {
     lines.push(`本地URL: ${localUrl}`);
   }
@@ -912,13 +954,56 @@ const buildAttachmentPromptSuffix = (attachment: Record<string, unknown>): strin
   }
 
   if (kind === 'text') {
-    lines.push('请优先使用 bash（例如 cat/sed/head）读取该文件原文后再回答。');
+    lines.push('请优先使用 bash（例如 cat/sed/head）读取工作暂存区里的文件原文后再回答。');
+  } else if (kind === 'image') {
+    lines.push('若当前模型支持图片理解，可直接查看图片；若需要进一步处理，请基于工作暂存路径继续操作。');
   } else {
-    lines.push('若当前模型不支持该类型多模态理解，请明确提示“不支持该附件类型”。');
+    lines.push('请先基于工作暂存区里的文件判断是否需要转录、格式提取或其他预处理，再继续回答。');
   }
 
   return lines.join('\n');
 };
+
+async function buildAttachmentRuntimeInput(
+  attachment: Record<string, unknown> | null,
+  userText: string,
+  modelName: string,
+): Promise<string | Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } }> | null> {
+  if (!attachment || attachment.type !== 'uploaded-file') {
+    return null;
+  }
+
+  const absolutePath = String(attachment.absolutePath || '').trim();
+  const originalAbsolutePath = String(attachment.originalAbsolutePath || '').trim();
+  const fileName = String(attachment.name || '').trim() || (absolutePath ? path.basename(absolutePath) : 'attachment');
+  const kind = String(attachment.kind || '').trim();
+  const mimeType = String(attachment.mimeType || '').trim() || guessAttachmentMimeType(String(attachment.ext || ''), kind);
+  const summary = String(attachment.summary || '').trim();
+  if (!absolutePath || kind !== 'image' || !isLikelyMultimodalModel(modelName)) {
+    return null;
+  }
+
+  const imageBuffer = await fs.readFile(absolutePath);
+  const dataUrl = `data:${mimeType};base64,${imageBuffer.toString('base64')}`;
+  const textLines = [
+    String(userText || '').trim() || `请查看这张图片附件：${fileName}`,
+    '',
+    '[当前轮已附带上传图片]',
+    `文件名: ${fileName}`,
+    `工作暂存路径: ${absolutePath}`,
+  ];
+  if (originalAbsolutePath && originalAbsolutePath !== absolutePath) {
+    textLines.push(`原始路径: ${originalAbsolutePath}`);
+  }
+  if (summary) {
+    textLines.push(`附件摘要: ${summary}`);
+  }
+
+  return [
+    { type: 'text', text: textLines.filter(Boolean).join('\n') },
+    { type: 'image_url', image_url: { url: dataUrl } },
+  ];
+}
 
 function guessMimeTypeByExtension(extension: string): string {
   const ext = String(extension || '').trim().toLowerCase();
@@ -3148,9 +3233,14 @@ ipcMain.handle('chat:pick-attachment', async (_, payload?: { sessionId?: string 
         ext: lowerExt,
         size: Number(fileStat.size || 0),
         absolutePath: targetPath,
+        originalAbsolutePath: selectedPath,
         localUrl: toLocalFileUrl(targetPath),
         kind,
-        requiresMultimodal: kind !== 'text',
+        mimeType: guessAttachmentMimeType(lowerExt, kind),
+        storageMode: 'staged',
+        directUploadEligible: kind === 'image',
+        processingStrategy: kind === 'image' ? 'direct-image-or-staged' : kind === 'text' ? 'staged-text' : 'staged-file',
+        requiresMultimodal: kind === 'image',
         summary,
       },
     };
@@ -3228,6 +3318,7 @@ ipcMain.on('chat:send-message', async (event, { sessionId, message, displayConte
     ? (attachment as Record<string, unknown>)
     : null;
   let outgoingMessage = String(message || '');
+  let attachmentRuntimeInput: string | Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } }> | null = null;
   console.log('[chat:send-message] incoming', {
     sessionId: sessionId || null,
     messageLength: typeof message === 'string' ? message.length : 0,
@@ -3258,7 +3349,15 @@ ipcMain.on('chat:send-message', async (event, { sessionId, message, displayConte
       return;
     }
 
-    outgoingMessage = `${outgoingMessage}${buildAttachmentPromptSuffix(rawAttachment)}`;
+    try {
+      attachmentRuntimeInput = await buildAttachmentRuntimeInput(rawAttachment, outgoingMessage, resolvedModelName);
+    } catch (error) {
+      console.warn('[chat:send-message] failed to prepare direct attachment input, falling back to staged prompt', error);
+      attachmentRuntimeInput = null;
+    }
+    if (!attachmentRuntimeInput) {
+      outgoingMessage = `${outgoingMessage}${buildAttachmentPromptSuffix(rawAttachment)}`;
+    }
   }
 
   // 如果没有 sessionId，创建新会话
@@ -3350,11 +3449,18 @@ ipcMain.on('chat:send-message', async (event, { sessionId, message, displayConte
     const service = getOrCreateChatService(sessionId, sender);
 
     // 发送消息
-    await service.sendMessage(outgoingMessage, sessionId, {
-      apiKey: resolvedChatApiKey,
-      baseURL: resolvedChatBaseURL,
-      modelName: resolvedModelName,
-    });
+    await service.sendMessage(
+      outgoingMessage,
+      sessionId,
+      {
+        apiKey: resolvedChatApiKey,
+        baseURL: resolvedChatBaseURL,
+        modelName: resolvedModelName,
+      },
+      {
+        userInputContent: attachmentRuntimeInput || undefined,
+      },
+    );
     console.log('[chat:send-message] completed', { sessionId });
 
   } catch (err: unknown) {

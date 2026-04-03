@@ -29,7 +29,7 @@ const CAPABILITY_RULES: Array<{ capability: ModelCapability; patterns: RegExp[] 
     { capability: 'transcription', patterns: [/\basr\b/i, /\bwhisper\b/i] },
     { capability: 'audio', patterns: [/\btts\b/i, /\bspeech\b/i] },
     { capability: 'video', patterns: [/\bvideo\b/i, /\bveo\b/i, /\bseedance\b/i, /\bkling\b/i, /\bvidu\b/i, /\bluma\b/i, /\bsora\b/i] },
-    { capability: 'image', patterns: [/\bimage\b/i, /\bdall-?e\b/i, /\bimagen\b/i] },
+    { capability: 'image', patterns: [/\bimage\b/i, /\bdall-?e\b/i, /\bimagen\b/i, /\bseedream\b/i, /\bbanana\b/i] },
 ];
 
 export const inferModelCapabilities = (modelId: string): ModelCapability[] => {
