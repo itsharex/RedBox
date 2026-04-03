@@ -8,13 +8,10 @@ import {
     ToolErrorType,
 } from '../toolRegistry';
 import { EditTool } from './editTool';
-import { GrepTool } from './grepTool';
-import { ListDirTool } from './listDirTool';
-import { ReadFileTool } from './readFileTool';
 import { WriteFileTool } from './writeFileTool';
 
 const WorkspaceToolParamsSchema = z.object({
-    action: z.enum(['list', 'read', 'search', 'write', 'edit']).describe('Workspace action to perform'),
+    action: z.enum(['list', 'read', 'search', 'write', 'edit']).describe('Workspace action to perform. Only write/edit remain supported; read/list/search should use bash or app_cli instead.'),
     path: z.string().optional().describe('Path for list or search actions'),
     filePath: z.string().optional().describe('Target file path for read, write, or edit actions'),
     offset: z.coerce.number().optional().describe('Read offset (0-based line number)'),
@@ -36,27 +33,22 @@ type WorkspaceToolParams = z.infer<typeof WorkspaceToolParamsSchema>;
 export class WorkspaceTool extends DeclarativeTool<typeof WorkspaceToolParamsSchema> {
     readonly name = 'workspace';
     readonly displayName = 'Workspace';
-    readonly description = 'Unified workspace tool for listing directories, reading files, searching text, writing files, and editing files inside the current workspace.';
+    readonly description = 'Controlled workspace mutator for writing files and applying precise edits inside the current workspace. Use bash/app_cli for reading, listing, or searching.';
     readonly kind = ToolKind.Other;
     readonly parameterSchema = WorkspaceToolParamsSchema;
     readonly requiresConfirmation = false;
 
-    private readonly listTool = new ListDirTool();
-    private readonly readTool = new ReadFileTool();
-    private readonly searchTool = new GrepTool();
     private readonly writeTool = new WriteFileTool();
     private readonly editTool = new EditTool();
 
     protected validateValues(params: WorkspaceToolParams): string | null {
         switch (params.action) {
             case 'list':
-                return null;
+                return 'workspace action=list has been removed; use bash (ls/find) or app_cli instead';
             case 'read':
-                if (!params.filePath) return 'filePath is required for action=read';
-                return null;
+                return 'workspace action=read has been removed; use bash (cat/sed/head) or app_cli instead';
             case 'search':
-                if (!params.pattern) return 'pattern is required for action=search';
-                return null;
+                return 'workspace action=search has been removed; use bash (rg/grep/find) or app_cli instead';
             case 'write':
                 if (!params.filePath) return 'filePath is required for action=write';
                 if (params.content === undefined) return 'content is required for action=write';
@@ -75,11 +67,11 @@ export class WorkspaceTool extends DeclarativeTool<typeof WorkspaceToolParamsSch
     getDescription(params: WorkspaceToolParams): string {
         switch (params.action) {
             case 'list':
-                return `Workspace list: ${params.path || '.'}`;
+                return `Workspace list (unsupported): ${params.path || '.'}`;
             case 'read':
-                return `Workspace read: ${params.filePath || '(missing filePath)'}`;
+                return `Workspace read (unsupported): ${params.filePath || '(missing filePath)'}`;
             case 'search':
-                return `Workspace search: ${params.pattern || '(missing pattern)'} in ${params.path || '.'}`;
+                return `Workspace search (unsupported): ${params.pattern || '(missing pattern)'} in ${params.path || '.'}`;
             case 'write':
                 return `Workspace write: ${params.filePath || '(missing filePath)'}`;
             case 'edit':
@@ -110,37 +102,25 @@ export class WorkspaceTool extends DeclarativeTool<typeof WorkspaceToolParamsSch
     }
 
     isConcurrencySafe(params: WorkspaceToolParams): boolean {
-        return params.action === 'list' || params.action === 'read' || params.action === 'search';
+        return false;
     }
 
     async execute(params: WorkspaceToolParams, signal: AbortSignal, _onOutput?: (chunk: string) => void): Promise<ToolResult> {
         switch (params.action) {
             case 'list':
-                return this.listTool.execute(
-                    {
-                        path: params.path,
-                        ignore: params.ignore,
-                        recursive: params.recursive,
-                    },
-                    signal,
+                return createErrorResult(
+                    'workspace action=list is no longer supported; use bash (ls/find) or app_cli instead',
+                    ToolErrorType.INVALID_PARAMS,
                 );
             case 'read':
-                return this.readTool.execute(
-                    {
-                        filePath: params.filePath || '',
-                        offset: params.offset,
-                        limit: params.limit,
-                    },
-                    signal,
+                return createErrorResult(
+                    'workspace action=read is no longer supported; use bash (cat/sed/head) or app_cli instead',
+                    ToolErrorType.INVALID_PARAMS,
                 );
             case 'search':
-                return this.searchTool.execute(
-                    {
-                        pattern: params.pattern || '',
-                        path: params.path,
-                        include: params.include,
-                    },
-                    signal,
+                return createErrorResult(
+                    'workspace action=search is no longer supported; use bash (rg/grep/find) or app_cli instead',
+                    ToolErrorType.INVALID_PARAMS,
                 );
             case 'write':
                 return this.writeTool.execute(

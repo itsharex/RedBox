@@ -1,4 +1,4 @@
-import { Lightbulb, Brain, ChevronRight } from 'lucide-react';
+import { Lightbulb, ChevronRight } from 'lucide-react';
 import { clsx } from 'clsx';
 
 interface ThinkingBubbleProps {
@@ -9,25 +9,14 @@ interface ThinkingBubbleProps {
 export function ThinkingBubble({ content, isActive = true }: ThinkingBubbleProps) {
     return (
         <div className={clsx(
-            "flex items-start gap-3 rounded-lg border p-3 transition-all",
+            "rounded-lg border px-4 py-3 transition-all",
             isActive
                 ? "bg-amber-500/5 border-amber-500/30"
                 : "bg-surface-secondary border-border"
         )}>
-            <div className={clsx(
-                "p-1.5 rounded-lg",
-                isActive ? "bg-amber-500/10 text-amber-500" : "bg-surface-primary text-text-tertiary"
-            )}>
-                <Brain className="w-4 h-4" />
-            </div>
-            <div className="flex-1 min-w-0">
-                <div className="text-xs font-medium text-text-tertiary uppercase tracking-wider mb-1">
-                    {isActive ? 'Thinking...' : 'Thought'}
-                </div>
-                <p className="text-sm text-text-secondary leading-relaxed">
-                    {content}
-                </p>
-            </div>
+            <p className="text-sm text-text-secondary leading-relaxed whitespace-pre-wrap break-words">
+                {content}
+            </p>
         </div>
     );
 }

@@ -179,7 +179,6 @@ export class QueryRuntime {
       }
 
       turnCount += 1;
-      this.adapter.onEvent({ type: 'thinking', phase: 'analyze', content: `Turn ${turnCount}: analyzing current objective` });
       let compacted = null;
       try {
         if (compactFailureCount < 3) {
@@ -330,7 +329,10 @@ export class QueryRuntime {
             },
           },
         });
-        this.adapter.onEvent({ type: 'thinking', phase: 'tooling', content: `Turn ${turnCount}: executing ${llmResponse.toolCalls.length} tool call(s)` });
+        const thoughtText = String(llmResponse.content || '').trim();
+        if (thoughtText) {
+          this.adapter.onEvent({ type: 'thinking', phase: 'tooling', content: thoughtText });
+        }
         const toolResponses = await this.executeToolCalls(llmResponse.toolCalls);
         const batchSummary = summarizeToolBatch(
           llmResponse.toolCalls.map((call, index) => ({

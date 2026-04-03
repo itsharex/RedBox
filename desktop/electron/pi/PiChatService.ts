@@ -2687,10 +2687,10 @@ export class PiChatService {
       lines.push('- `app_cli`: app-managed data and business actions');
     }
     if (toolNames.has('workspace')) {
-      lines.push('- `workspace`: unified workspace file tool (`list` / `read` / `search` / `write` / `edit`)');
+      lines.push('- `workspace`: controlled workspace mutator (`write` / `edit`)');
     }
     if (toolNames.has('bash')) {
-      lines.push('- `bash`: shell fallback for inspection or simple commands');
+      lines.push('- `bash`: preferred for inspection, search, listing, and reading absolute paths');
     }
     if (toolNames.has('web_search')) {
       lines.push('- `web_search`: current external information');

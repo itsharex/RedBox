@@ -269,6 +269,15 @@ export const MessageItem = memo(({
   const showTimeline = !isUser && msg.timeline && msg.timeline.length > 0;
   const showLegacyWorkflow = !isUser && (!msg.timeline || msg.timeline.length === 0) && (msg.thinking || msg.tools.length > 0 || msg.activatedSkill);
   const showWorkflowOnTop = workflowPlacement === 'top';
+  const latestTimelineThought = !isUser
+    ? [...(msg.timeline || [])]
+        .reverse()
+        .find((item) => item.type === 'thought' && String(item.content || '').trim())
+    : undefined;
+  const activeThoughtContent = !isUser
+    ? String(latestTimelineThought?.content || msg.thinking || '').trim()
+    : '';
+  const showStreamingThought = !isUser && Boolean(msg.isStreaming && activeThoughtContent);
 
   useEffect(() => {
     if (!imageMenu.visible) return;
@@ -456,6 +465,22 @@ export const MessageItem = memo(({
     </div>
   );
 
+  const renderThoughtText = (content: string) => (
+    <div className="chat-ai-shell">
+      <div className="chat-ai-content">
+        <div className="chat-markdown-body text-text-secondary">
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            components={markdownComponents}
+            urlTransform={transformMarkdownUrl}
+          >
+            {content}
+          </ReactMarkdown>
+        </div>
+      </div>
+    </div>
+  );
+
   return (
     <div className={clsx('chat-message-row', isUser ? 'chat-message-row-user' : 'chat-message-row-ai')}>
 
@@ -473,7 +498,7 @@ export const MessageItem = memo(({
         <div className="mb-4 w-full max-w-3xl space-y-3">
           {/* Thinking Bubble */}
           {msg.thinking && (
-            <ThinkingBubble content={msg.thinking} isActive={!!msg.isStreaming && !msg.content} />
+            renderThoughtText(msg.thinking)
           )}
 
           {/* Activated Skill */}
@@ -490,6 +515,12 @@ export const MessageItem = memo(({
               查看工具调用 ({msg.tools.length})
             </div>
           )}
+        </div>
+      )}
+
+      {showStreamingThought && (
+        <div className={clsx(showWorkflowOnTop ? 'mb-2' : 'mt-2', 'w-full max-w-[740px]')}>
+          {renderThoughtText(activeThoughtContent)}
         </div>
       )}
 
@@ -582,7 +613,7 @@ export const MessageItem = memo(({
       {!showWorkflowOnTop && showLegacyWorkflow && (
         <div className="mt-3 w-full max-w-3xl space-y-3">
           {msg.thinking && (
-            <ThinkingBubble content={msg.thinking} isActive={!!msg.isStreaming && !msg.content} />
+            renderThoughtText(msg.thinking)
           )}
           {msg.activatedSkill && (
             <SkillActivatedBadge

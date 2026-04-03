@@ -150,23 +150,20 @@ async function runQueryTask(runId, payload) {
     }
 
     turnCount += 1;
-    process.send?.({
-      type: 'progress',
-      runId,
-      phase: 'thinking',
-      text: `Turn ${turnCount}: analyzing current objective`,
-    });
 
     const llmResponse = await callLlm(payload, messages, currentAbortController?.signal);
 
     if (Array.isArray(llmResponse.toolCalls) && llmResponse.toolCalls.length > 0) {
       messages.push({ role: 'assistant', content: llmResponse.content || '' });
-      process.send?.({
-        type: 'progress',
-        runId,
-        phase: 'tooling',
-        text: `Turn ${turnCount}: executing ${llmResponse.toolCalls.length} tool call(s)`,
-      });
+      const thoughtText = String(llmResponse.content || '').trim();
+      if (thoughtText) {
+        process.send?.({
+          type: 'progress',
+          runId,
+          phase: 'tooling',
+          text: thoughtText,
+        });
+      }
       const toolResults = await waitForToolResults(runId, llmResponse.toolCalls);
       const feedback = Array.isArray(toolResults?.results) ? toolResults.results : [];
       messages.push(...feedback.map((item) => toToolFeedbackMessage(item.toolName, item.promptText || '')));

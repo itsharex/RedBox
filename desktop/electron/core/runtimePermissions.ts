@@ -68,15 +68,12 @@ export const evaluateRuntimeToolPermission = (params: {
 
     if (toolName === 'workspace') {
         const action = String(args.action || '').trim();
-        const isMutatingAction = action === 'write' || action === 'edit';
-        const reason = action
-            ? `workspace action=${action}`
-            : 'workspace action';
+        const reason = action ? `workspace action=${action}` : 'workspace action';
 
-        if (!isMutatingAction) {
+        if (action === 'list' || action === 'read' || action === 'search') {
             return {
-                outcome: 'allow',
-                reason: `${reason} 属于工作区只读操作。`,
+                outcome: 'deny',
+                reason: `${reason} 已停用；读取/搜索/列目录请改用 bash 或 app_cli。`,
                 source: 'runtime-policy',
             };
         }
