@@ -140,6 +140,13 @@ function sanitizeFileName(input: string): string {
   return normalized || `image-${Date.now()}`;
 }
 
+function buildManagedAssetName(prefix: 'image' | 'voice', ext: string, index?: number): string {
+  const stamp = Date.now();
+  const suffix = randomUUID().slice(0, 8);
+  const ordinal = Number.isFinite(index) ? `-${Number(index) + 1}` : '';
+  return `${prefix}-${stamp}${ordinal}-${suffix}.${ext}`;
+}
+
 function getSubjectsRootDir(): string {
   const paths = getWorkspacePaths() as ReturnType<typeof getWorkspacePaths> & { subjects?: string };
   return paths.subjects || path.join(paths.base, 'subjects');
@@ -338,8 +345,7 @@ async function materializeSubjectImages(subjectId: string, inputs: SubjectImageI
     const dataUrl = normalizeText(item.dataUrl);
     if (!dataUrl) continue;
     const { buffer, ext } = decodeDataUrl(dataUrl);
-    const baseName = sanitizeFileName(item.name || `subject-${index + 1}`);
-    const fileName = `${Date.now()}-${index + 1}-${baseName}.${ext}`;
+    const fileName = buildManagedAssetName('image', ext, index);
     const relative = normalizeRelativeStorePath(path.join('images', fileName));
     const absolute = path.join(subjectDir, relative);
     await fs.writeFile(absolute, buffer);
@@ -392,8 +398,7 @@ async function materializeSubjectVoice(subjectId: string, input: SubjectVoiceInp
   }
 
   const { buffer, ext } = decodeDataUrl(dataUrl);
-  const baseName = sanitizeFileName(normalizedInput.name || 'voice-reference');
-  const fileName = `${Date.now()}-${baseName}.${ext}`;
+  const fileName = buildManagedAssetName('voice', ext);
   const relative = normalizeRelativeStorePath(path.join('voice', fileName));
   const absolute = path.join(subjectDir, relative);
   await fs.writeFile(absolute, buffer);

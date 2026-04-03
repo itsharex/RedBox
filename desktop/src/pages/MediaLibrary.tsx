@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { ExternalLink, Link2, RefreshCw, Save, FolderOpen, ImagePlus, Sparkles, Search, SlidersHorizontal, Image, Pencil, X, Clapperboard } from 'lucide-react';
+import { ExternalLink, Link2, RefreshCw, Save, FolderOpen, ImagePlus, Sparkles, Search, SlidersHorizontal, Image, Pencil, X, Clapperboard, Trash2 } from 'lucide-react';
 import clsx from 'clsx';
 import { resolveAssetUrl } from '../utils/pathManager';
 import { REDBOX_OFFICIAL_VIDEO_BASE_URL, getRedBoxOfficialVideoModel } from '../../shared/redboxVideo';
@@ -391,6 +391,39 @@ export function MediaLibrary() {
         }
     }, [bindTarget, loadData]);
 
+    const handleDeleteAsset = useCallback(async (asset: MediaAsset) => {
+        const label = asset.title || asset.id;
+        const confirmed = window.confirm(`确认删除媒体“${label}”？${asset.relativePath ? '\n对应文件也会一并删除。' : ''}`);
+        if (!confirmed) return;
+        setWorkingId(asset.id);
+        try {
+            const result = await window.ipcRenderer.invoke('media:delete', {
+                assetId: asset.id,
+            }) as { success?: boolean; error?: string };
+            if (!result?.success) {
+                alert(result?.error || '删除失败');
+                return;
+            }
+            setDrafts((prev) => {
+                const next = { ...prev };
+                delete next[asset.id];
+                return next;
+            });
+            setBindTarget((prev) => {
+                const next = { ...prev };
+                delete next[asset.id];
+                return next;
+            });
+            setExpandedAssetId((prev) => prev === asset.id ? null : prev);
+            await loadData();
+        } catch (e) {
+            console.error('Failed to delete media asset:', e);
+            alert('删除失败');
+        } finally {
+            setWorkingId(null);
+        }
+    }, [loadData]);
+
     const handleGenerate = useCallback(async () => {
         if (!prompt.trim()) {
             setGenError('请先输入提示词');
@@ -768,6 +801,17 @@ export function MediaLibrary() {
                                                 <span className="inline-flex items-center gap-1">
                                                     <Pencil className="w-3.5 h-3.5" />
                                                     {isExpanded ? '收起' : '编辑'}
+                                                </span>
+                                            </button>
+                                            <button
+                                                onClick={() => void handleDeleteAsset(asset)}
+                                                disabled={busy}
+                                                className="px-2.5 py-2 text-xs rounded border border-border hover:bg-red-50 hover:border-red-200 hover:text-red-600 text-text-secondary disabled:opacity-50"
+                                                title="删除媒体"
+                                            >
+                                                <span className="inline-flex items-center gap-1">
+                                                    <Trash2 className="w-3.5 h-3.5" />
+                                                    删除
                                                 </span>
                                             </button>
                                         </div>
@@ -1232,6 +1276,29 @@ export function MediaLibrary() {
                             </div>
 
                             {videoGenError && <div className="text-xs text-status-error">{videoGenError}</div>}
+
+                            {isGeneratingVideo && (
+                                <div className="space-y-3 border-t border-border pt-4">
+                                    <div className="text-sm font-medium text-text-primary">
+                                        视频生成中，请等待
+                                    </div>
+                                    <div className="relative overflow-hidden rounded-2xl border border-border bg-surface-secondary/20 aspect-[16/9]">
+                                        <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,rgba(245,158,11,0.16),transparent_55%)] animate-pulse" />
+                                        <div className="absolute inset-0 bg-[radial-gradient(circle_at_35%_40%,rgba(251,191,36,0.18),transparent_30%),radial-gradient(circle_at_65%_60%,rgba(249,115,22,0.14),transparent_28%)] blur-2xl animate-pulse" />
+                                        <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-center px-6">
+                                            <div className="flex h-14 w-14 items-center justify-center rounded-full border border-accent-primary/20 bg-accent-primary/10 text-accent-primary">
+                                                <Clapperboard className="h-6 w-6" />
+                                            </div>
+                                            <div className="space-y-1">
+                                                <div className="text-base font-medium text-text-primary">正在生成视频片段</div>
+                                                <div className="text-xs leading-5 text-text-tertiary">
+                                                    已提交到官方视频服务。当前页面会继续等待结果返回，生成完成后会自动出现在下方。
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
 
                             {generatedVideoAssets.length > 0 && (
                                 <div className="space-y-3 border-t border-border pt-4">

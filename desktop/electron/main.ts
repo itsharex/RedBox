@@ -70,6 +70,7 @@ import {
   listMediaAssets,
   bindMediaAssetToManuscript,
   updateMediaAssetMetadata,
+  deleteMediaAsset,
   getAbsoluteMediaPath,
   type MediaAsset,
 } from './core/mediaLibraryStore';
@@ -2590,6 +2591,19 @@ ipcMain.handle('media:update', async (_, payload: { assetId: string; projectId?:
     return { success: true, asset: await enrichMediaAsset(updated) };
   } catch (error) {
     console.error('Failed to update media asset:', error);
+    return { success: false, error: String(error) };
+  }
+});
+
+ipcMain.handle('media:delete', async (_, { assetId }: { assetId: string }) => {
+  try {
+    if (!assetId) {
+      return { success: false, error: 'assetId is required' };
+    }
+    const deleted = await deleteMediaAsset(assetId);
+    return { success: true, deleted };
+  } catch (error) {
+    console.error('Failed to delete media asset:', error);
     return { success: false, error: String(error) };
   }
 });

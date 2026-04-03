@@ -123,6 +123,29 @@ async function updateManuscriptBinding(manuscriptPath: string, asset: MediaAsset
   await fs.writeFile(absolutePath, next, 'utf-8');
 }
 
+async function removeManuscriptBinding(manuscriptPath: string, assetId: string): Promise<void> {
+  const manuscriptsRoot = getWorkspacePaths().manuscripts;
+  const normalized = normalizePathForStore(manuscriptPath);
+  const absolutePath = path.join(manuscriptsRoot, normalized);
+  try {
+    const raw = await fs.readFile(absolutePath, 'utf-8');
+    const parsed = matter(raw);
+    const data = parsed.data as Record<string, unknown>;
+    const current = Array.isArray(data.boundMedia) ? data.boundMedia : [];
+    const filtered = current.filter((item) => {
+      if (!item || typeof item !== 'object') return false;
+      const id = (item as Record<string, unknown>).assetId;
+      return id !== assetId;
+    });
+    data.boundMedia = filtered;
+    data.updatedAt = Date.now();
+    const next = matter.stringify(parsed.content, data);
+    await fs.writeFile(absolutePath, next, 'utf-8');
+  } catch {
+    // Ignore missing manuscript or malformed frontmatter during delete cleanup.
+  }
+}
+
 export async function listMediaAssets(limit = 200): Promise<MediaAsset[]> {
   const catalog = await readCatalog();
   const sorted = [...catalog.assets].sort((a, b) => {
@@ -274,6 +297,37 @@ export async function updateMediaAssetMetadata(input: {
   asset.updatedAt = nowIso();
   await writeCatalog(catalog);
   return asset;
+}
+
+export async function deleteMediaAsset(assetId: string): Promise<{ id: string; relativePath?: string }> {
+  const catalog = await readCatalog();
+  const assetIndex = catalog.assets.findIndex((item) => item.id === assetId);
+  if (assetIndex === -1) {
+    throw new Error('Media asset not found');
+  }
+
+  const [asset] = catalog.assets.splice(assetIndex, 1);
+  await writeCatalog(catalog);
+
+  if (asset.boundManuscriptPath) {
+    await removeManuscriptBinding(asset.boundManuscriptPath, asset.id);
+  }
+
+  if (asset.relativePath) {
+    const absolutePath = getAbsoluteMediaPath(asset.relativePath);
+    try {
+      await fs.unlink(absolutePath);
+    } catch (error: any) {
+      if (error?.code !== 'ENOENT') {
+        throw error;
+      }
+    }
+  }
+
+  return {
+    id: asset.id,
+    relativePath: asset.relativePath,
+  };
 }
 
 export function getAbsoluteMediaPath(relativePath: string): string {

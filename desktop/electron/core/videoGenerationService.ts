@@ -289,6 +289,7 @@ async function generateViaOpenAiCompatibleVideoRoute(input: {
     const size = mapOpenAiVideoSize(input.aspectRatio, input.resolution);
     const seconds = mapOpenAiVideoSeconds(input.durationSeconds);
     const refs = Array.isArray(input.referenceImages) ? input.referenceImages.filter(Boolean) : [];
+    const normalizedDrivingAudio = input.drivingAudio ? await normalizeMediaValueForRemote(input.drivingAudio) : '';
     const body: Record<string, unknown> = {
         model: input.model,
         prompt: input.prompt,
@@ -300,7 +301,12 @@ async function generateViaOpenAiCompatibleVideoRoute(input: {
         body.resolution = input.resolution === '1080p' ? '1080P' : '720P';
         body.duration = input.durationSeconds;
 
-        if (input.generationMode === 'reference-guided') {
+        if (input.generationMode === 'text-to-video') {
+            if (normalizedDrivingAudio) {
+                body.audio_url = normalizedDrivingAudio;
+                body.driving_audio_url = normalizedDrivingAudio;
+            }
+        } else if (input.generationMode === 'reference-guided') {
             const referenceImages = await Promise.all(refs.slice(0, 5).map((item) => normalizeMediaValueForRemote(item)));
             const normalizedRefs = referenceImages.filter(Boolean);
             if (normalizedRefs.length) {
@@ -313,6 +319,11 @@ async function generateViaOpenAiCompatibleVideoRoute(input: {
                 body.reference_image = normalizedRefs[0];
                 body.img_url = normalizedRefs[0];
             }
+            if (normalizedDrivingAudio) {
+                body.reference_voice = normalizedDrivingAudio;
+                body.reference_voice_url = normalizedDrivingAudio;
+                body.audio_url = normalizedDrivingAudio;
+            }
         } else if (input.generationMode === 'first-last-frame') {
             const firstFrame = refs[0] ? await normalizeMediaValueForRemote(refs[0]) : '';
             const lastFrame = refs[1] ? await normalizeMediaValueForRemote(refs[1]) : '';
@@ -321,6 +332,7 @@ async function generateViaOpenAiCompatibleVideoRoute(input: {
                 body.media = [
                     ...(firstFrame ? [{ type: 'first_frame', url: firstFrame }] : []),
                     ...(lastFrame ? [{ type: 'last_frame', url: lastFrame }] : []),
+                    ...(normalizedDrivingAudio ? [{ type: 'driving_audio', url: normalizedDrivingAudio }] : []),
                 ];
                 if (firstFrame) {
                     body.image = firstFrame;
@@ -333,6 +345,10 @@ async function generateViaOpenAiCompatibleVideoRoute(input: {
                     body.last_frame = lastFrame;
                     body.last_frame_url = lastFrame;
                     body.last_image_url = lastFrame;
+                }
+                if (normalizedDrivingAudio) {
+                    body.audio_url = normalizedDrivingAudio;
+                    body.driving_audio_url = normalizedDrivingAudio;
                 }
             }
         } else if (input.generationMode === 'continuation') {
@@ -354,6 +370,10 @@ async function generateViaOpenAiCompatibleVideoRoute(input: {
         }
         if (refs.length > 0) {
             body.images = refs.slice(0, 2);
+        }
+        if (normalizedDrivingAudio) {
+            body.audio_url = normalizedDrivingAudio;
+            body.driving_audio_url = normalizedDrivingAudio;
         }
     }
     let response: Response | null = null;
@@ -573,6 +593,7 @@ export async function generateVideosToMediaLibrary(input: GenerateVideosInput): 
         globalKeySuffix: maskKeySuffix(globalApiKey),
         model,
         generationMode,
+        hasDrivingAudio: Boolean(drivingAudio),
     });
     if (generationMode === 'reference-guided' && referenceImages.length < 1) {
         throw new Error('参考图视频模式至少需要 1 张参考图。');

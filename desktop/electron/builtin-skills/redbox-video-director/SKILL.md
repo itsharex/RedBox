@@ -96,6 +96,8 @@ If the script is complex, also ask whether the user wants storyboard stills firs
   - `Image 2: livestream background mood reference`
   - `Audio 1: Jamba voice reference for tone and speaking rhythm`
 - Do this before the motion/camera description so the model does not confuse multiple references.
+- If a suitable subject voice reference exists and the chosen mode supports audio conditioning, treat it as a first-class reference asset instead of telling the user the platform cannot accept audio.
+- If the request uses a subject from the subject library and that subject has a saved voice reference, you should treat that voice as the default audio reference for the video unless the user explicitly asks to disable it or replace it.
 - For `text-to-video`, describe subject, camera, motion, environment, pacing, and visual style.
 - For `reference-guided`, describe the desired movement and cinematic behavior while preserving and combining the important elements from the provided reference images.
 - For `first-last-frame`, describe the transition between the first and last frame; do not rewrite the full scene unless the transition requires it.
@@ -109,6 +111,8 @@ If the script is complex, also ask whether the user wants storyboard stills firs
 - Pass 1 to 5 reference images for `reference-guided`.
 - Pass exactly two reference images in `首帧,尾帧` order for `first-last-frame`.
 - If a suitable voice reference exists, pass it as `drivingAudio` and describe it explicitly as `Audio 1` in the prompt preface.
+- For `reference-guided`, if a suitable voice reference exists, also pass it as the mode's voice reference input.
+- When a subject-library character is used, default to that character's saved voice reference as `Audio 1`.
 - Keep the final generation prompt focused on execution details derived from the approved script.
 - Do not dump the whole planning discussion into the generation prompt.
 - If the user intent is ambiguous, explain the ambiguity briefly and pick the safer mode instead of faking certainty.
