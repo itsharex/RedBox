@@ -4,6 +4,7 @@ export interface BuiltinToolFactoryContext {
     chatService?: any;
     skillManager?: any;
     onSkillActivated?: (payload: { name: string; description: string }) => void;
+    workspaceRootOverride?: string;
 }
 
 export type BuiltinToolPack = 'redclaw' | 'knowledge' | 'chatroom' | 'diagnostics' | 'full';

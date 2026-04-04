@@ -47,7 +47,10 @@ import {
     saveRedClawCopyPack,
     saveRedClawImagePack,
     saveRedClawRetrospective,
+    type RedClawAuthoringTaskType,
+    type RedClawContentPlatform,
     type RedClawImagePrompt,
+    type RedClawSourceMode,
 } from '../redclawStore';
 import {
     listMediaAssets,
@@ -89,6 +92,15 @@ import {
 } from '../mcpStore';
 import { listMcpTools, callMcpTool } from '../mcpRuntime';
 import { getRandomWanderItems, runWanderBrainstorm } from '../wanderService';
+import {
+    ensureManuscriptFileName,
+    getDraftTypeFromFileName,
+    getManuscriptExtension,
+    getPackageKindFromFileName,
+    isManuscriptPackageName,
+    isSupportedManuscriptFile,
+    stripManuscriptExtension,
+} from '../../../shared/manuscriptFiles';
 
 const AppCliParamsSchema = z.object({
     command: z.string().min(1).describe('CLI command. Example: "redclaw list --limit 20"'),
@@ -175,6 +187,30 @@ interface GeneratedVideoCliResult {
         briefPath: string;
     } | null;
 }
+
+const normalizeRedClawPlatform = (value: unknown): RedClawContentPlatform | undefined => {
+    const normalized = String(value || '').trim();
+    if (normalized === 'wechat_official_account' || normalized === 'xiaohongshu') {
+        return normalized;
+    }
+    return undefined;
+};
+
+const normalizeRedClawTaskType = (value: unknown): RedClawAuthoringTaskType | undefined => {
+    const normalized = String(value || '').trim();
+    if (normalized === 'expand_from_xhs' || normalized === 'direct_write') {
+        return normalized;
+    }
+    return undefined;
+};
+
+const normalizeRedClawSourceMode = (value: unknown): RedClawSourceMode | undefined => {
+    const normalized = String(value || '').trim();
+    if (normalized === 'manual' || normalized === 'knowledge' || normalized === 'manuscript') {
+        return normalized;
+    }
+    return undefined;
+};
 
 const CONCURRENCY_SAFE_APP_CLI_ACTIONS = new Map<string, Set<string>>([
     ['workspace', new Set(['list', 'show', 'get'])],
@@ -411,7 +447,7 @@ const APP_CLI_NAMESPACE_HELP: Record<string, { summary: string; actions: string[
     redclaw: {
         summary: 'Manage RedClaw projects and automation.',
         actions: ['list', 'get', 'create', 'save-copy', 'save-image', 'save-retro', 'runner-status', 'runner-start', 'heartbeat-set', 'schedule-add', 'schedule-update', 'long-add', 'long-update'],
-        examples: ['redclaw create --goal "做一条民宿选题"', 'redclaw runner-status'],
+        examples: ['redclaw create --goal "做一条民宿选题" --platform xiaohongshu', 'redclaw runner-status'],
     },
     media: {
         summary: 'List media and bind assets to manuscripts.',
@@ -553,10 +589,14 @@ async function listManuscripts(root: string): Promise<string[]> {
         for (const entry of entries) {
             const absolute = path.join(dir, entry.name);
             if (entry.isDirectory()) {
+                if (isManuscriptPackageName(entry.name)) {
+                    results.push(path.relative(root, absolute).replace(/\\/g, '/'));
+                    continue;
+                }
                 await walk(absolute);
                 continue;
             }
-            if (entry.name.endsWith('.md')) {
+            if (isSupportedManuscriptFile(entry.name)) {
                 results.push(path.relative(root, absolute).replace(/\\/g, '/'));
             }
         }
@@ -564,6 +604,204 @@ async function listManuscripts(root: string): Promise<string[]> {
     await fs.mkdir(root, { recursive: true });
     await walk(root);
     return results.sort((a, b) => a.localeCompare(b));
+}
+
+function getDefaultManuscriptPackageEntry(fileName: string): string {
+    const packageKind = getPackageKindFromFileName(fileName);
+    if (packageKind === 'video' || packageKind === 'audio') {
+        return 'script.md';
+    }
+    return 'content.md';
+}
+
+function getPackageManifestPath(packagePath: string): string {
+    return path.join(packagePath, 'manifest.json');
+}
+
+function getPackageTimelinePath(packagePath: string): string {
+    return path.join(packagePath, 'timeline.otio.json');
+}
+
+async function readJsonFile<T>(filePath: string, fallback: T): Promise<T> {
+    try {
+        const raw = await fs.readFile(filePath, 'utf-8');
+        return JSON.parse(raw) as T;
+    } catch {
+        return fallback;
+    }
+}
+
+function createEmptyOtioTimeline(title: string) {
+    return {
+        OTIO_SCHEMA: 'Timeline.1',
+        name: title,
+        global_start_time: null,
+        tracks: {
+            OTIO_SCHEMA: 'Stack.1',
+            children: [
+                { OTIO_SCHEMA: 'Track.1', name: 'V1', kind: 'Video', children: [] },
+                { OTIO_SCHEMA: 'Track.1', name: 'A1', kind: 'Audio', children: [] },
+            ],
+        },
+        metadata: {
+            owner: 'redbox',
+            engine: 'ai-editing',
+            version: 1,
+            sourceRefs: [],
+        },
+    };
+}
+
+function getPackageEntryPath(packagePath: string, fileName: string, manifest?: Record<string, unknown>): string {
+    const entry = String(manifest?.entry || '').trim() || getDefaultManuscriptPackageEntry(fileName);
+    return path.join(packagePath, entry);
+}
+
+async function createManuscriptPackage(packagePath: string, content: string, fileName: string): Promise<void> {
+    const now = Date.now();
+    const title = stripManuscriptExtension(fileName);
+    const packageKind = getPackageKindFromFileName(fileName);
+    const draftType = getDraftTypeFromFileName(fileName);
+    const manifest = {
+        id: ulid(),
+        type: 'manuscript-package',
+        packageKind,
+        draftType,
+        title,
+        status: 'writing',
+        version: 1,
+        createdAt: now,
+        updatedAt: now,
+        entry: getDefaultManuscriptPackageEntry(fileName),
+        timeline: packageKind === 'video' || packageKind === 'audio' ? 'timeline.otio.json' : undefined,
+    };
+
+    await fs.mkdir(packagePath, { recursive: true });
+    await fs.mkdir(path.join(packagePath, 'cache'), { recursive: true });
+    await fs.mkdir(path.join(packagePath, 'exports'), { recursive: true });
+    await fs.writeFile(getPackageManifestPath(packagePath), JSON.stringify(manifest, null, 2), 'utf-8');
+    await fs.writeFile(getPackageEntryPath(packagePath, fileName, manifest), content || '', 'utf-8');
+
+    if (packageKind === 'video' || packageKind === 'audio') {
+        await fs.writeFile(path.join(packagePath, 'assets.json'), JSON.stringify({ items: [] }, null, 2), 'utf-8');
+        await fs.writeFile(getPackageTimelinePath(packagePath), JSON.stringify(createEmptyOtioTimeline(title), null, 2), 'utf-8');
+        if (packageKind === 'video') {
+            await fs.writeFile(path.join(packagePath, 'storyboard.json'), JSON.stringify({ scenes: [] }, null, 2), 'utf-8');
+            await fs.writeFile(path.join(packagePath, 'transcript.json'), JSON.stringify({ items: [] }, null, 2), 'utf-8');
+        } else {
+            await fs.writeFile(path.join(packagePath, 'segments.json'), JSON.stringify({ items: [] }, null, 2), 'utf-8');
+            await fs.writeFile(path.join(packagePath, 'transcript.json'), JSON.stringify({ items: [] }, null, 2), 'utf-8');
+        }
+    } else if (packageKind === 'article') {
+        await fs.writeFile(path.join(packagePath, 'layout.html'), '', 'utf-8');
+        await fs.writeFile(path.join(packagePath, 'wechat.html'), '', 'utf-8');
+        await fs.writeFile(path.join(packagePath, 'styles.json'), JSON.stringify({ theme: 'default' }, null, 2), 'utf-8');
+        await fs.writeFile(path.join(packagePath, 'assets.json'), JSON.stringify({ items: [] }, null, 2), 'utf-8');
+    } else if (packageKind === 'post') {
+        await fs.writeFile(path.join(packagePath, 'images.json'), JSON.stringify({ items: [] }, null, 2), 'utf-8');
+        await fs.writeFile(path.join(packagePath, 'cover.json'), JSON.stringify({ assetId: null }, null, 2), 'utf-8');
+        await fs.writeFile(path.join(packagePath, 'layout.json'), JSON.stringify({ cards: [] }, null, 2), 'utf-8');
+        await fs.writeFile(path.join(packagePath, 'assets.json'), JSON.stringify({ items: [] }, null, 2), 'utf-8');
+    }
+}
+
+async function readManuscriptPackage(packagePath: string) {
+    const fileName = path.basename(packagePath);
+    const metadata = await readJsonFile<Record<string, unknown>>(getPackageManifestPath(packagePath), {});
+    const content = await fs.readFile(getPackageEntryPath(packagePath, fileName, metadata), 'utf-8').catch(() => '');
+    return { path: packagePath, content, metadata };
+}
+
+async function saveManuscriptPackage(packagePath: string, content: string, metadata?: Record<string, unknown>) {
+    const fileName = path.basename(packagePath);
+    const existingMetadata = await readJsonFile<Record<string, unknown>>(getPackageManifestPath(packagePath), {});
+    const nextMetadata = {
+        ...existingMetadata,
+        ...(metadata || {}),
+        updatedAt: Date.now(),
+        entry: String((metadata || {}).entry || existingMetadata.entry || getDefaultManuscriptPackageEntry(fileName)),
+    };
+    await fs.mkdir(packagePath, { recursive: true });
+    await fs.writeFile(getPackageEntryPath(packagePath, fileName, nextMetadata), content, 'utf-8');
+    await fs.writeFile(getPackageManifestPath(packagePath), JSON.stringify(nextMetadata, null, 2), 'utf-8');
+}
+
+function buildTimelineClipSummaries(timeline: Record<string, unknown>) {
+    const tracks = Array.isArray((timeline as any)?.tracks?.children) ? (timeline as any).tracks.children : [];
+    const sourceRefs = Array.isArray((timeline as any)?.metadata?.sourceRefs) ? (timeline as any).metadata.sourceRefs : [];
+    const sourceRefByAssetId = new Map<string, Record<string, unknown>>();
+    for (const item of sourceRefs) {
+        const assetId = String((item as any)?.assetId || '').trim();
+        if (!assetId) continue;
+        sourceRefByAssetId.set(assetId, item as Record<string, unknown>);
+    }
+
+    return tracks.flatMap((track: any) => {
+        const trackName = String(track?.name || '').trim();
+        const trackKind = String(track?.kind || '').trim();
+        const children = Array.isArray(track?.children) ? track.children : [];
+        return children.map((clip: any, index: number) => {
+            const metadata = (clip?.metadata && typeof clip.metadata === 'object') ? clip.metadata : {};
+            const mediaRef = clip?.media_references?.DEFAULT_MEDIA;
+            const assetId = String(metadata.assetId || mediaRef?.metadata?.assetId || '').trim();
+            const sourceRef = assetId ? sourceRefByAssetId.get(assetId) : null;
+            return {
+                assetId,
+                name: String(clip?.name || assetId || `Clip ${index + 1}`),
+                track: trackName,
+                trackKind,
+                order: Number(metadata.order ?? index) || 0,
+                durationMs: metadata.durationMs ?? null,
+                trimInMs: Number(metadata.trimInMs ?? 0) || 0,
+                trimOutMs: Number(metadata.trimOutMs ?? 0) || 0,
+                enabled: metadata.enabled ?? true,
+                assetKind: String(metadata.assetKind || sourceRef?.assetKind || ''),
+                mediaPath: String(sourceRef?.mediaPath || mediaRef?.target_url || ''),
+                mimeType: String(sourceRef?.mimeType || mediaRef?.metadata?.mimeType || ''),
+            };
+        });
+    });
+}
+
+function normalizePackageTimeline(timeline: Record<string, unknown>) {
+    const tracks = Array.isArray((timeline as any)?.tracks?.children) ? (timeline as any).tracks.children : [];
+    const nextSourceRefs: Array<Record<string, unknown>> = [];
+
+    for (const track of tracks) {
+        const trackName = String((track as any)?.name || '').trim();
+        const children = Array.isArray((track as any)?.children) ? track.children : [];
+        track.children = children.map((clip: any, index: number) => {
+            const metadata = (clip?.metadata && typeof clip.metadata === 'object') ? clip.metadata : {};
+            const assetId = String(metadata.assetId || clip?.media_references?.DEFAULT_MEDIA?.metadata?.assetId || '').trim();
+            const mediaRef = clip?.media_references?.DEFAULT_MEDIA;
+            nextSourceRefs.push({
+                assetId,
+                mediaPath: String(mediaRef?.target_url || ''),
+                mimeType: String(mediaRef?.metadata?.mimeType || ''),
+                track: trackName,
+                order: index,
+                assetKind: String(metadata.assetKind || ''),
+                addedAt: String(metadata.addedAt || new Date().toISOString()),
+            });
+            return {
+                ...clip,
+                metadata: {
+                    ...metadata,
+                    order: index,
+                    durationMs: metadata.durationMs ?? null,
+                    trimInMs: Number(metadata.trimInMs ?? 0) || 0,
+                    trimOutMs: Number(metadata.trimOutMs ?? 0) || 0,
+                    enabled: metadata.enabled ?? true,
+                },
+            };
+        });
+    }
+
+    (timeline as any).metadata = {
+        ...((timeline as any).metadata || {}),
+        sourceRefs: nextSourceRefs.filter((item) => String(item.assetId || '').trim()),
+    };
+    return timeline;
 }
 
 export class AppCliTool extends DeclarativeTool<typeof AppCliParamsSchema> {
@@ -1108,12 +1346,23 @@ export class AppCliTool extends DeclarativeTool<typeof AppCliParamsSchema> {
             for (const relPath of files) {
                 if (relPath.startsWith('_drafts/') || relPath.startsWith('_published/')) continue;
                 const absolute = path.join(manuscriptsRoot, relPath);
-                const raw = await fs.readFile(absolute, 'utf-8');
-                const parsedMatter = matter(raw);
-                const joinedText = [
-                    String((parsedMatter.data as Record<string, unknown>).title || ''),
-                    parsedMatter.content || '',
-                ].join('\n');
+                const stats = await fs.stat(absolute);
+                let joinedText = '';
+                if (stats.isDirectory()) {
+                    const manifestPath = path.join(absolute, 'manifest.json');
+                    const rawManifest = await fs.readFile(manifestPath, 'utf-8').catch(() => '{}');
+                    const manifest = JSON.parse(rawManifest) as Record<string, unknown>;
+                    const entryPath = path.join(absolute, String(manifest.entry || 'content.md'));
+                    const entryContent = await fs.readFile(entryPath, 'utf-8').catch(() => '');
+                    joinedText = [String(manifest.title || ''), entryContent].join('\n');
+                } else {
+                    const raw = await fs.readFile(absolute, 'utf-8');
+                    const parsedMatter = matter(raw);
+                    joinedText = [
+                        String((parsedMatter.data as Record<string, unknown>).title || ''),
+                        parsedMatter.content || '',
+                    ].join('\n');
+                }
                 const category = detectManuscriptCategory(joinedText);
                 const targetDir = path.join(manuscriptsRoot, category);
                 const ext = path.extname(relPath);
@@ -1149,6 +1398,15 @@ export class AppCliTool extends DeclarativeTool<typeof AppCliParamsSchema> {
         if (action === 'read') {
             const relPath = normalizeRelativePath(requireString(readFlag(parsed.flags, 'path') || payload.path, 'path'));
             const absolute = path.join(manuscriptsRoot, relPath);
+            const stats = await fs.stat(absolute);
+            if (stats.isDirectory() && isManuscriptPackageName(path.basename(absolute))) {
+                const pkg = await readManuscriptPackage(absolute);
+                return {
+                    path: relPath,
+                    content: pkg.content,
+                    metadata: pkg.metadata || {},
+                };
+            }
             const raw = await fs.readFile(absolute, 'utf-8');
             const parsedMatter = matter(raw);
             return {
@@ -1158,11 +1416,95 @@ export class AppCliTool extends DeclarativeTool<typeof AppCliParamsSchema> {
             };
         }
 
+        if (action === 'clips') {
+            const relPath = normalizeRelativePath(requireString(readFlag(parsed.flags, 'path') || payload.path, 'path'));
+            const absolute = path.join(manuscriptsRoot, relPath);
+            const stats = await fs.stat(absolute);
+            if (!stats.isDirectory() || !isManuscriptPackageName(path.basename(absolute))) {
+                throw new Error('clips 仅支持视频/音频工程稿件');
+            }
+            const timeline = await readJsonFile<Record<string, unknown>>(getPackageTimelinePath(absolute), {});
+            const clips = buildTimelineClipSummaries(timeline);
+            return {
+                path: relPath,
+                count: clips.length,
+                clips,
+            };
+        }
+
+        if (action === 'clip-update') {
+            const relPath = normalizeRelativePath(requireString(readFlag(parsed.flags, 'path') || payload.path, 'path'));
+            const assetId = requireString(readFlag(parsed.flags, 'asset-id', 'assetid') || payload.assetId, 'assetId');
+            const absolute = path.join(manuscriptsRoot, relPath);
+            const stats = await fs.stat(absolute);
+            if (!stats.isDirectory() || !isManuscriptPackageName(path.basename(absolute))) {
+                throw new Error('clip-update 仅支持视频/音频工程稿件');
+            }
+
+            const timelinePath = getPackageTimelinePath(absolute);
+            const timeline = await readJsonFile<Record<string, unknown>>(timelinePath, createEmptyOtioTimeline(path.basename(absolute)));
+            const tracks = Array.isArray((timeline as any)?.tracks?.children) ? (timeline as any).tracks.children : [];
+            let clipToMove: any = null;
+            let currentTrack: any = null;
+
+            for (const track of tracks) {
+                const children = Array.isArray((track as any)?.children) ? track.children : [];
+                const clipIndex = children.findIndex((clip: any) => String(clip?.metadata?.assetId || clip?.media_references?.DEFAULT_MEDIA?.metadata?.assetId || '').trim() === assetId);
+                if (clipIndex >= 0) {
+                    clipToMove = children.splice(clipIndex, 1)[0];
+                    currentTrack = track;
+                    break;
+                }
+            }
+
+            if (!clipToMove || !currentTrack) {
+                throw new Error(`Clip not found for assetId: ${assetId}`);
+            }
+
+            const nextTrackName = String(readFlag(parsed.flags, 'track') || payload.track || currentTrack?.name || '').trim();
+            const targetTrack = tracks.find((track: any) => String(track?.name || '').trim() === nextTrackName) || currentTrack;
+            const targetChildren = Array.isArray(targetTrack.children) ? targetTrack.children : [];
+            const nextMetadata = (clipToMove?.metadata && typeof clipToMove.metadata === 'object') ? clipToMove.metadata : {};
+            const durationRaw = readFlag(parsed.flags, 'duration-ms', 'duration') ?? payload.durationMs;
+            const trimInRaw = readFlag(parsed.flags, 'trim-in-ms', 'trim-in') ?? payload.trimInMs;
+            const trimOutRaw = readFlag(parsed.flags, 'trim-out-ms', 'trim-out') ?? payload.trimOutMs;
+            const enabledRaw = readFlag(parsed.flags, 'enabled') ?? payload.enabled;
+            const orderRaw = readFlag(parsed.flags, 'order') ?? payload.order;
+
+            clipToMove = {
+                ...clipToMove,
+                metadata: {
+                    ...nextMetadata,
+                    durationMs: durationRaw === null ? null : (parseNumber(durationRaw) ?? nextMetadata.durationMs ?? null),
+                    trimInMs: parseNumber(trimInRaw) ?? nextMetadata.trimInMs ?? 0,
+                    trimOutMs: parseNumber(trimOutRaw) ?? nextMetadata.trimOutMs ?? 0,
+                    enabled: enabledRaw === undefined ? (nextMetadata.enabled ?? true) : String(enabledRaw) !== 'false',
+                },
+            };
+
+            const desiredOrder = (() => {
+                const parsedOrder = parseNumber(orderRaw);
+                if (parsedOrder === undefined || Number.isNaN(parsedOrder)) return targetChildren.length;
+                return Math.max(0, Math.min(Math.trunc(parsedOrder), targetChildren.length));
+            })();
+
+            targetChildren.splice(desiredOrder, 0, clipToMove);
+            targetTrack.children = targetChildren;
+            normalizePackageTimeline(timeline);
+            await fs.writeFile(timelinePath, JSON.stringify(timeline, null, 2), 'utf-8');
+            return {
+                success: true,
+                path: relPath,
+                assetId,
+                clips: buildTimelineClipSummaries(timeline),
+            };
+        }
+
         if (action === 'write' || action === 'create') {
             const relPathInput = requireString(readFlag(parsed.flags, 'path') || payload.path, 'path');
-            const relPath = normalizeRelativePath(relPathInput.endsWith('.md') ? relPathInput : `${relPathInput}.md`);
+            const fallbackExtension = getManuscriptExtension(relPathInput) || '.md';
+            const relPath = normalizeRelativePath(ensureManuscriptFileName(relPathInput, fallbackExtension));
             const absolute = path.join(manuscriptsRoot, relPath);
-            await fs.mkdir(path.dirname(absolute), { recursive: true });
 
             const content = String(
                 readFlag(parsed.flags, 'content')
@@ -1178,6 +1520,41 @@ export class AppCliTool extends DeclarativeTool<typeof AppCliParamsSchema> {
                 } catch {
                     throw new Error('metadata must be valid JSON');
                 }
+            }
+
+            await fs.mkdir(path.dirname(absolute), { recursive: true });
+
+            if (isManuscriptPackageName(path.basename(absolute))) {
+                let currentMeta: Record<string, unknown> = {};
+                let currentContent = '';
+                try {
+                    const pkg = await readManuscriptPackage(absolute);
+                    currentMeta = pkg.metadata || {};
+                    currentContent = pkg.content || '';
+                } catch {
+                    currentMeta = {};
+                }
+                try {
+                    await fs.access(absolute);
+                } catch {
+                    await createManuscriptPackage(absolute, content, path.basename(absolute));
+                }
+                const nextMeta: Record<string, unknown> = {
+                    ...currentMeta,
+                    ...(metadataInput || {}),
+                    id: currentMeta.id || ulid(),
+                    createdAt: currentMeta.createdAt || Date.now(),
+                    updatedAt: Date.now(),
+                };
+                const nextContent = content || currentContent;
+                await saveManuscriptPackage(absolute, nextContent, nextMeta);
+                return {
+                    success: true,
+                    path: relPath,
+                    absolutePath: absolute,
+                    bytes: Buffer.byteLength(nextContent, 'utf8'),
+                    frontmatter: nextMeta,
+                };
             }
 
             let currentMeta: Record<string, unknown> = {};
@@ -1392,9 +1769,16 @@ export class AppCliTool extends DeclarativeTool<typeof AppCliParamsSchema> {
             const goal = requireString(readFlag(parsed.flags, 'goal') || payload.goal, 'goal');
             return createRedClawProject({
                 goal,
+                platform: normalizeRedClawPlatform(readFlag(parsed.flags, 'platform') || payload.platform),
+                taskType: normalizeRedClawTaskType(readFlag(parsed.flags, 'task-type') || payload.taskType),
                 targetAudience: readFlag(parsed.flags, 'audience', 'target-audience') || (payload.targetAudience as string | undefined),
                 tone: readFlag(parsed.flags, 'tone') || (payload.tone as string | undefined),
                 successCriteria: readFlag(parsed.flags, 'success', 'success-criteria') || (payload.successCriteria as string | undefined),
+                sourcePlatform: normalizeRedClawPlatform(readFlag(parsed.flags, 'source-platform') || payload.sourcePlatform),
+                sourceNoteId: readFlag(parsed.flags, 'source-note-id') || (payload.sourceNoteId as string | undefined),
+                sourceMode: normalizeRedClawSourceMode(readFlag(parsed.flags, 'source-mode') || payload.sourceMode),
+                sourceTitle: readFlag(parsed.flags, 'source-title') || (payload.sourceTitle as string | undefined),
+                sourceManuscriptPath: readFlag(parsed.flags, 'source-manuscript-path') || (payload.sourceManuscriptPath as string | undefined),
                 tags: parseList(readFlag(parsed.flags, 'tags') || payload.tags),
                 workItemId: readFlag(parsed.flags, 'work-item-id') || (payload.workItemId as string | undefined),
             });
@@ -1409,11 +1793,22 @@ export class AppCliTool extends DeclarativeTool<typeof AppCliParamsSchema> {
             const content = requireString(readFlag(parsed.flags, 'content') || payload.content, 'content');
             return saveRedClawCopyPack({
                 projectId,
+                platform: normalizeRedClawPlatform(readFlag(parsed.flags, 'platform') || payload.platform),
+                taskType: normalizeRedClawTaskType(readFlag(parsed.flags, 'task-type') || payload.taskType),
                 titleOptions: titleOptions.length > 0 ? titleOptions : ['默认标题'],
                 finalTitle: readFlag(parsed.flags, 'final-title') || (payload.finalTitle as string | undefined),
+                summary: readFlag(parsed.flags, 'summary') || (payload.summary as string | undefined),
+                introduction: readFlag(parsed.flags, 'introduction', 'intro') || (payload.introduction as string | undefined),
                 content,
                 hashtags: parseList(readFlag(parsed.flags, 'hashtags') || payload.hashtags),
                 coverTexts: parseList(readFlag(parsed.flags, 'cover-texts') || payload.coverTexts),
+                imageSuggestions: parseList(readFlag(parsed.flags, 'image-suggestions') || payload.imageSuggestions),
+                cta: readFlag(parsed.flags, 'cta') || (payload.cta as string | undefined),
+                sourcePlatform: normalizeRedClawPlatform(readFlag(parsed.flags, 'source-platform') || payload.sourcePlatform),
+                sourceNoteId: readFlag(parsed.flags, 'source-note-id') || (payload.sourceNoteId as string | undefined),
+                sourceMode: normalizeRedClawSourceMode(readFlag(parsed.flags, 'source-mode') || payload.sourceMode),
+                sourceTitle: readFlag(parsed.flags, 'source-title') || (payload.sourceTitle as string | undefined),
+                sourceManuscriptPath: readFlag(parsed.flags, 'source-manuscript-path') || (payload.sourceManuscriptPath as string | undefined),
                 publishPlan: readFlag(parsed.flags, 'publish-plan') || (payload.publishPlan as string | undefined),
             });
         }
@@ -1765,7 +2160,11 @@ export class AppCliTool extends DeclarativeTool<typeof AppCliParamsSchema> {
         if (action === 'bind') {
             const assetId = requireString(readFlag(parsed.flags, 'asset-id', 'assetid') || payload.assetId, 'assetId');
             const manuscriptPath = normalizeRelativePath(requireString(readFlag(parsed.flags, 'manuscript-path') || payload.manuscriptPath, 'manuscriptPath'));
-            return bindMediaAssetToManuscript({ assetId, manuscriptPath });
+            const roleRaw = readFlag(parsed.flags, 'role') || payload.role;
+            const role = roleRaw === 'cover' || roleRaw === 'image' || roleRaw === 'asset'
+                ? roleRaw
+                : undefined;
+            return bindMediaAssetToManuscript({ assetId, manuscriptPath, role });
         }
         if (action === 'path') {
             const assetId = requireString(readFlag(parsed.flags, 'asset-id', 'assetid') || payload.assetId, 'assetId');

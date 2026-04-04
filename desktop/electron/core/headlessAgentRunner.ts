@@ -1,9 +1,10 @@
-import { addChatMessage, getChatMessages, getSettings } from '../db';
+import { addChatMessage, getChatMessages, getSettings, getWorkspacePathsForSpace } from '../db';
 import { PiChatService } from '../pi/PiChatService';
 import { getAgentRuntime } from './ai';
 import { getBackgroundSessionStore } from './backgroundSessionStore';
 import { getBackgroundTaskRegistry } from './backgroundTaskRegistry';
 import { getHeadlessWorkerProcessManager } from './headlessWorkerProcessManager';
+import type { BuiltinToolPack } from './tools/catalog';
 
 type HeadlessRuntimeMode = 'redclaw' | 'background-maintenance';
 
@@ -47,6 +48,8 @@ export class HeadlessAgentRunner {
     runtimeMode?: HeadlessRuntimeMode;
     contextType?: string;
     metadata?: Record<string, unknown>;
+    spaceId?: string;
+    toolPack?: BuiltinToolPack;
     service?: PiChatService;
     rollback?: () => Promise<void> | void;
     attemptSignal?: AbortSignal;
@@ -59,6 +62,7 @@ export class HeadlessAgentRunner {
       runtimeMode: input.runtimeMode || 'redclaw',
       metadata: {
         headless: true,
+        spaceId: input.spaceId,
         ...(input.metadata || {}),
       },
     });
@@ -73,7 +77,12 @@ export class HeadlessAgentRunner {
       display_content: input.displayContent || '[后台任务]',
     });
 
-    const service = input.service || new PiChatService();
+    const workspacePaths = input.spaceId ? getWorkspacePathsForSpace(input.spaceId) : null;
+    const toolPack = input.toolPack || 'redclaw';
+    const service = input.service || new PiChatService({
+      toolPack,
+      workspacePathsOverride: workspacePaths || undefined,
+    });
 
     if (input.service) {
       const onAttemptAbort = () => service.abort();
@@ -119,12 +128,14 @@ export class HeadlessAgentRunner {
         systemPrompt: prepared.systemPrompt,
         messages: prepared.runtimeMessages,
         userInput: input.prompt,
-        toolPack: 'redclaw',
+        toolPack,
         runtimeMode: prepared.runtimeMode,
         requiresHumanApproval: prepared.preparedExecution.route.requiresHumanApproval,
         temperature: prepared.temperature,
         maxTurns: prepared.maxTurns,
         maxTimeMinutes: prepared.maxTimeMinutes,
+        workspaceRoot: workspacePaths?.base,
+        projectRoot: workspacePaths?.base,
         rollback: input.rollback,
         attemptSignal: input.attemptSignal,
       });

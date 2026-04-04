@@ -38,6 +38,14 @@ export class WriteFileTool extends DeclarativeTool<typeof WriteFileParamsSchema>
     readonly parameterSchema = WriteFileParamsSchema;
     readonly requiresConfirmation = false; // 不需要确认，让AI可以直接创建文件
 
+    constructor(private readonly workspaceRootOverride?: string) {
+        super();
+    }
+
+    private getWorkspaceRoot(): string {
+        return this.workspaceRootOverride || Instance.directory;
+    }
+
     protected validateValues(params: WriteFileParams): string | null {
         // 允许相对路径，会自动解析
         return null;
@@ -70,7 +78,7 @@ export class WriteFileTool extends DeclarativeTool<typeof WriteFileParamsSchema>
         try {
             let filePath = params.path;
             try {
-                filePath = resolvePathInWorkspace(filePath, Instance.directory);
+                filePath = resolvePathInWorkspace(filePath, this.getWorkspaceRoot());
             } catch (error) {
                 const message = error instanceof Error ? error.message : String(error);
                 return createErrorResult(message, ToolErrorType.PERMISSION_DENIED);

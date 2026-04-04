@@ -58,6 +58,55 @@ function copyWorkerScripts() {
 
 // https://vitejs.dev/config/
 export default defineConfig({
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes('node_modules')) {
+            return undefined;
+          }
+          if (id.includes('/react/') || id.includes('/react-dom/') || id.includes('/scheduler/')) {
+            return 'vendor-react';
+          }
+          if (
+            id.includes('/@codemirror/')
+            || id.includes('/@uiw/')
+            || id.includes('/@lezer/')
+            || id.includes('/refractor/')
+          ) {
+            return 'vendor-editor';
+          }
+          if (
+            id.includes('/react-markdown/')
+            || id.includes('/remark-gfm/')
+            || id.includes('/tippy.js/')
+          ) {
+            return 'vendor-content';
+          }
+          if (id.includes('/@xyflow/')) {
+            return 'vendor-flow';
+          }
+          if (
+            id.includes('/openai/')
+            || id.includes('/ai/')
+            || id.includes('/@ai-sdk/')
+            || id.includes('/@google/genai/')
+            || id.includes('/@mariozechner/')
+          ) {
+            return 'vendor-ai';
+          }
+          if (
+            id.includes('/lucide-react/')
+            || id.includes('/clsx/')
+            || id.includes('/tailwind-merge/')
+          ) {
+            return 'vendor-ui';
+          }
+          return undefined;
+        },
+      },
+    },
+  },
   plugins: [
     react(),
     copyPromptLibrary(),
@@ -86,6 +135,10 @@ export default defineConfig({
                 || id === 'bufferutil'
                 || id === 'utf-8-validate'
                 || id === 'undici'
+                || id === 'jsdom'
+                || id.startsWith('jsdom/')
+                || id === 'canvas'
+                || id.startsWith('canvas/')
                 || id === '@weixin-claw/core'
                 || id.startsWith('@weixin-claw/core/')
               ),

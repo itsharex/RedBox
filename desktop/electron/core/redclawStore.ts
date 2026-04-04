@@ -6,14 +6,24 @@ import { ensurePlannedMediaAssetsForProject } from './mediaLibraryStore';
 import { getWorkItemStore } from './workItemStore';
 
 type RedClawProjectStatus = 'planning' | 'drafted' | 'reviewed';
+export type RedClawContentPlatform = 'xiaohongshu' | 'wechat_official_account';
+export type RedClawAuthoringTaskType = 'direct_write' | 'expand_from_xhs';
+export type RedClawSourceMode = 'manual' | 'knowledge' | 'manuscript';
 
 export interface RedClawProject {
   id: string;
   workItemId?: string;
   goal: string;
+  platform: RedClawContentPlatform;
+  taskType: RedClawAuthoringTaskType;
   targetAudience?: string;
   tone?: string;
   successCriteria?: string;
+  sourcePlatform?: RedClawContentPlatform;
+  sourceNoteId?: string;
+  sourceMode?: RedClawSourceMode;
+  sourceTitle?: string;
+  sourceManuscriptPath?: string;
   tags: string[];
   status: RedClawProjectStatus;
   createdAt: string;
@@ -39,8 +49,53 @@ export interface RedClawRetrospectiveMetrics {
 const REDCLAW_DIR_NAME = 'redclaw';
 const PROJECTS_DIR_NAME = 'projects';
 
+const DEFAULT_PLATFORM: RedClawContentPlatform = 'xiaohongshu';
+const DEFAULT_TASK_TYPE: RedClawAuthoringTaskType = 'direct_write';
+
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+function normalizePlatform(value: unknown): RedClawContentPlatform {
+  return String(value || '').trim() === 'wechat_official_account'
+    ? 'wechat_official_account'
+    : DEFAULT_PLATFORM;
+}
+
+function normalizeTaskType(value: unknown): RedClawAuthoringTaskType {
+  return String(value || '').trim() === 'expand_from_xhs'
+    ? 'expand_from_xhs'
+    : DEFAULT_TASK_TYPE;
+}
+
+function platformLabel(platform: RedClawContentPlatform): string {
+  return platform === 'wechat_official_account' ? '公众号' : '小红书';
+}
+
+function taskTypeLabel(taskType: RedClawAuthoringTaskType): string {
+  return taskType === 'expand_from_xhs' ? '小红书扩写公众号' : '直接写稿';
+}
+
+function normalizeProject(raw: Partial<RedClawProject> & { id: string; goal: string }): RedClawProject {
+  return {
+    id: raw.id,
+    workItemId: raw.workItemId,
+    goal: String(raw.goal || '').trim(),
+    platform: normalizePlatform(raw.platform),
+    taskType: normalizeTaskType(raw.taskType),
+    targetAudience: raw.targetAudience?.trim() || undefined,
+    tone: raw.tone?.trim() || undefined,
+    successCriteria: raw.successCriteria?.trim() || undefined,
+    sourcePlatform: raw.sourcePlatform ? normalizePlatform(raw.sourcePlatform) : undefined,
+    sourceNoteId: raw.sourceNoteId?.trim() || undefined,
+    sourceMode: raw.sourceMode || undefined,
+    sourceTitle: raw.sourceTitle?.trim() || undefined,
+    sourceManuscriptPath: raw.sourceManuscriptPath?.trim() || undefined,
+    tags: Array.from(new Set((raw.tags || []).map((tag) => String(tag || '').trim()).filter(Boolean))),
+    status: raw.status || 'planning',
+    createdAt: raw.createdAt || nowIso(),
+    updatedAt: raw.updatedAt || nowIso(),
+  };
 }
 
 function slugify(value: string): string {
@@ -97,9 +152,16 @@ function safeNumber(value: unknown): number | undefined {
 
 export async function createRedClawProject(input: {
   goal: string;
+  platform?: RedClawContentPlatform;
+  taskType?: RedClawAuthoringTaskType;
   targetAudience?: string;
   tone?: string;
   successCriteria?: string;
+  sourcePlatform?: RedClawContentPlatform;
+  sourceNoteId?: string;
+  sourceMode?: RedClawSourceMode;
+  sourceTitle?: string;
+  sourceManuscriptPath?: string;
   tags?: string[];
   workItemId?: string;
 }): Promise<{ project: RedClawProject; projectDir: string }> {
@@ -115,8 +177,15 @@ export async function createRedClawProject(input: {
       status: 'active',
       tags: input.tags || [],
       metadata: {
+        platform: normalizePlatform(input.platform),
+        taskType: normalizeTaskType(input.taskType),
         targetAudience: input.targetAudience?.trim() || undefined,
         tone: input.tone?.trim() || undefined,
+        sourcePlatform: input.sourcePlatform || undefined,
+        sourceNoteId: input.sourceNoteId?.trim() || undefined,
+        sourceMode: input.sourceMode || undefined,
+        sourceTitle: input.sourceTitle?.trim() || undefined,
+        sourceManuscriptPath: input.sourceManuscriptPath?.trim() || undefined,
       },
       summary: '已升级为 RedClaw 项目，进入持续创作/复盘链路。',
     });
@@ -128,18 +197,25 @@ export async function createRedClawProject(input: {
   const projectDir = resolveProjectDir(projectId);
   await fs.mkdir(projectDir, { recursive: true });
 
-  const project: RedClawProject = {
+  const project = normalizeProject({
     id: projectId,
     workItemId: linkedWorkItem?.id,
     goal: input.goal.trim(),
+    platform: input.platform,
+    taskType: input.taskType,
     targetAudience: input.targetAudience?.trim() || undefined,
     tone: input.tone?.trim() || undefined,
     successCriteria: input.successCriteria?.trim() || undefined,
-    tags: Array.from(new Set((input.tags || []).map((tag) => tag.trim()).filter(Boolean))),
+    sourcePlatform: input.sourcePlatform,
+    sourceNoteId: input.sourceNoteId,
+    sourceMode: input.sourceMode,
+    sourceTitle: input.sourceTitle,
+    sourceManuscriptPath: input.sourceManuscriptPath,
+    tags: input.tags || [],
     status: 'planning',
     createdAt: nowIso(),
     updatedAt: nowIso(),
-  };
+  });
 
   await writeJson(resolveProjectJsonPath(projectId), project);
   if (linkedWorkItem?.id) {
@@ -159,15 +235,22 @@ export async function createRedClawProject(input: {
     `- Project ID: ${project.id}`,
     `- Work Item ID: ${project.workItemId || '(未绑定)'}`,
     `- Goal: ${project.goal}`,
+    `- Platform: ${platformLabel(project.platform)}`,
+    `- Task Type: ${taskTypeLabel(project.taskType)}`,
     `- Audience: ${project.targetAudience || '(未设置)'}`,
     `- Tone: ${project.tone || '(未设置)'}`,
     `- Success Criteria: ${project.successCriteria || '(未设置)'}`,
+    `- Source Mode: ${project.sourceMode || '(无)'}`,
+    `- Source Platform: ${project.sourcePlatform ? platformLabel(project.sourcePlatform) : '(无)'}`,
+    `- Source Note ID: ${project.sourceNoteId || '(无)'}`,
+    `- Source Title: ${project.sourceTitle || '(无)'}`,
+    `- Source Manuscript: ${project.sourceManuscriptPath || '(无)'}`,
     `- Status: ${project.status}`,
     `- Created At: ${project.createdAt}`,
     '',
     '## Files',
     '- `project.json` 项目元数据',
-    '- `copy-pack.md/.json` 文案包',
+    '- `copy-pack.md/.json` 稿件包',
     '- `image-pack.md/.json` 配图包',
     '- `retrospective.md/.json` 复盘记录',
   ].join('\n');
@@ -191,7 +274,7 @@ export async function getRedClawProject(projectId: string): Promise<{ project: R
     throw new Error(`Project not found: ${normalizedProjectId} (${projectPath}) - ${message}`);
   }
   return {
-    project: JSON.parse(raw) as RedClawProject,
+    project: normalizeProject(JSON.parse(raw) as RedClawProject),
     projectDir: resolveProjectDir(normalizedProjectId),
   };
 }
@@ -240,23 +323,48 @@ export async function saveRedClawCopyPack(input: {
   projectId: string;
   titleOptions: string[];
   finalTitle?: string;
+  platform?: RedClawContentPlatform;
+  taskType?: RedClawAuthoringTaskType;
+  summary?: string;
+  introduction?: string;
   content: string;
   hashtags?: string[];
   coverTexts?: string[];
+  imageSuggestions?: string[];
+  cta?: string;
+  sourcePlatform?: RedClawContentPlatform;
+  sourceNoteId?: string;
+  sourceMode?: RedClawSourceMode;
+  sourceTitle?: string;
+  sourceManuscriptPath?: string;
   publishPlan?: string;
 }): Promise<{ project: RedClawProject; filePath: string; manuscriptPath: string }> {
   const normalizedProjectId = normalizeProjectId(input.projectId);
   const { projectDir, project } = await getRedClawProject(normalizedProjectId);
+  const platform = normalizePlatform(input.platform || project.platform);
+  const taskType = normalizeTaskType(input.taskType || project.taskType);
   const hashtags = (input.hashtags || []).map((tag) => tag.trim()).filter(Boolean);
   const coverTexts = (input.coverTexts || []).map((text) => text.trim()).filter(Boolean);
+  const imageSuggestions = (input.imageSuggestions || []).map((text) => text.trim()).filter(Boolean);
   const titleOptions = input.titleOptions.map((text) => text.trim()).filter(Boolean);
 
   const payload = {
+    platform,
+    taskType,
     titleOptions,
     finalTitle: input.finalTitle?.trim() || undefined,
+    summary: input.summary?.trim() || undefined,
+    introduction: input.introduction?.trim() || undefined,
     content: input.content.trim(),
     hashtags,
     coverTexts,
+    imageSuggestions,
+    cta: input.cta?.trim() || undefined,
+    sourcePlatform: input.sourcePlatform || project.sourcePlatform,
+    sourceNoteId: input.sourceNoteId?.trim() || project.sourceNoteId,
+    sourceMode: input.sourceMode || project.sourceMode,
+    sourceTitle: input.sourceTitle?.trim() || project.sourceTitle,
+    sourceManuscriptPath: input.sourceManuscriptPath?.trim() || project.sourceManuscriptPath,
     publishPlan: input.publishPlan?.trim() || undefined,
     updatedAt: nowIso(),
   };
@@ -264,27 +372,58 @@ export async function saveRedClawCopyPack(input: {
   const jsonPath = path.join(projectDir, 'copy-pack.json');
   await writeJson(jsonPath, payload);
 
-  const markdown = [
-    '# 小红书文案包',
-    '',
-    '## 标题候选',
-    ...titleOptions.map((title, index) => `${index + 1}. ${title}`),
-    '',
-    '## 最终标题',
-    payload.finalTitle || '(待定)',
-    '',
-    '## 正文',
-    payload.content || '(空)',
-    '',
-    '## 话题标签',
-    hashtags.length > 0 ? hashtags.map((tag) => `- ${tag}`).join('\n') : '(无)',
-    '',
-    '## 封面文案',
-    coverTexts.length > 0 ? coverTexts.map((text) => `- ${text}`).join('\n') : '(无)',
-    '',
-    '## 发布计划',
-    payload.publishPlan || '(无)',
-  ].join('\n');
+  const markdown = platform === 'wechat_official_account'
+    ? [
+        '# 公众号文章文案包',
+        '',
+        '## 标题候选',
+        ...(titleOptions.length > 0 ? titleOptions.map((title, index) => `${index + 1}. ${title}`) : ['(无)']),
+        '',
+        '## 最终标题',
+        payload.finalTitle || '(待定)',
+        '',
+        '## 摘要',
+        payload.summary || '(无)',
+        '',
+        '## 导语',
+        payload.introduction || '(无)',
+        '',
+        '## 正文',
+        payload.content || '(空)',
+        '',
+        '## 结尾 CTA',
+        payload.cta || '(无)',
+        '',
+        '## 关键词 / 标签',
+        hashtags.length > 0 ? hashtags.map((tag) => `- ${tag}`).join('\n') : '(无)',
+        '',
+        '## 配图建议',
+        imageSuggestions.length > 0 ? imageSuggestions.map((item) => `- ${item}`).join('\n') : '(无)',
+        '',
+        '## 发布计划',
+        payload.publishPlan || '(无)',
+      ].join('\n')
+    : [
+        '# 小红书文案包',
+        '',
+        '## 标题候选',
+        ...(titleOptions.length > 0 ? titleOptions.map((title, index) => `${index + 1}. ${title}`) : ['(无)']),
+        '',
+        '## 最终标题',
+        payload.finalTitle || '(待定)',
+        '',
+        '## 正文',
+        payload.content || '(空)',
+        '',
+        '## 话题标签',
+        hashtags.length > 0 ? hashtags.map((tag) => `- ${tag}`).join('\n') : '(无)',
+        '',
+        '## 封面文案',
+        coverTexts.length > 0 ? coverTexts.map((text) => `- ${text}`).join('\n') : '(无)',
+        '',
+        '## 发布计划',
+        payload.publishPlan || '(无)',
+      ].join('\n');
   await fs.writeFile(path.join(projectDir, 'copy-pack.md'), markdown, 'utf-8');
 
   const manuscriptsDir = getWorkspacePaths().manuscripts;
@@ -305,36 +444,101 @@ export async function saveRedClawCopyPack(input: {
     title: payload.finalTitle || titleOptions[0] || project.goal,
     status: currentMetadata.status || 'writing',
     source: 'redclaw',
+    platform,
+    taskType,
     redclawProjectId: project.id,
     redclawUpdatedAt: payload.updatedAt,
+    sourcePlatform: payload.sourcePlatform,
+    sourceNoteId: payload.sourceNoteId,
+    sourceMode: payload.sourceMode,
+    sourceTitle: payload.sourceTitle,
+    sourceManuscriptPath: payload.sourceManuscriptPath,
+    formatTarget: 'markdown',
     tags: hashtags,
     createdAt: currentMetadata.createdAt || Date.now(),
     updatedAt: Date.now(),
   };
 
-  const manuscriptBody = [
-    '# 标题候选',
-    ...(titleOptions.length > 0 ? titleOptions.map((title, index) => `${index + 1}. ${title}`) : ['(无)']),
-    '',
-    '## 最终标题',
-    payload.finalTitle || '(待定)',
-    '',
-    '## 正文',
-    payload.content || '(空)',
-    '',
-    '## 话题标签',
-    hashtags.length > 0 ? hashtags.map((tag) => `- ${tag}`).join('\n') : '(无)',
-    '',
-    '## 封面文案',
-    coverTexts.length > 0 ? coverTexts.map((text) => `- ${text}`).join('\n') : '(无)',
-    '',
-    '## 发布计划',
-    payload.publishPlan || '(无)',
-    '',
-    '> 该稿件由 RedClaw 自动生成，可在稿件工作台继续编辑。',
-  ].join('\n');
+  const sourceReferenceLines = payload.sourceMode || payload.sourceNoteId || payload.sourceTitle || payload.sourceManuscriptPath
+    ? [
+        '## 来源信息',
+        `- 来源模式: ${payload.sourceMode || '(无)'}`,
+        `- 来源平台: ${payload.sourcePlatform ? platformLabel(payload.sourcePlatform) : '(无)'}`,
+        `- 来源标题: ${payload.sourceTitle || '(无)'}`,
+        `- 来源笔记 ID: ${payload.sourceNoteId || '(无)'}`,
+        `- 来源稿件路径: ${payload.sourceManuscriptPath || '(无)'}`,
+        '',
+      ]
+    : [];
+
+  const manuscriptBody = platform === 'wechat_official_account'
+    ? [
+        '# 标题候选',
+        ...(titleOptions.length > 0 ? titleOptions.map((title, index) => `${index + 1}. ${title}`) : ['(无)']),
+        '',
+        '## 最终标题',
+        payload.finalTitle || '(待定)',
+        '',
+        ...sourceReferenceLines,
+        '## 摘要',
+        payload.summary || '(无)',
+        '',
+        '## 导语',
+        payload.introduction || '(无)',
+        '',
+        '## 正文',
+        payload.content || '(空)',
+        '',
+        '## 结尾 CTA',
+        payload.cta || '(无)',
+        '',
+        '## 关键词 / 标签',
+        hashtags.length > 0 ? hashtags.map((tag) => `- ${tag}`).join('\n') : '(无)',
+        '',
+        '## 配图建议',
+        imageSuggestions.length > 0 ? imageSuggestions.map((item) => `- ${item}`).join('\n') : '(无)',
+        '',
+        '## 发布计划',
+        payload.publishPlan || '(无)',
+        '',
+        '> 该稿件由 RedClaw 自动生成，可在稿件工作台继续编辑或执行公众号排版复制。',
+      ].join('\n')
+    : [
+        '# 标题候选',
+        ...(titleOptions.length > 0 ? titleOptions.map((title, index) => `${index + 1}. ${title}`) : ['(无)']),
+        '',
+        '## 最终标题',
+        payload.finalTitle || '(待定)',
+        '',
+        '## 正文',
+        payload.content || '(空)',
+        '',
+        '## 话题标签',
+        hashtags.length > 0 ? hashtags.map((tag) => `- ${tag}`).join('\n') : '(无)',
+        '',
+        '## 封面文案',
+        coverTexts.length > 0 ? coverTexts.map((text) => `- ${text}`).join('\n') : '(无)',
+        '',
+        '## 发布计划',
+        payload.publishPlan || '(无)',
+        '',
+        '> 该稿件由 RedClaw 自动生成，可在稿件工作台继续编辑。',
+      ].join('\n');
 
   await fs.writeFile(manuscriptAbsolutePath, matter.stringify(manuscriptBody, manuscriptMetadata), 'utf-8');
+
+  const normalizedProject = normalizeProject({
+    ...project,
+    platform,
+    taskType,
+    sourcePlatform: payload.sourcePlatform,
+    sourceNoteId: payload.sourceNoteId,
+    sourceMode: payload.sourceMode,
+    sourceTitle: payload.sourceTitle,
+    sourceManuscriptPath: payload.sourceManuscriptPath,
+    updatedAt: payload.updatedAt,
+  });
+  await saveProject(normalizedProject);
 
   const nextProject = await updateProjectStatus(normalizedProjectId, 'drafted');
   if (project.workItemId) {
@@ -343,7 +547,7 @@ export async function saveRedClawCopyPack(input: {
     });
     await getWorkItemStore().updateWorkItem(project.workItemId, {
       status: 'active',
-      summary: `文案包已保存，稿件路径 ${manuscriptPath}`,
+      summary: `稿件包已保存，稿件路径 ${manuscriptPath}`,
     });
   }
   return { project: nextProject, filePath: jsonPath, manuscriptPath };
@@ -356,7 +560,7 @@ export async function saveRedClawImagePack(input: {
   notes?: string;
 }): Promise<{ project: RedClawProject; filePath: string; plannedAssetCount: number }> {
   const normalizedProjectId = normalizeProjectId(input.projectId);
-  const { projectDir } = await getRedClawProject(normalizedProjectId);
+  const { projectDir, project } = await getRedClawProject(normalizedProjectId);
   const images = input.images
     .map((item) => ({
       purpose: item.purpose?.trim() || undefined,
@@ -377,7 +581,7 @@ export async function saveRedClawImagePack(input: {
   await writeJson(jsonPath, payload);
 
   const markdown = [
-    '# 小红书配图包',
+    `# ${platformLabel(project.platform)}配图包`,
     '',
     '## 封面图提示词',
     payload.coverPrompt || '(无)',
@@ -507,7 +711,7 @@ export async function getRedClawProjectContextPrompt(limit = 8): Promise<string>
   const lines: string[] = [];
   for (const project of projects) {
     lines.push(
-      `- [${project.id}] status=${project.status}; workItemId=${project.workItemId || '-'}; goal=${project.goal}; audience=${project.targetAudience || '-'}; updatedAt=${project.updatedAt}`
+      `- [${project.id}] status=${project.status}; platform=${project.platform}; taskType=${project.taskType}; workItemId=${project.workItemId || '-'}; goal=${project.goal}; audience=${project.targetAudience || '-'}; updatedAt=${project.updatedAt}`
     );
   }
   return lines.join('\n');

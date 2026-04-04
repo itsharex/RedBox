@@ -1,5 +1,5 @@
 import { ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { MessageSquare, MessageSquarePlus, Settings as SettingsIcon, FolderOpen, FileEdit, Dices, Plus, Pencil, ChevronDown, Bot, Image, Users, ImagePlus, Sun, Moon, X, Download, Package, ListTodo } from 'lucide-react';
+import { MessageSquare, MessageSquarePlus, Settings as SettingsIcon, FolderOpen, FileEdit, Dices, Plus, Pencil, ChevronDown, Bot, Users, ImagePlus, Sun, Moon, X, Download, Package, ListTodo } from 'lucide-react';
 import { clsx } from 'clsx';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -12,20 +12,20 @@ interface LayoutProps {
   children: ReactNode;
   currentView: ViewType;
   onNavigate: (view: ViewType) => void;
+  immersiveMode?: boolean;
 }
 
 const NAV_ITEMS: { id: ViewType; label: string; icon: typeof MessageSquare; group?: string }[] = [
   // { id: 'chat', label: 'AI 对话', icon: MessageSquare },
   { id: 'knowledge', label: '知识库', icon: FolderOpen },
   { id: 'wander', label: '漫步', icon: Dices },
-  { id: 'manuscripts', label: '稿件', icon: FileEdit },
+  { id: 'manuscripts', label: '草稿', icon: FileEdit },
   { id: 'redclaw', label: 'RedClaw', icon: Bot },
   { id: 'workboard', label: '任务', icon: ListTodo },
   { id: 'subjects', label: '主体', icon: Package },
   { id: 'creative-chat', label: '聊天室', icon: MessageSquarePlus },
   { id: 'advisors', label: '智囊团', icon: Users },
   { id: 'cover-studio', label: '封面', icon: ImagePlus },
-  { id: 'media-library', label: '媒体', icon: Image },
   { id: 'settings', label: '设置', icon: SettingsIcon },
   // { id: 'archives', label: '档案', icon: Archive },
   // { id: 'skills', label: '技能库', icon: Lightbulb },
@@ -59,7 +59,7 @@ function readInitialThemeMode(): ThemeMode {
   return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
 }
 
-export function Layout({ children, currentView, onNavigate }: LayoutProps) {
+export function Layout({ children, currentView, onNavigate, immersiveMode = false }: LayoutProps) {
   const [spaces, setSpaces] = useState<WorkspaceSpace[]>([]);
   const [appVersion, setAppVersion] = useState('');
   const [themeMode, setThemeMode] = useState<ThemeMode>(readInitialThemeMode);
@@ -139,10 +139,11 @@ export function Layout({ children, currentView, onNavigate }: LayoutProps) {
 
   useEffect(() => {
     const root = document.documentElement;
-    root.setAttribute('data-theme', themeMode);
-    root.classList.toggle('dark', themeMode === 'dark');
+    const effectiveTheme = immersiveMode ? 'dark' : themeMode;
+    root.setAttribute('data-theme', effectiveTheme);
+    root.classList.toggle('dark', effectiveTheme === 'dark');
     window.localStorage.setItem(THEME_STORAGE_KEY, themeMode);
-  }, [themeMode]);
+  }, [immersiveMode, themeMode]);
 
   useEffect(() => {
     const handleUpdateNotice = (_event: unknown, payload: AppUpdateNoticePayload) => {
@@ -278,8 +279,9 @@ export function Layout({ children, currentView, onNavigate }: LayoutProps) {
   }, [handleSwitchSpace, loadSpaces, spaceDialogMode, spaceDialogName, spaceDialogTargetId]);
 
   return (
-    <div className="flex h-screen w-full bg-background overflow-hidden text-text-primary">
+    <div className={clsx('flex h-screen w-full overflow-hidden text-text-primary', immersiveMode ? 'bg-[#0f0f0f]' : 'bg-background')}>
       {/* Sidebar */}
+      {!immersiveMode && (
       <aside className="app-sidebar-shell w-[13.5rem] bg-surface-secondary/85 border-r border-border flex flex-col">
         {/* App Title */}
         <div className="h-11 flex items-center px-4 border-b border-border/50">
@@ -402,9 +404,10 @@ export function Layout({ children, currentView, onNavigate }: LayoutProps) {
           </div>
         </div>
       </aside>
+      )}
 
       {/* Main Content */}
-      <main className="app-main-shell flex-1 flex flex-col min-w-0 bg-surface-primary relative">
+      <main className={clsx('app-main-shell flex-1 flex flex-col min-w-0 relative', immersiveMode ? 'bg-[#0f0f0f]' : 'bg-surface-primary')}>
         {/* Content */}
         <div
           className={clsx(

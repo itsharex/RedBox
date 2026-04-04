@@ -14,11 +14,22 @@ import {
   saveRedClawRetrospective,
 } from '../redclawStore';
 
+const PlatformSchema = z.enum(['xiaohongshu', 'wechat_official_account']);
+const TaskTypeSchema = z.enum(['direct_write', 'expand_from_xhs']);
+const SourceModeSchema = z.enum(['manual', 'knowledge', 'manuscript']);
+
 const RedClawProjectCreateParamsSchema = z.object({
-  goal: z.string().min(1).describe('User goal for this Xiaohongshu content project.'),
+  goal: z.string().min(1).describe('User goal for this self-media content project.'),
+  platform: PlatformSchema.optional().describe('Target platform. Use xiaohongshu or wechat_official_account.'),
+  taskType: TaskTypeSchema.optional().describe('Creation task type. direct_write or expand_from_xhs.'),
   targetAudience: z.string().optional().describe('Target audience profile.'),
   tone: z.string().optional().describe('Desired writing tone/style.'),
   successCriteria: z.string().optional().describe('How success should be measured.'),
+  sourcePlatform: PlatformSchema.optional().describe('Original source platform when expanding from an existing draft/note.'),
+  sourceNoteId: z.string().optional().describe('Source note/document id for traceability.'),
+  sourceMode: SourceModeSchema.optional().describe('Where the source comes from: manual, knowledge, or manuscript.'),
+  sourceTitle: z.string().optional().describe('Source note/manuscript title.'),
+  sourceManuscriptPath: z.string().optional().describe('Source manuscript path, if expanding from an existing draft.'),
   tags: z.array(z.string()).optional().describe('Project tags for later retrieval.'),
 });
 
@@ -26,11 +37,22 @@ type RedClawProjectCreateParams = z.infer<typeof RedClawProjectCreateParamsSchem
 
 const RedClawCopyPackParamsSchema = z.object({
   projectId: z.string().min(1).describe('RedClaw project id.'),
+  platform: PlatformSchema.optional().describe('Target platform for this copy pack.'),
+  taskType: TaskTypeSchema.optional().describe('Creation task type.'),
   titleOptions: z.array(z.string()).min(1).describe('Candidate titles for this post.'),
   finalTitle: z.string().optional().describe('Final title selected for publishing.'),
+  summary: z.string().optional().describe('Short article summary, especially for WeChat articles.'),
+  introduction: z.string().optional().describe('Lead paragraph / intro section, especially for WeChat articles.'),
   content: z.string().min(1).describe('Final post body content.'),
   hashtags: z.array(z.string()).optional().describe('Hashtag list.'),
   coverTexts: z.array(z.string()).optional().describe('Cover text options.'),
+  imageSuggestions: z.array(z.string()).optional().describe('Suggested supporting images for the article.'),
+  cta: z.string().optional().describe('Closing CTA for WeChat articles.'),
+  sourcePlatform: PlatformSchema.optional().describe('Original source platform for expansion tasks.'),
+  sourceNoteId: z.string().optional().describe('Source note/document id.'),
+  sourceMode: SourceModeSchema.optional().describe('Source mode: manual, knowledge, or manuscript.'),
+  sourceTitle: z.string().optional().describe('Source title.'),
+  sourceManuscriptPath: z.string().optional().describe('Source manuscript path, if any.'),
   publishPlan: z.string().optional().describe('Publishing timing and action plan.'),
 });
 
@@ -80,7 +102,7 @@ export class RedClawCreateProjectTool extends DeclarativeTool<typeof RedClawProj
   readonly name = 'redclaw_create_project';
   readonly displayName = 'RedClaw Create Project';
   readonly description =
-    'Create a structured RedClaw project for Xiaohongshu creation. Use this before generating copy/images.';
+    'Create a structured RedClaw project for Xiaohongshu or WeChat creation. Use this before generating copy/images.';
   readonly kind = ToolKind.Other;
   readonly parameterSchema = RedClawProjectCreateParamsSchema;
   readonly requiresConfirmation = false;
@@ -112,7 +134,7 @@ export class RedClawSaveCopyPackTool extends DeclarativeTool<typeof RedClawCopyP
   readonly name = 'redclaw_save_copy_pack';
   readonly displayName = 'RedClaw Save Copy Pack';
   readonly description =
-    'Save Xiaohongshu copy artifacts (titles/content/hashtags/cover texts/publish plan) into project files.';
+    'Save platform-aware copy artifacts (Xiaohongshu or WeChat article fields) into project files.';
   readonly kind = ToolKind.Edit;
   readonly parameterSchema = RedClawCopyPackParamsSchema;
   readonly requiresConfirmation = false;
@@ -145,7 +167,7 @@ export class RedClawSaveImagePackTool extends DeclarativeTool<typeof RedClawImag
   readonly name = 'redclaw_save_image_pack';
   readonly displayName = 'RedClaw Save Image Pack';
   readonly description =
-    'Save Xiaohongshu image strategy and generation prompts into project files.';
+    'Save platform-aware image strategy and generation prompts into project files.';
   readonly kind = ToolKind.Edit;
   readonly parameterSchema = RedClawImagePackParamsSchema;
   readonly requiresConfirmation = false;

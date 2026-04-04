@@ -38,8 +38,14 @@ export class WorkspaceTool extends DeclarativeTool<typeof WorkspaceToolParamsSch
     readonly parameterSchema = WorkspaceToolParamsSchema;
     readonly requiresConfirmation = false;
 
-    private readonly writeTool = new WriteFileTool();
-    private readonly editTool = new EditTool();
+    private readonly writeTool: WriteFileTool;
+    private readonly editTool: EditTool;
+
+    constructor(workspaceRootOverride?: string) {
+        super();
+        this.writeTool = new WriteFileTool(workspaceRootOverride);
+        this.editTool = new EditTool(workspaceRootOverride);
+    }
 
     protected validateValues(params: WorkspaceToolParams): string | null {
         switch (params.action) {

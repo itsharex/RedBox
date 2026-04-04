@@ -2705,7 +2705,7 @@ export function ExperimentalSettingsSection({ flags, updateFlag }: ExperimentalS
 }
 
 interface SettingsSaveBarProps {
-    activeTab: 'general' | 'ai' | 'knowledge' | 'tools' | 'memory' | 'experimental';
+    activeTab: 'general' | 'ai' | 'knowledge' | 'tools' | 'memory' | 'experimental' | 'project';
     status: 'idle' | 'saving' | 'saved' | 'error';
 }
 

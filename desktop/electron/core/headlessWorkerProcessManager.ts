@@ -807,6 +807,8 @@ export class HeadlessWorkerProcessManager {
     temperature?: number;
     maxTurns?: number;
     maxTimeMinutes?: number;
+    workspaceRoot?: string;
+    projectRoot?: string;
     rollback?: () => Promise<void> | void;
     attemptSignal?: AbortSignal;
   }): Promise<RuntimeWorkerResult> {
@@ -818,8 +820,12 @@ export class HeadlessWorkerProcessManager {
         const registry = getBackgroundTaskRegistry();
         const toolRegistry = new ToolRegistry();
         const skillManager = new SkillManager();
-        await skillManager.discoverSkills(getWorkspacePaths().base);
-        toolRegistry.registerTools(createBuiltinTools({ pack: input.toolPack, skillManager }));
+        await skillManager.discoverSkills(input.projectRoot || input.workspaceRoot || getWorkspacePaths().base);
+        toolRegistry.registerTools(createBuiltinTools({
+          pack: input.toolPack,
+          skillManager,
+          workspaceRootOverride: input.workspaceRoot,
+        }));
         const toolExecutor = new ToolExecutor(toolRegistry, async () => ToolConfirmationOutcome.ProceedOnce);
         const onAttemptAbort = () => this.abortRuntimeRun(slot);
 

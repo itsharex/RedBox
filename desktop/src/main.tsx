@@ -51,10 +51,16 @@ class ErrorBoundary extends React.Component<{ children: React.ReactNode }, { has
   }
 }
 
+const appTree = (
+  <ErrorBoundary>
+    <App />
+  </ErrorBoundary>
+);
+
+const isDevRuntime = window.location.protocol !== 'file:';
+
 ReactDOM.createRoot(document.getElementById('root')!).render(
-  <React.StrictMode>
-    <ErrorBoundary>
-      <App />
-    </ErrorBoundary>
-  </React.StrictMode>,
+  isDevRuntime
+    ? <React.StrictMode>{appTree}</React.StrictMode>
+    : appTree,
 )

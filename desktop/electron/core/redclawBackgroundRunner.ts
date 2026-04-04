@@ -415,6 +415,8 @@ async function exists(filePath: string): Promise<boolean> {
 function buildBackgroundPrompt(params: {
   projectId: string;
   goal: string;
+  platform?: string;
+  taskType?: string;
   hasCopyPack: boolean;
   hasImagePack: boolean;
   customPrompt?: string;
@@ -426,6 +428,8 @@ function buildBackgroundPrompt(params: {
         '[RedClaw 后台任务]',
         `项目ID: ${params.projectId}`,
         `目标: ${params.goal}`,
+        `平台: ${params.platform || 'xiaohongshu'}`,
+        `任务类型: ${params.taskType || 'direct_write'}`,
         '',
         params.customPrompt,
       ].join('\n'),
@@ -439,10 +443,14 @@ function buildBackgroundPrompt(params: {
         '[RedClaw 后台任务]',
         `项目ID: ${params.projectId}`,
         `目标: ${params.goal}`,
+        `平台: ${params.platform || 'xiaohongshu'}`,
+        `任务类型: ${params.taskType || 'direct_write'}`,
         '',
         '请推进项目到“文案包已保存”状态：',
         '1) 先读取当前项目信息（优先 app_cli: redclaw get --project-id ...）。',
-        '2) 生成标题候选、正文、标签、封面文案、发布计划。',
+        params.platform === 'wechat_official_account'
+          ? '2) 生成标题候选、摘要、导语、正文、结尾 CTA、配图建议、发布计划。'
+          : '2) 生成标题候选、正文、标签、封面文案、发布计划。',
         '3) 调用 redclaw_save_copy_pack（或 app_cli redclaw save-copy）落盘。',
         '4) 返回一句简要执行结果。',
       ].join('\n'),
@@ -456,6 +464,8 @@ function buildBackgroundPrompt(params: {
         '[RedClaw 后台任务]',
         `项目ID: ${params.projectId}`,
         `目标: ${params.goal}`,
+        `平台: ${params.platform || 'xiaohongshu'}`,
+        `任务类型: ${params.taskType || 'direct_write'}`,
         '',
         '请推进项目到“配图包已保存”状态：',
         '1) 读取项目和已有文案。',
@@ -707,6 +717,13 @@ export class RedClawBackgroundRunner extends EventEmitter {
     }
 
     this.normalizeSchedules(Date.now());
+    for (const task of Object.values(this.config.scheduledTasks)) {
+      await this.syncScheduledTaskWorkItem(task);
+    }
+    for (const task of Object.values(this.config.longCycleTasks)) {
+      await this.syncLongCycleTaskWorkItem(task);
+    }
+    await this.persistConfig();
     this.refreshCatchUpQueue(Date.now());
     this.isLoaded = true;
     this.emitStatus();
@@ -1002,6 +1019,7 @@ export class RedClawBackgroundRunner extends EventEmitter {
   }
 
   private async syncScheduledTaskWorkItem(task: RedClawScheduledTask): Promise<void> {
+    await this.ensureScheduledTaskWorkItem(task);
     if (!task.workItemId) return;
     const store = getWorkItemStore();
     await store.attachRefs(task.workItemId, {
@@ -1031,6 +1049,7 @@ export class RedClawBackgroundRunner extends EventEmitter {
   }
 
   private async syncLongCycleTaskWorkItem(task: RedClawLongCycleTask): Promise<void> {
+    await this.ensureLongCycleTaskWorkItem(task);
     if (!task.workItemId) return;
     const store = getWorkItemStore();
     await store.attachRefs(task.workItemId, {
@@ -1056,6 +1075,81 @@ export class RedClawBackgroundRunner extends EventEmitter {
         subagentRoles: task.subagentRoles || [],
       },
     });
+  }
+
+  private async ensureScheduledTaskWorkItem(task: RedClawScheduledTask): Promise<void> {
+    const store = getWorkItemStore();
+    const existingId = String(task.workItemId || '').trim();
+    if (existingId) {
+      const existing = await store.getWorkItem(existingId);
+      if (existing) return;
+    }
+
+    const workItem = await store.createWorkItem({
+      title: task.name,
+      description: task.prompt,
+      type: 'automation',
+      status: task.enabled ? 'waiting' : 'pending',
+      summary: `定时任务 ${task.name} 已登记，下一次执行 ${task.nextRunAt || '待计算'}`,
+      refs: {
+        projectIds: task.projectId ? [task.projectId] : [],
+      },
+      metadata: {
+        automationKind: 'scheduled',
+        scheduledTaskId: task.id,
+        projectId: task.projectId || null,
+        subagentRoles: task.subagentRoles || [],
+      },
+      schedule: {
+        mode: task.mode,
+        enabled: task.enabled,
+        intervalMinutes: task.intervalMinutes,
+        time: task.time,
+        weekdays: task.weekdays,
+        runAt: task.runAt,
+        nextRunAt: task.nextRunAt,
+        lastRunAt: task.lastRunAt,
+      },
+    });
+    task.workItemId = workItem.id;
+    task.updatedAt = nowIso();
+  }
+
+  private async ensureLongCycleTaskWorkItem(task: RedClawLongCycleTask): Promise<void> {
+    const store = getWorkItemStore();
+    const existingId = String(task.workItemId || '').trim();
+    if (existingId) {
+      const existing = await store.getWorkItem(existingId);
+      if (existing) return;
+    }
+
+    const workItem = await store.createWorkItem({
+      title: task.name,
+      description: task.objective,
+      type: 'automation',
+      status: task.status === 'completed' ? 'done' : (task.enabled ? 'active' : 'waiting'),
+      summary: `长周期任务 ${task.name} 进度 ${task.completedRounds}/${task.totalRounds}`,
+      refs: {
+        projectIds: task.projectId ? [task.projectId] : [],
+      },
+      metadata: {
+        automationKind: 'long-cycle',
+        longCycleTaskId: task.id,
+        projectId: task.projectId || null,
+        subagentRoles: task.subagentRoles || [],
+      },
+      schedule: {
+        mode: 'long-cycle',
+        enabled: task.enabled,
+        intervalMinutes: task.intervalMinutes,
+        totalRounds: task.totalRounds,
+        completedRounds: task.completedRounds,
+        nextRunAt: task.nextRunAt,
+        lastRunAt: task.lastRunAt,
+      },
+    });
+    task.workItemId = workItem.id;
+    task.updatedAt = nowIso();
   }
 
   listScheduledTasks(): RedClawScheduledTask[] {
@@ -1662,6 +1756,8 @@ export class RedClawBackgroundRunner extends EventEmitter {
       const prompt = buildBackgroundPrompt({
         projectId,
         goal: project.goal,
+        platform: project.platform,
+        taskType: project.taskType,
         hasCopyPack,
         hasImagePack,
         customPrompt: projectState.prompt,
@@ -1680,6 +1776,8 @@ export class RedClawBackgroundRunner extends EventEmitter {
         contextContent: [
           `后台项目: ${projectId}`,
           `目标: ${project.goal}`,
+          `平台: ${project.platform}`,
+          `任务类型: ${project.taskType}`,
           '这是后台自动推进会话，不依赖前台界面。',
         ].join('\n'),
         prompt: prompt.message,

@@ -38,6 +38,7 @@ import {
   type AiModelDescriptor,
   createAiSourceDraftFromPreset,
   buildModelCapabilityBadges,
+  buildModelInputIcons,
   createAiSourceFromPreset,
   createDefaultMcpServer,
   filterAiModelsByCapability,
@@ -72,6 +73,7 @@ import {
   SettingsSaveBar,
   ToolsSettingsSection,
 } from './settings/SettingsSections';
+import { ProjectSettingsSection, type WorkspaceSpace } from './settings/ProjectSettingsSection';
 
 const MIN_CHAT_MAX_TOKENS = 1024;
 const DEFAULT_CHAT_MAX_TOKENS = 262144;
@@ -256,6 +258,9 @@ type RuntimeHookDefinition = {
   enabled?: boolean;
 };
 
+type SettingsTab = 'general' | 'ai' | 'knowledge' | 'tools' | 'memory' | 'experimental' | 'project';
+type ProjectDialogMode = 'create' | 'rename';
+
 const sanitizeChatMaxTokensInput = (value: string, fallback: number): string => {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < MIN_CHAT_MAX_TOKENS) {
@@ -265,7 +270,7 @@ const sanitizeChatMaxTokensInput = (value: string, fallback: number): string => 
 };
 
 export function Settings() {
-  const [activeTab, setActiveTab] = useState<'general' | 'ai' | 'knowledge' | 'tools' | 'memory' | 'experimental'>('ai');
+  const [activeTab, setActiveTab] = useState<SettingsTab>('ai');
   const { flags, updateFlag } = useFeatureFlags();
   const [formData, setFormData] = useState({
     api_endpoint: '',
@@ -365,6 +370,15 @@ export function Settings() {
   const [assistantDaemonWeixinLogin, setAssistantDaemonWeixinLogin] = useState<AssistantDaemonWeixinLoginState | null>(null);
   const [showScopedModelOverrides, setShowScopedModelOverrides] = useState(false);
   const [developerVersionTapCount, setDeveloperVersionTapCount] = useState(0);
+  const [spaces, setSpaces] = useState<WorkspaceSpace[]>([]);
+  const [activeSpaceId, setActiveSpaceId] = useState('');
+  const [isSpacesLoading, setIsSpacesLoading] = useState(false);
+  const [isSwitchingSpace, setIsSwitchingSpace] = useState(false);
+  const [isProjectDialogOpen, setIsProjectDialogOpen] = useState(false);
+  const [projectDialogMode, setProjectDialogMode] = useState<ProjectDialogMode>('create');
+  const [projectDialogName, setProjectDialogName] = useState('');
+  const [projectDialogTargetId, setProjectDialogTargetId] = useState<string | null>(null);
+  const [isProjectDialogSubmitting, setIsProjectDialogSubmitting] = useState(false);
 
   const buildWeixinQrImageUrl = useCallback(async (rawUrl?: string): Promise<string | undefined> => {
     const text = String(rawUrl || '').trim();
@@ -386,10 +400,122 @@ export function Settings() {
   const assistantDaemonLogBufferRef = useRef<string[]>([]);
   const assistantDaemonLogFlushTimerRef = useRef<number | null>(null);
 
+  const loadSpaces = useCallback(async () => {
+    setIsSpacesLoading(true);
+    try {
+      const result = await window.ipcRenderer.invoke('spaces:list') as { spaces?: WorkspaceSpace[]; activeSpaceId?: string } | null;
+      setSpaces(result?.spaces || []);
+      setActiveSpaceId(result?.activeSpaceId || '');
+    } catch (error) {
+      console.error('Failed to load project spaces:', error);
+      setSpaces([]);
+      setActiveSpaceId('');
+    } finally {
+      setIsSpacesLoading(false);
+    }
+  }, []);
+
+  const handleSwitchSpace = useCallback(async (nextSpaceId: string) => {
+    if (!nextSpaceId || nextSpaceId === activeSpaceId || isSwitchingSpace) return;
+    setIsSwitchingSpace(true);
+    try {
+      const result = await window.ipcRenderer.invoke('spaces:switch', nextSpaceId) as { success?: boolean; error?: string } | null;
+      if (!result?.success) {
+        alert(result?.error || '切换项目失败');
+        return;
+      }
+      window.location.reload();
+    } catch (error) {
+      console.error('Failed to switch project space:', error);
+      alert('切换项目失败，请重试');
+    } finally {
+      setIsSwitchingSpace(false);
+    }
+  }, [activeSpaceId, isSwitchingSpace]);
+
+  const openCreateProjectDialog = useCallback(() => {
+    setProjectDialogMode('create');
+    setProjectDialogTargetId(null);
+    setProjectDialogName('');
+    setIsProjectDialogOpen(true);
+  }, []);
+
+  const openRenameProjectDialog = useCallback((space: WorkspaceSpace) => {
+    setProjectDialogMode('rename');
+    setProjectDialogTargetId(space.id);
+    setProjectDialogName(space.name);
+    setIsProjectDialogOpen(true);
+  }, []);
+
+  const closeProjectDialog = useCallback(() => {
+    if (isProjectDialogSubmitting) return;
+    setIsProjectDialogOpen(false);
+    setProjectDialogName('');
+    setProjectDialogTargetId(null);
+  }, [isProjectDialogSubmitting]);
+
+  const submitProjectDialog = useCallback(async () => {
+    const trimmedName = projectDialogName.trim();
+    if (!trimmedName) {
+      alert('项目名称不能为空');
+      return;
+    }
+
+    setIsProjectDialogSubmitting(true);
+    try {
+      if (projectDialogMode === 'create') {
+        const result = await window.ipcRenderer.invoke('spaces:create', trimmedName) as { success?: boolean; space?: WorkspaceSpace; error?: string } | null;
+        if (!result?.success || !result.space) {
+          alert(result?.error || '创建项目失败');
+          return;
+        }
+        setIsProjectDialogOpen(false);
+        setProjectDialogName('');
+        setProjectDialogTargetId(null);
+        await loadSpaces();
+        await handleSwitchSpace(result.space.id);
+        return;
+      }
+
+      if (!projectDialogTargetId) {
+        alert('未找到要重命名的项目');
+        return;
+      }
+
+      const result = await window.ipcRenderer.invoke('spaces:rename', { id: projectDialogTargetId, name: trimmedName }) as { success?: boolean; error?: string } | null;
+      if (!result?.success) {
+        alert(result?.error || '重命名项目失败');
+        return;
+      }
+      setIsProjectDialogOpen(false);
+      setProjectDialogName('');
+      setProjectDialogTargetId(null);
+      await loadSpaces();
+    } catch (error) {
+      console.error('Failed to submit project dialog:', error);
+      alert(projectDialogMode === 'create' ? '创建项目失败，请重试' : '重命名项目失败，请重试');
+    } finally {
+      setIsProjectDialogSubmitting(false);
+    }
+  }, [handleSwitchSpace, loadSpaces, projectDialogMode, projectDialogName, projectDialogTargetId]);
+
   const defaultAiSource = useMemo(() => {
     if (!aiSources.length) return null;
     return aiSources.find((source) => source.id === defaultAiSourceId) || aiSources[0];
   }, [aiSources, defaultAiSourceId]);
+
+  useEffect(() => {
+    void loadSpaces();
+
+    const handleSpaceChanged = () => {
+      void loadSpaces();
+    };
+
+    window.ipcRenderer.on('space:changed', handleSpaceChanged);
+    return () => {
+      window.ipcRenderer.off('space:changed', handleSpaceChanged);
+    };
+  }, [loadSpaces]);
 
   const activeAiSource = useMemo(() => {
     if (!aiSources.length) return null;
@@ -419,6 +545,7 @@ export function Settings() {
       merged.set(descriptor.id, {
         id: descriptor.id,
         capabilities: Array.from(new Set([...(previous?.capabilities || []), ...descriptor.capabilities])),
+        inputCapabilities: Array.from(new Set([...(previous?.inputCapabilities || []), ...descriptor.inputCapabilities])),
       });
     }
     for (const remoteModel of (modelsBySource[source.id] || [])) {
@@ -428,6 +555,7 @@ export function Settings() {
       merged.set(descriptor.id, {
         id: descriptor.id,
         capabilities: Array.from(new Set([...(previous?.capabilities || []), ...descriptor.capabilities])),
+        inputCapabilities: Array.from(new Set([...(previous?.inputCapabilities || []), ...descriptor.inputCapabilities])),
       });
     }
     return Array.from(merged.values());
@@ -2525,6 +2653,7 @@ export function Settings() {
   const tabs = [
     { id: 'ai', label: 'AI 模型', icon: Cpu },
     { id: 'general', label: '常规设置', icon: LayoutGrid },
+    { id: 'project', label: '项目', icon: FolderOpen },
     { id: 'memory', label: '用户记忆', icon: Brain },
     { id: 'knowledge', label: '知识库索引', icon: Database },
     { id: 'tools', label: '工具管理', icon: Wrench },
@@ -2581,6 +2710,24 @@ export function Settings() {
                 handleStartAssistantDaemonWeixinLogin={handleStartAssistantDaemonWeixinLogin}
                 handleCheckAssistantDaemonWeixinLogin={handleCheckAssistantDaemonWeixinLogin}
                 handleClearAssistantDaemonWeixinLogin={handleClearAssistantDaemonWeixinLogin}
+              />
+            )}
+
+            {activeTab === 'project' && (
+              <ProjectSettingsSection
+                spaces={spaces}
+                activeSpaceId={activeSpaceId}
+                workspaceRoot={formData.workspace_dir}
+                isLoading={isSpacesLoading}
+                isSwitching={isSwitchingSpace}
+                onRefresh={() => {
+                  void loadSpaces();
+                }}
+                onCreate={openCreateProjectDialog}
+                onRename={openRenameProjectDialog}
+                onSwitch={(spaceId) => {
+                  void handleSwitchSpace(spaceId);
+                }}
               />
             )}
 
@@ -2685,6 +2832,7 @@ export function Settings() {
                               id: model.id,
                               label: model.id,
                               badges: buildModelCapabilityBadges(model.capabilities),
+                              inputIcons: buildModelInputIcons(model.inputCapabilities),
                             }))}
                           />
                         </div>
@@ -3002,11 +3150,28 @@ export function Settings() {
                                                 {buildModelCapabilityBadges(model.capabilities).map((badge) => (
                                                   <span
                                                     key={`${model.id}-${badge.text}`}
-                                                    className="px-1.5 py-0.5 rounded text-[10px] leading-none border border-border text-text-tertiary bg-surface-secondary/50 whitespace-nowrap"
+                                                    className={clsx(
+                                                      'px-1.5 py-0.5 rounded text-[10px] leading-none whitespace-nowrap font-medium',
+                                                      badge.className || 'text-text-tertiary'
+                                                    )}
                                                   >
                                                     {badge.text}
                                                   </span>
                                                 ))}
+                                                <span className="ml-0.5 flex items-center gap-1">
+                                                  {buildModelInputIcons(model.inputCapabilities).map((icon) => {
+                                                    const Icon = icon.icon;
+                                                    return (
+                                                      <span
+                                                        key={`${model.id}-${icon.key}`}
+                                                        title={icon.label}
+                                                        className={clsx('inline-flex h-5 w-5 items-center justify-center rounded-full', icon.className)}
+                                                      >
+                                                        <Icon className="h-3.5 w-3.5" strokeWidth={2.1} />
+                                                      </span>
+                                                    );
+                                                  })}
+                                                </span>
                                               </div>
                                               <button
                                                 type="button"
@@ -3083,6 +3248,7 @@ export function Settings() {
                               id: model.id,
                               label: model.id,
                               badges: buildModelCapabilityBadges(model.capabilities, { recommended: isRecommended }),
+                              inputIcons: buildModelInputIcons(model.inputCapabilities),
                             };
                           })}
                           disabled={!transcriptionSourceModels.length}
@@ -3126,6 +3292,7 @@ export function Settings() {
                               id: model.id,
                               label: model.id,
                               badges: buildModelCapabilityBadges(model.capabilities),
+                              inputIcons: buildModelInputIcons(model.inputCapabilities),
                             }))}
                           />
                         </div>
@@ -3169,6 +3336,7 @@ export function Settings() {
                                   id: model.id,
                                   label: model.id,
                                   badges: buildModelCapabilityBadges(model.capabilities),
+                                  inputIcons: buildModelInputIcons(model.inputCapabilities),
                                 }))}
                             />
                           </div>
@@ -3437,6 +3605,63 @@ export function Settings() {
               status={status}
             />
           </form>
+          {isProjectDialogOpen && (
+            <div
+              className="fixed inset-0 z-[140] bg-black/45 flex items-center justify-center px-6 py-6"
+              onMouseDown={closeProjectDialog}
+            >
+              <div
+                className="w-full max-w-md rounded-2xl border border-border bg-surface-primary shadow-2xl"
+                onMouseDown={(event) => event.stopPropagation()}
+              >
+                <div className="px-5 py-4 border-b border-border">
+                  <div className="text-base font-semibold text-text-primary">
+                    {projectDialogMode === 'create' ? '新建项目' : '重命名项目'}
+                  </div>
+                  <p className="mt-1 text-xs text-text-tertiary">
+                    每个项目都会创建独立空间，知识库、草稿、任务和机器人会自动隔离。
+                  </p>
+                </div>
+                <div className="px-5 py-5 space-y-3">
+                  <input
+                    autoFocus
+                    value={projectDialogName}
+                    onChange={(event) => setProjectDialogName(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') {
+                        event.preventDefault();
+                        void submitProjectDialog();
+                      } else if (event.key === 'Escape') {
+                        closeProjectDialog();
+                      }
+                    }}
+                    className="w-full h-11 rounded-xl border border-border bg-surface-secondary/30 px-4 text-sm text-text-primary focus:outline-none focus:border-accent-primary transition-colors"
+                    placeholder="请输入项目名称"
+                  />
+                </div>
+                <div className="px-5 py-4 border-t border-border bg-surface-secondary/10 rounded-b-2xl flex items-center justify-end gap-3">
+                  <button
+                    type="button"
+                    onClick={closeProjectDialog}
+                    disabled={isProjectDialogSubmitting}
+                    className="h-9 px-4 rounded-lg border border-border text-sm text-text-secondary hover:bg-surface-secondary hover:text-text-primary transition-colors disabled:opacity-50"
+                  >
+                    取消
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void submitProjectDialog();
+                    }}
+                    disabled={isProjectDialogSubmitting}
+                    className="h-9 px-4 rounded-lg bg-accent-primary text-sm font-medium text-white hover:bg-accent-hover transition-colors disabled:opacity-50"
+                  >
+                    {isProjectDialogSubmitting ? '处理中...' : '确定'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
           {isCreateAiSourceModalOpen && (
             <div
               className="fixed inset-0 z-[140] bg-black/45 flex items-center justify-center px-6 py-6"
@@ -3656,11 +3881,28 @@ export function Settings() {
                             {buildModelCapabilityBadges(item.capabilities).map((badge) => (
                               <span
                                 key={`${item.id}-${badge.text}`}
-                                className="px-1 py-0.5 rounded text-[10px] leading-none border border-border text-text-tertiary bg-surface-secondary/50 whitespace-nowrap"
+                                className={clsx(
+                                  'px-1 py-0.5 rounded text-[10px] leading-none whitespace-nowrap font-medium',
+                                  badge.className || 'text-text-tertiary'
+                                )}
                               >
                                 {badge.text}
                               </span>
                             ))}
+                            <span className="ml-0.5 flex items-center gap-1">
+                              {buildModelInputIcons(item.inputCapabilities).map((icon) => {
+                                const Icon = icon.icon;
+                                return (
+                                  <span
+                                    key={`${item.id}-${icon.key}`}
+                                    title={icon.label}
+                                    className={clsx('inline-flex h-4.5 w-4.5 items-center justify-center rounded-full', icon.className)}
+                                  >
+                                    <Icon className="h-3 w-3" strokeWidth={2.1} />
+                                  </span>
+                                );
+                              })}
+                            </span>
                           </button>
                         ))}
                       </div>

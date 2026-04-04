@@ -6,6 +6,23 @@ import { spawn } from 'node:child_process'
 import { Blob as NodeBlob } from 'node:buffer'
 import { pathToFileURL } from 'node:url'
 import {
+  getModelInputCapabilities,
+  supportsAttachmentKindDirectInput,
+} from '../shared/modelCapabilities';
+import {
+  ARTICLE_DRAFT_EXTENSION,
+  AUDIO_DRAFT_EXTENSION,
+  ensureManuscriptFileName,
+  getDraftTypeFromFileName,
+  getManuscriptExtension,
+  getPackageKindFromFileName,
+  isManuscriptPackageName,
+  isSupportedManuscriptFile,
+  POST_DRAFT_EXTENSION,
+  stripManuscriptExtension,
+  VIDEO_DRAFT_EXTENSION,
+} from '../shared/manuscriptFiles';
+import {
   saveSettings,
   getSettings,
   getWorkspacePaths,
@@ -71,11 +88,10 @@ import {
   bindMediaAssetToManuscript,
   updateMediaAssetMetadata,
   deleteMediaAsset,
+  importMediaFiles,
   getAbsoluteMediaPath,
   type MediaAsset,
 } from './core/mediaLibraryStore';
-import { generateImagesToMediaLibrary } from './core/imageGenerationService';
-import { generateVideosToMediaLibrary } from './core/videoGenerationService';
 import { buildRuntimeBaseSystemPrompt } from './core/prompts/defaultPromptBuilder';
 import {
   listCoverAssets,
@@ -84,10 +100,8 @@ import {
   saveCoverTemplateImage,
   type CoverAsset,
 } from './core/coverStudioStore';
-import { generateCoverAssets } from './core/coverGenerationService';
 import { getRedClawBackgroundRunner } from './core/redclawBackgroundRunner';
 import { getAdvisorYoutubeBackgroundRunner, getDefaultAdvisorYoutubeChannelConfig } from './core/advisorYoutubeRunner';
-import { detectAiProtocol, fetchModelsForAiSource, testAiSourceConnection } from './core/aiSourceService';
 import { loadOfficialFeatureModule } from './officialFeatureBridge';
 import { getMemoryMaintenanceService } from './core/memoryMaintenanceService';
 import { getBackgroundTaskRegistry } from './core/backgroundTaskRegistry';
@@ -95,7 +109,6 @@ import { getHeadlessWorkerProcessManager } from './core/headlessWorkerProcessMan
 import { getAssistantDaemonService } from './core/assistantDaemonService';
 import { applyGlobalNetworkProxy } from './core/networkProxy';
 import { getSessionBridgeService } from './core/sessionBridgeService';
-import { generateAdvisorPersonaDocument } from './core/advisorPersonaGenerator';
 import {
   getDebugLogDirectory,
   getRecentDebugLogs,
@@ -112,6 +125,13 @@ import { getAgentRuntime, getLongTaskCoordinator, getTaskGraphRuntime, listRoleS
 import { getSessionRuntimeStore } from './core/sessionRuntimeStore';
 import { listRuntimeHooks, registerRuntimeHook, unregisterRuntimeHook } from './core/runtimeHooks';
 import { getWorkItemStore } from './core/workItemStore';
+import { formatWechatArticleFromMarkdown } from './core/wechatFormatter';
+import {
+  bindWechatOfficialAccount,
+  createWechatOfficialDraftFromMarkdown,
+  getWechatOfficialAccountStatus,
+  unbindWechatOfficialAccount,
+} from './core/wechatOfficialAccountService';
 
 if (typeof (globalThis as any).Blob === 'undefined' && typeof NodeBlob !== 'undefined') {
   (globalThis as any).Blob = NodeBlob;
@@ -212,6 +232,8 @@ let advisorYoutubeRunnerListenersAttached = false;
 let assistantDaemonListenersAttached = false;
 let appShutdownInProgress = false;
 let appShutdownPromise: Promise<void> | null = null;
+const appStartupEpochMs = Date.now();
+const startupPhaseMarks = new Map<string, number>();
 const DOWNLOAD_RETRY_DELAYS_MS = [0, 600, 1600];
 const XHS_ASSET_REQUEST_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 RedBox/1.0',
@@ -225,6 +247,17 @@ const APP_UPDATE_CHECK_TIMEOUT_MS = 10000;
 const APP_UPDATE_CHECK_MIN_INTERVAL_MS = 6 * 60 * 60 * 1000;
 let appUpdateCheckInFlight = false;
 let appUpdateLastCheckedAt = 0;
+
+function markStartupPhase(label: string): void {
+  const now = Date.now();
+  const last = startupPhaseMarks.get('__last__') ?? appStartupEpochMs;
+  startupPhaseMarks.set('__last__', now);
+  startupPhaseMarks.set(label, now);
+  console.log('[Startup]', label, {
+    sinceLaunchMs: now - appStartupEpochMs,
+    sincePrevPhaseMs: now - last,
+  });
+}
 const ADVISOR_OPTIMIZE_SYSTEM_PROMPT = loadPrompt(
   'runtime/advisors/optimize_system.txt',
   '你是一个专业的 Prompt 工程师，请根据用户描述优化系统提示词。'
@@ -245,6 +278,18 @@ const SIX_HAT_PROMPTS = {
   green: loadPrompt('runtime/six_hats/green.txt', '你是六顶思考帽中的绿帽。'),
   blue: loadPrompt('runtime/six_hats/blue.txt', '你是六顶思考帽中的蓝帽。'),
 };
+const REDCLAW_WRITE_XHS_TEMPLATE = loadPrompt(
+  'runtime/redclaw/write_xiaohongshu.txt',
+  '请按小红书创作要求完成任务，并最终保存文案包。\n\n{{user_brief}}',
+);
+const REDCLAW_WRITE_WECHAT_TEMPLATE = loadPrompt(
+  'runtime/redclaw/write_wechat_article.txt',
+  '请按公众号文章创作要求完成任务，并最终保存稿件包。\n\n{{user_brief}}',
+);
+const REDCLAW_EXPAND_XHS_TO_WECHAT_TEMPLATE = loadPrompt(
+  'runtime/redclaw/expand_xhs_to_wechat.txt',
+  '请把下面的小红书内容扩写成公众号文章，并最终保存稿件包。\n\n{{user_brief}}',
+);
 let appUpdateLastNotifiedVersion = '';
 const advisorAvatarLocalizationInFlight = new Set<string>();
 let localAssetProtocolsRegistered = false;
@@ -252,6 +297,82 @@ const BROWSER_PLUGIN_BUNDLE_RELATIVE_PATH = path.join('.plugin-runtime', 'browse
 const BROWSER_PLUGIN_EXPORT_RELATIVE_PATH = path.join('integrations', 'browser-extension', 'redbox-capture');
 
 const appSingleInstanceLock = app.requestSingleInstanceLock();
+type RedClawAuthoringHints = {
+  platform: 'xiaohongshu' | 'wechat_official_account';
+  taskType: 'direct_write' | 'expand_from_xhs';
+  formatTarget?: 'markdown' | 'wechat_rich_text';
+  sourcePlatform?: 'xiaohongshu' | 'wechat_official_account';
+  sourceNoteId?: string;
+  sourceMode?: 'manual' | 'knowledge' | 'manuscript';
+  sourceTitle?: string;
+  sourceManuscriptPath?: string;
+};
+
+const WECHAT_OFFICIAL_SKILL_NAME = 'wechat-official-formatter';
+
+function normalizeRedClawAuthoringHints(raw: unknown): RedClawAuthoringHints | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const record = raw as Record<string, unknown>;
+  const platform = String(record.platform || '').trim();
+  const taskType = String(record.taskType || '').trim();
+  if ((platform !== 'xiaohongshu' && platform !== 'wechat_official_account')
+    || (taskType !== 'direct_write' && taskType !== 'expand_from_xhs')) {
+    return null;
+  }
+  const sourcePlatform = String(record.sourcePlatform || '').trim();
+  const sourceMode = String(record.sourceMode || '').trim();
+  return {
+    platform,
+    taskType,
+    formatTarget: String(record.formatTarget || '').trim() === 'wechat_rich_text' ? 'wechat_rich_text' : 'markdown',
+    sourcePlatform: (sourcePlatform === 'xiaohongshu' || sourcePlatform === 'wechat_official_account') ? sourcePlatform : undefined,
+    sourceNoteId: String(record.sourceNoteId || '').trim() || undefined,
+    sourceMode: (sourceMode === 'manual' || sourceMode === 'knowledge' || sourceMode === 'manuscript') ? sourceMode : undefined,
+    sourceTitle: String(record.sourceTitle || '').trim() || undefined,
+    sourceManuscriptPath: String(record.sourceManuscriptPath || '').trim() || undefined,
+  };
+}
+
+function buildRedClawAuthoringPrompt(userBrief: string, hints: RedClawAuthoringHints): string {
+  const template = hints.taskType === 'expand_from_xhs'
+    ? REDCLAW_EXPAND_XHS_TO_WECHAT_TEMPLATE
+    : hints.platform === 'wechat_official_account'
+      ? REDCLAW_WRITE_WECHAT_TEMPLATE
+      : REDCLAW_WRITE_XHS_TEMPLATE;
+  return renderPrompt(template, {
+    platform: hints.platform,
+    task_type: hints.taskType,
+    source_mode: hints.sourceMode || 'manual',
+    source_platform: hints.sourcePlatform || '',
+    source_note_id: hints.sourceNoteId || '',
+    source_title: hints.sourceTitle || '',
+    source_manuscript_path: hints.sourceManuscriptPath || '',
+    user_brief: userBrief,
+  }).trim();
+}
+
+function resolveForcedSkillNames(input: unknown): string[] {
+  const record = (input && typeof input === 'object') ? input as Record<string, unknown> : null;
+  if (!record) return [];
+  const platform = String(record.platform || '').trim();
+  const formatTarget = String(record.formatTarget || '').trim();
+  if (platform === 'wechat_official_account' || formatTarget === 'wechat_rich_text') {
+    return [WECHAT_OFFICIAL_SKILL_NAME];
+  }
+  return [];
+}
+
+function emitForcedSkillActivationEvents(sender: Electron.WebContents, skillNames: string[]): void {
+  for (const skillName of skillNames) {
+    if (skillName === WECHAT_OFFICIAL_SKILL_NAME) {
+      sender.send('chat:skill-activated', {
+        name: WECHAT_OFFICIAL_SKILL_NAME,
+        description: '公众号写作、扩写、排版与草稿发布能力已激活。',
+      });
+    }
+  }
+}
+
 if (!appSingleInstanceLock) {
   app.exit(0);
 }
@@ -299,6 +420,10 @@ const getExportedBrowserPluginDir = (): string => {
   return path.join(app.getPath('userData'), BROWSER_PLUGIN_EXPORT_RELATIVE_PATH);
 };
 
+const getExportedBrowserPluginMetaPath = (): string => {
+  return path.join(getExportedBrowserPluginDir(), '.redbox-plugin-meta.json');
+};
+
 const pathExists = async (targetPath: string): Promise<boolean> => {
   try {
     await fs.access(targetPath);
@@ -315,10 +440,31 @@ const ensureBrowserPluginPrepared = async (): Promise<{ path: string; alreadyPre
   }
 
   const targetDir = getExportedBrowserPluginDir();
+  const metaPath = getExportedBrowserPluginMetaPath();
   const alreadyPrepared = await pathExists(targetDir);
+  if (alreadyPrepared && app.isPackaged) {
+    try {
+      const raw = await fs.readFile(metaPath, 'utf-8');
+      const parsed = JSON.parse(raw) as {
+        appVersion?: string;
+        sourceDir?: string;
+      };
+      if (parsed?.appVersion === app.getVersion() && parsed?.sourceDir === path.basename(sourceDir)) {
+        return { path: targetDir, alreadyPrepared: true };
+      }
+    } catch {
+      // stale or missing metadata; fall through and refresh the exported extension
+    }
+  }
+
   await fs.rm(targetDir, { recursive: true, force: true });
   await fs.mkdir(path.dirname(targetDir), { recursive: true });
   await fs.cp(sourceDir, targetDir, { recursive: true });
+  await fs.writeFile(metaPath, JSON.stringify({
+    appVersion: app.getVersion(),
+    sourceDir: path.basename(sourceDir),
+    preparedAt: new Date().toISOString(),
+  }, null, 2), 'utf-8');
   return { path: targetDir, alreadyPrepared };
 };
 
@@ -1008,12 +1154,6 @@ function guessAttachmentMimeType(extension: string, kind?: string): string {
   return 'application/octet-stream';
 }
 
-const isLikelyMultimodalModel = (modelName: string): boolean => {
-  const name = String(modelName || '').toLowerCase();
-  if (!name) return false;
-  return /(gpt-4o|gpt-4\.1|omni|vision|claude-3|claude-4|gemini|qwen.*vl|qvq|glm-4v|pixtral|internvl|llava|minicpm-v|doubao.*vision|seedream|wan|kimi.*vision)/i.test(name);
-};
-
 const buildAttachmentPromptSuffix = (attachment: Record<string, unknown>): string => {
   const absolutePath = String(attachment.absolutePath || '').trim();
   const originalAbsolutePath = String(attachment.originalAbsolutePath || '').trim();
@@ -1066,7 +1206,7 @@ async function buildAttachmentRuntimeInput(
   const kind = String(attachment.kind || '').trim();
   const mimeType = String(attachment.mimeType || '').trim() || guessAttachmentMimeType(String(attachment.ext || ''), kind);
   const summary = String(attachment.summary || '').trim();
-  if (!absolutePath || kind !== 'image' || !isLikelyMultimodalModel(modelName)) {
+  if (!absolutePath || kind !== 'image' || !supportsAttachmentKindDirectInput(modelName, kind)) {
     return null;
   }
 
@@ -1285,129 +1425,176 @@ async function initializeSessionBridge() {
   await getSessionBridgeService().start();
 }
 
-app.whenReady().then(async () => {
-  try {
-    await applyGlobalNetworkProxy((getSettings() || {}) as Record<string, unknown>);
-  } catch (error) {
-    console.error('[NetworkProxy] Failed to apply startup proxy settings:', error);
+let startupCoreServicesPromise: Promise<void> | null = null;
+async function initializeStartupCoreServices() {
+  if (startupCoreServicesPromise) {
+    return startupCoreServicesPromise;
   }
-
-  const officialFeatureModule = await loadOfficialFeatureModule();
-  if (officialFeatureModule?.registerOfficialFeatures) {
-    await officialFeatureModule.registerOfficialFeatures({
-      ipcMain,
-      shell,
-      getSettings: () => (getSettings() || {}) as Record<string, unknown>,
-      saveSettings: (settings) => {
-        saveSettings(
-          normalizeSettingsInput(settings) as Parameters<typeof saveSettings>[0]
-        );
-      },
-      normalizeSettingsInput,
-    });
-  }
-
-  try {
-    await officialFeatureModule?.syncOfficialAiRoutingOnStartup?.({
-      getSettings: () => (getSettings() || {}) as Record<string, unknown>,
-      saveSettings: (settings) => {
-        saveSettings(
-          normalizeSettingsInput(settings) as Parameters<typeof saveSettings>[0]
-        );
-      },
-      normalizeSettingsInput,
-    });
-  } catch (e) {
-    console.error('[official-feature] Failed to hydrate official auth on startup:', e);
-  }
-
-  registerLocalAssetProtocols();
-  createWindow();
-
-  // 先让窗口尽快可交互，再异步初始化重量后台服务
-  let bootstrapped = false;
-  const bootstrapBackgroundServices = async () => {
-    if (bootstrapped) return;
-    bootstrapped = true;
-
+  startupCoreServicesPromise = (async () => {
     try {
-      const workspacePaths = getWorkspacePaths();
-      const shouldBootstrapWorkspace = await confirmWorkspaceBootstrapIfNeeded(win, workspacePaths);
-      if (shouldBootstrapWorkspace) {
-        await ensureWorkspaceStructureFor(workspacePaths);
-      } else {
-        console.warn('[Workspace] Skipped workspace bootstrap because the configured directory looks like an existing manuscripts folder:', workspacePaths.base);
-      }
-    } catch (e) {
-      console.error('[Workspace] Failed to ensure workspace structure:', e);
+      await applyGlobalNetworkProxy((getSettings() || {}) as Record<string, unknown>);
+    } catch (error) {
+      console.error('[NetworkProxy] Failed to apply startup proxy settings:', error);
     }
 
-    await warmupBrowserPluginPrepared();
-    try {
-      await initializeRedClawBackgroundRunner();
-    } catch (e) {
-      console.error('[RedClawRunner] Init failed:', e);
-    }
-
-    try {
-      await initializeBackgroundTaskRegistry();
-    } catch (e) {
-      console.error('[BackgroundTasks] Init failed:', e);
-    }
-
-    try {
-      await initializeAssistantDaemon();
-    } catch (e) {
-      console.error('[AssistantDaemon] Init failed:', e);
-    }
-
-    try {
-      await initializeSessionBridge();
-    } catch (e) {
-      console.error('[SessionBridge] Init failed:', e);
-    }
-
-    try {
-      getMemoryMaintenanceService().start();
-    } catch (e) {
-      console.error('[MemoryMaintenance] Init failed:', e);
-    }
-
-    try {
-      // 初始化任务队列并启动后台服务
-      initializeTaskQueueWithExecutors();
-      const advisorYoutubeRunner = getAdvisorYoutubeBackgroundRunner();
-      if (!advisorYoutubeRunnerListenersAttached) {
-        advisorYoutubeRunner.on('progress', ({ advisorId, progress }) => {
-          win?.webContents.send('advisors:download-progress', { advisorId, progress });
+    const officialFeatureModule = await loadOfficialFeatureModule();
+    if (officialFeatureModule?.registerOfficialFeatures) {
+      try {
+        await officialFeatureModule.registerOfficialFeatures({
+          ipcMain,
+          shell,
+          getSettings: () => (getSettings() || {}) as Record<string, unknown>,
+          saveSettings: (settings) => {
+            saveSettings(
+              normalizeSettingsInput(settings) as Parameters<typeof saveSettings>[0]
+            );
+          },
+          normalizeSettingsInput,
         });
-        advisorYoutubeRunnerListenersAttached = true;
+      } catch (error) {
+        console.error('[official-feature] Failed to register official features on startup:', error);
       }
-      advisorYoutubeRunner.start();
-    } catch (e) {
-      console.error('[TaskQueue] Init failed:', e);
     }
 
     try {
-      // 启动文件监听服务
-      fileWatcher.start();
-    } catch (e) {
-      console.error('[FileWatcher] Start failed:', e);
-    }
-
-    // 自动检查并安装/更新 yt-dlp（静默后台执行）
-    import('./core/youtubeScraper').then(({ autoSetupYtdlp }) => {
-      autoSetupYtdlp().then(result => {
-        if (result.action !== 'none') {
-          console.log(`[App] yt-dlp auto setup: ${result.action} - ${result.message}`);
-        }
-      }).catch(e => {
-        console.error('[App] yt-dlp auto setup error:', e);
+      await officialFeatureModule?.syncOfficialAiRoutingOnStartup?.({
+        getSettings: () => (getSettings() || {}) as Record<string, unknown>,
+        saveSettings: (settings) => {
+          saveSettings(
+            normalizeSettingsInput(settings) as Parameters<typeof saveSettings>[0]
+          );
+        },
+        normalizeSettingsInput,
       });
-    });
+    } catch (e) {
+      console.error('[official-feature] Failed to hydrate official auth on startup:', e);
+    }
+  })().catch((error) => {
+    startupCoreServicesPromise = null;
+    throw error;
+  });
+
+  return startupCoreServicesPromise;
+}
+
+let sessionBridgeStartupPromise: Promise<void> | null = null;
+async function ensureSessionBridgeStarted() {
+  if (sessionBridgeStartupPromise) {
+    return sessionBridgeStartupPromise;
+  }
+  sessionBridgeStartupPromise = initializeSessionBridge().catch((error) => {
+    sessionBridgeStartupPromise = null;
+    throw error;
+  });
+  return sessionBridgeStartupPromise;
+}
+
+app.whenReady().then(async () => {
+  markStartupPhase('app.whenReady');
+  registerLocalAssetProtocols();
+  markStartupPhase('local-asset-protocols-registered');
+  createWindow();
+  markStartupPhase('main-window-created');
+
+  // 先让窗口尽快可交互，再分阶段初始化重量后台服务
+  let backgroundServicesScheduled = false;
+  const bootstrapBackgroundServices = async () => {
+    if (backgroundServicesScheduled) return;
+    backgroundServicesScheduled = true;
+
+    void initializeStartupCoreServices();
+
+    setTimeout(() => {
+      void (async () => {
+        markStartupPhase('background-phase-1-start');
+        try {
+          const workspacePaths = getWorkspacePaths();
+          const shouldBootstrapWorkspace = await confirmWorkspaceBootstrapIfNeeded(win, workspacePaths);
+          if (shouldBootstrapWorkspace) {
+            await ensureWorkspaceStructureFor(workspacePaths);
+          } else {
+            console.warn('[Workspace] Skipped workspace bootstrap because the configured directory looks like an existing manuscripts folder:', workspacePaths.base);
+          }
+        } catch (e) {
+          console.error('[Workspace] Failed to ensure workspace structure:', e);
+        }
+
+        await warmupBrowserPluginPrepared();
+        try {
+          await initializeRedClawBackgroundRunner();
+        } catch (e) {
+          console.error('[RedClawRunner] Init failed:', e);
+        }
+
+        try {
+          await initializeBackgroundTaskRegistry();
+        } catch (e) {
+          console.error('[BackgroundTasks] Init failed:', e);
+        }
+        markStartupPhase('background-phase-1-done');
+      })();
+    }, 180);
+
+    setTimeout(() => {
+      void (async () => {
+        markStartupPhase('background-phase-2-start');
+        try {
+          await initializeAssistantDaemon();
+        } catch (e) {
+          console.error('[AssistantDaemon] Init failed:', e);
+        }
+
+        try {
+          getMemoryMaintenanceService().start();
+        } catch (e) {
+          console.error('[MemoryMaintenance] Init failed:', e);
+        }
+        markStartupPhase('background-phase-2-done');
+      })();
+    }, 1200);
+
+    setTimeout(() => {
+      void (async () => {
+        markStartupPhase('background-phase-3-start');
+        try {
+          initializeTaskQueueWithExecutors();
+          const advisorYoutubeRunner = getAdvisorYoutubeBackgroundRunner();
+          if (!advisorYoutubeRunnerListenersAttached) {
+            advisorYoutubeRunner.on('progress', ({ advisorId, progress }) => {
+              win?.webContents.send('advisors:download-progress', { advisorId, progress });
+            });
+            advisorYoutubeRunnerListenersAttached = true;
+          }
+          advisorYoutubeRunner.start();
+        } catch (e) {
+          console.error('[TaskQueue] Init failed:', e);
+        }
+
+        try {
+          fileWatcher.start();
+        } catch (e) {
+          console.error('[FileWatcher] Start failed:', e);
+        }
+        markStartupPhase('background-phase-3-done');
+      })();
+    }, 2200);
+
+    setTimeout(() => {
+      import('./core/youtubeScraper').then(({ autoSetupYtdlp }) => {
+        autoSetupYtdlp().then(result => {
+          if (result.action !== 'none') {
+            console.log(`[App] yt-dlp auto setup: ${result.action} - ${result.message}`);
+          }
+        }).catch(e => {
+          console.error('[App] yt-dlp auto setup error:', e);
+        });
+      });
+    }, 12000);
   };
 
   win?.webContents.once('did-finish-load', () => {
+    markStartupPhase('renderer-did-finish-load');
+    void initializeStartupCoreServices();
     void bootstrapBackgroundServices();
     setTimeout(() => {
       void checkForAppUpdate(false, false);
@@ -1661,7 +1848,7 @@ ipcMain.handle('runtime:query', async (event, payload?: { sessionId?: string; me
     role: 'user',
     content: message,
   });
-  const service = getOrCreateChatService(sessionId, event.sender);
+  const service = await getOrCreateChatService(sessionId, event.sender);
   await service.sendMessage(message, sessionId);
   return {
     success: true,
@@ -1855,6 +2042,73 @@ ipcMain.handle('clipboard:read-text', () => {
   } catch (error) {
     console.error('[clipboard] read text failed:', error);
     return '';
+  }
+});
+
+ipcMain.handle('clipboard:write-html', async (_, payload?: { html?: string; text?: string }) => {
+  try {
+    const html = String(payload?.html || '').trim();
+    const text = String(payload?.text || '').trim();
+    if (!html) {
+      throw new Error('html is required');
+    }
+    clipboard.writeHTML(html);
+    clipboard.writeText(text || html.replace(/<[^>]+>/g, ' '));
+    return { success: true };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+});
+
+ipcMain.handle('wechat-official:get-status', async () => {
+  try {
+    return {
+      success: true,
+      ...(await getWechatOfficialAccountStatus()),
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+      bindings: [],
+    };
+  }
+});
+
+ipcMain.handle('wechat-official:bind', async (_, payload?: {
+  name?: string;
+  appId?: string;
+  secret?: string;
+  setActive?: boolean;
+}) => {
+  try {
+    const binding = await bindWechatOfficialAccount({
+      name: String(payload?.name || '').trim() || undefined,
+      appId: String(payload?.appId || '').trim(),
+      secret: String(payload?.secret || '').trim(),
+      setActive: payload?.setActive !== false,
+    });
+    return { success: true, binding };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+});
+
+ipcMain.handle('wechat-official:unbind', async (_, payload?: { bindingId?: string }) => {
+  try {
+    await unbindWechatOfficialAccount(String(payload?.bindingId || '').trim() || undefined);
+    return { success: true };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
   }
 });
 
@@ -2096,14 +2350,17 @@ ipcMain.handle('assistant:daemon-weixin-login-wait', async (_, payload: {
 });
 
 ipcMain.handle('session-bridge:status', async () => {
+  await ensureSessionBridgeStarted();
   return getSessionBridgeService().getStatus();
 });
 
 ipcMain.handle('session-bridge:list-sessions', async () => {
+  await ensureSessionBridgeStarted();
   return getSessionBridgeService().listSessions();
 });
 
 ipcMain.handle('session-bridge:get-session', async (_, payload?: { sessionId?: string }) => {
+  await ensureSessionBridgeStarted();
   const sessionId = String(payload?.sessionId || '').trim();
   if (!sessionId) return null;
   return getSessionBridgeService().getSessionSnapshot(sessionId);
@@ -2115,6 +2372,7 @@ ipcMain.handle('session-bridge:create-session', async (_, payload?: {
   runtimeMode?: string;
   metadata?: Record<string, unknown>;
 }) => {
+  await ensureSessionBridgeStarted();
   return getSessionBridgeService().createSession(payload);
 });
 
@@ -2122,6 +2380,7 @@ ipcMain.handle('session-bridge:send-message', async (_, payload?: {
   sessionId?: string;
   message?: string;
 }) => {
+  await ensureSessionBridgeStarted();
   const sessionId = String(payload?.sessionId || '').trim();
   const message = String(payload?.message || '').trim();
   if (!sessionId || !message) {
@@ -2131,6 +2390,7 @@ ipcMain.handle('session-bridge:send-message', async (_, payload?: {
 });
 
 ipcMain.handle('session-bridge:list-permissions', async (_, payload?: { sessionId?: string }) => {
+  await ensureSessionBridgeStarted();
   const sessionId = String(payload?.sessionId || '').trim();
   return getSessionBridgeService().listPermissionRequests(sessionId || undefined);
 });
@@ -2144,6 +2404,7 @@ ipcMain.handle('session-bridge:resolve-permission', async (_, payload?: {
   if (!requestId) {
     return { success: false, error: 'requestId is required' };
   }
+  await ensureSessionBridgeStarted();
   const { ToolConfirmationOutcome } = require('./core/toolRegistry');
   return getSessionBridgeService().resolvePermissionRequest(
     requestId,
@@ -2242,6 +2503,7 @@ ipcMain.handle('ai:detect-protocol', async (_, payload: {
   protocol?: string;
 }) => {
   try {
+    const { detectAiProtocol } = await import('./core/aiSourceService');
     return {
       success: true,
       protocol: detectAiProtocol({
@@ -2262,6 +2524,7 @@ ipcMain.handle('ai:test-connection', async (_, payload: {
   presetId?: string;
   protocol?: 'openai' | 'anthropic' | 'gemini';
 }) => {
+  const { detectAiProtocol, testAiSourceConnection } = await import('./core/aiSourceService');
   try {
     const result = await testAiSourceConnection({
       apiKey: payload?.apiKey || '',
@@ -2293,6 +2556,7 @@ ipcMain.handle('ai:fetch-models', async (_, payload: {
   purpose?: 'chat' | 'image';
 }) => {
   try {
+    const { fetchModelsForAiSource } = await import('./core/aiSourceService');
     const { models } = await fetchModelsForAiSource({
       apiKey: payload?.apiKey || '',
       baseURL: payload?.baseURL || '',
@@ -2307,15 +2571,22 @@ ipcMain.handle('ai:fetch-models', async (_, payload: {
   }
 });
 
-// AI Chat - 使用 pi-agent-core 引擎
-import { PiChatService } from './pi/PiChatService';
-
 // 会话级 ChatService 实例管理（保证切换 tab/并行会话时不中断）
-const chatServices = new Map<string, PiChatService>();
+type PiChatServiceInstance = import('./pi/PiChatService').PiChatService;
+let piChatServiceCtorPromise: Promise<typeof import('./pi/PiChatService').PiChatService> | null = null;
+const chatServices = new Map<string, PiChatServiceInstance>();
 
-function getOrCreateChatService(sessionId: string, sender?: Electron.WebContents): PiChatService {
+async function getPiChatServiceCtor(): Promise<typeof import('./pi/PiChatService').PiChatService> {
+  if (!piChatServiceCtorPromise) {
+    piChatServiceCtorPromise = import('./pi/PiChatService').then((module) => module.PiChatService);
+  }
+  return piChatServiceCtorPromise;
+}
+
+async function getOrCreateChatService(sessionId: string, sender?: Electron.WebContents): Promise<PiChatServiceInstance> {
   let service = chatServices.get(sessionId);
   if (!service) {
+    const PiChatService = await getPiChatServiceCtor();
     service = new PiChatService();
     chatServices.set(sessionId, service);
   }
@@ -2668,6 +2939,34 @@ ipcMain.handle('media:list', async (_, { limit }: { limit?: number } = {}) => {
   }
 });
 
+ipcMain.handle('media:import-files', async () => {
+  try {
+    const picker = await dialog.showOpenDialog({
+      title: '选择要导入到草稿媒体库的素材',
+      properties: ['openFile', 'multiSelections'],
+      filters: [
+        { name: 'Media Files', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'svg', 'mp4', 'mov', 'webm', 'm4v', 'avi', 'mkv', 'mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus'] },
+        { name: 'All Files', extensions: ['*'] },
+      ],
+    });
+
+    if (picker.canceled || !picker.filePaths.length) {
+      return { success: true, canceled: true, imported: [] };
+    }
+
+    const imported = await importMediaFiles(picker.filePaths);
+    const enriched = await Promise.all(imported.map((asset) => enrichMediaAsset(asset)));
+    return {
+      success: true,
+      imported: enriched,
+      added: enriched.length,
+    };
+  } catch (error) {
+    console.error('Failed to import media files:', error);
+    return { success: false, error: String(error), imported: [] };
+  }
+});
+
 ipcMain.handle('media:update', async (_, payload: { assetId: string; projectId?: string; title?: string; prompt?: string }) => {
   try {
     if (!payload?.assetId) {
@@ -2694,7 +2993,15 @@ ipcMain.handle('media:delete', async (_, { assetId }: { assetId: string }) => {
   }
 });
 
-ipcMain.handle('media:bind', async (_, { assetId, manuscriptPath }: { assetId: string; manuscriptPath: string }) => {
+ipcMain.handle('media:bind', async (_, {
+  assetId,
+  manuscriptPath,
+  role,
+}: {
+  assetId: string;
+  manuscriptPath: string;
+  role?: 'cover' | 'image' | 'asset';
+}) => {
   try {
     if (!assetId || !manuscriptPath) {
       return { success: false, error: 'assetId and manuscriptPath are required' };
@@ -2705,6 +3012,7 @@ ipcMain.handle('media:bind', async (_, { assetId, manuscriptPath }: { assetId: s
     const updated = await bindMediaAssetToManuscript({
       assetId,
       manuscriptPath: normalizedManuscriptPath,
+      role,
     });
     return { success: true, asset: await enrichMediaAsset(updated) };
   } catch (error) {
@@ -2991,6 +3299,7 @@ ipcMain.handle('cover:generate', async (_, {
   quality?: string;
 }) => {
   try {
+    const { generateCoverAssets } = await import('./core/coverGenerationService');
     const result = await generateCoverAssets({
       templateImage,
       baseImage,
@@ -3042,6 +3351,7 @@ ipcMain.handle('image-gen:generate', async (_, {
   aspectRatio?: string;
 }) => {
   try {
+    const { generateImagesToMediaLibrary } = await import('./core/imageGenerationService');
     const result = await generateImagesToMediaLibrary({
       prompt,
       projectId,
@@ -3094,6 +3404,7 @@ ipcMain.handle('video-gen:generate', async (_, {
   firstClip?: string;
 }) => {
   try {
+    const { generateVideosToMediaLibrary } = await import('./core/videoGenerationService');
     const normalizedGenerationMode = (() => {
       const value = String(generationMode || '').trim().toLowerCase();
       if (value === 'text-to-video' || value === 'reference-guided' || value === 'first-last-frame' || value === 'continuation') {
@@ -3170,7 +3481,7 @@ ipcMain.handle('chat:compact-context', async (event, sessionId: string) => {
   }
 
   try {
-    const service = getOrCreateChatService(sessionId, event.sender);
+    const service = await getOrCreateChatService(sessionId, event.sender);
     return await service.compactContextNow(sessionId);
   } catch (error) {
     console.error('[chat:compact-context] Failed:', error);
@@ -3444,10 +3755,16 @@ ipcMain.on('chat:send-message', async (event, { sessionId, message, displayConte
         return {} as Record<string, unknown>;
       }
     })() : {};
+    const attachmentKind = String(rawAttachment.kind || 'file').trim().toLowerCase();
+    const directInputSupported = supportsAttachmentKindDirectInput(resolvedModelName, attachmentKind);
+    const modelInputCapabilities = getModelInputCapabilities(resolvedModelName);
     const requiresMultimodal = Boolean(rawAttachment.requiresMultimodal);
-    if (requiresMultimodal && !isLikelyMultimodalModel(resolvedModelName)) {
+    if (requiresMultimodal && !directInputSupported) {
       const kind = String(rawAttachment.kind || 'file');
-      const failMessage = `当前模型 "${resolvedModelName}" 不支持 ${kind} 附件理解，请切换到多模态模型后重试。`;
+      const capabilityHint = modelInputCapabilities.length > 0
+        ? `当前登记的输入能力: ${modelInputCapabilities.join(', ')}`
+        : '当前未登记该模型的输入能力';
+      const failMessage = `当前模型 "${resolvedModelName}" 不支持 ${kind} 附件直传。${capabilityHint}。请切换到支持该输入类型的模型后重试。`;
       sender.send('chat:error', {
         message: 'AI 请求失败（模型不支持附件）',
         category: 'request',
@@ -3497,6 +3814,11 @@ ipcMain.on('chat:send-message', async (event, { sessionId, message, displayConte
         return {} as Record<string, unknown>;
       }
     })();
+    const redClawAuthoringHints = normalizeRedClawAuthoringHints(taskHints);
+    const forcedSkillNames = resolveForcedSkillNames(taskHints);
+    if (redClawAuthoringHints) {
+      outgoingMessage = buildRedClawAuthoringPrompt(outgoingMessage, redClawAuthoringHints);
+    }
 
     const runtimeMode = resolveRuntimeModeForSession(String(sessionMeta.contextType || ''));
     const routeAnalysis = getAgentRuntime().analyzeRuntimeContext({
@@ -3513,6 +3835,7 @@ ipcMain.on('chat:send-message', async (event, { sessionId, message, displayConte
     });
 
     if (routeAnalysis.shouldUseCoordinator && runtimeMode !== 'background-maintenance') {
+      emitForcedSkillActivationEvents(sender, forcedSkillNames);
       sender.send('chat:phase-start', { name: '任务已进入协作模式' });
       sender.send('chat:thought-start', {});
       sender.send('chat:thought-delta', {
@@ -3520,7 +3843,11 @@ ipcMain.on('chat:send-message', async (event, { sessionId, message, displayConte
           ? '正在接管创作任务并准备读取素材...'
           : '正在接管任务并准备协作执行...',
       });
-      const baseSystemPrompt = await buildRuntimeBaseSystemPrompt({ runtimeMode, interactive: true });
+      const baseSystemPrompt = await buildRuntimeBaseSystemPrompt({
+        runtimeMode,
+        interactive: true,
+        forcedSkillNames,
+      });
       console.log('[chat:send-message] routed-to-coordinator', {
         sessionId,
         runtimeMode,
@@ -3554,7 +3881,10 @@ ipcMain.on('chat:send-message', async (event, { sessionId, message, displayConte
       return;
     }
 
-    const service = getOrCreateChatService(sessionId, sender);
+    const service = await getOrCreateChatService(sessionId, sender);
+    if (forcedSkillNames.length > 0) {
+      await service.activateSkills(forcedSkillNames);
+    }
 
     // 发送消息
     await service.sendMessage(
@@ -4512,6 +4842,7 @@ ipcMain.handle('advisors:generate-persona', async (_, {
       model,
     });
 
+    const { generateAdvisorPersonaDocument } = await import('./core/advisorPersonaGenerator');
     const result = await generateAdvisorPersonaDocument({
       advisorId,
       channelName,
@@ -5500,6 +5831,387 @@ function getManuscriptsDir() {
   return getWorkspacePaths().manuscripts;
 }
 
+function getManuscriptDisplayName(fileName: string) {
+  return stripManuscriptExtension(fileName);
+}
+
+function getManuscriptPackageManifestPath(packagePath: string) {
+  return path.join(packagePath, 'manifest.json');
+}
+
+function getManuscriptPackageScriptPath(packagePath: string) {
+  return path.join(packagePath, 'script.md');
+}
+
+function getManuscriptPackageTimelinePath(packagePath: string) {
+  return path.join(packagePath, 'timeline.otio.json');
+}
+
+function getManuscriptPackageAssetsPath(packagePath: string) {
+  return path.join(packagePath, 'assets.json');
+}
+
+function getManuscriptPackageCoverPath(packagePath: string) {
+  return path.join(packagePath, 'cover.json');
+}
+
+function getManuscriptPackageImagesPath(packagePath: string) {
+  return path.join(packagePath, 'images.json');
+}
+
+function getManuscriptPackageLayoutHtmlPath(packagePath: string) {
+  return path.join(packagePath, 'layout.html');
+}
+
+function getManuscriptPackageWechatHtmlPath(packagePath: string) {
+  return path.join(packagePath, 'wechat.html');
+}
+
+function getDefaultManuscriptPackageEntry(fileName: string) {
+  const packageKind = getPackageKindFromFileName(fileName);
+  if (packageKind === 'video' || packageKind === 'audio') {
+    return 'script.md';
+  }
+  return 'content.md';
+}
+
+function getManuscriptPackageEntryPath(packagePath: string, fileName: string, manifest?: Record<string, unknown>) {
+  const entry = String(manifest?.entry || '').trim() || getDefaultManuscriptPackageEntry(fileName);
+  return path.join(packagePath, entry);
+}
+
+async function readManuscriptPackage(packagePath: string): Promise<{ content: string; metadata: Record<string, unknown> }> {
+  const manifestPath = getManuscriptPackageManifestPath(packagePath);
+  const fileName = path.basename(packagePath);
+  let metadata: Record<string, unknown> = {};
+  let content = '';
+
+  try {
+    const rawManifest = await fs.readFile(manifestPath, 'utf-8');
+    const parsed = JSON.parse(rawManifest);
+    if (parsed && typeof parsed === 'object') {
+      metadata = parsed as Record<string, unknown>;
+    }
+  } catch {
+    metadata = {};
+  }
+
+  try {
+    content = await fs.readFile(getManuscriptPackageEntryPath(packagePath, fileName, metadata), 'utf-8');
+  } catch {
+    content = '';
+  }
+
+  let needsUpdate = false;
+  if (!metadata.id) {
+    metadata.id = ulid();
+    needsUpdate = true;
+  }
+  if (!metadata.createdAt) {
+    metadata.createdAt = Date.now();
+    needsUpdate = true;
+  }
+  if (!metadata.updatedAt) {
+    metadata.updatedAt = Number(metadata.createdAt) || Date.now();
+    needsUpdate = true;
+  }
+  if (!metadata.title) {
+    metadata.title = getManuscriptDisplayName(fileName);
+    needsUpdate = true;
+  }
+  if (!metadata.packageKind) {
+    metadata.packageKind = getPackageKindFromFileName(fileName);
+    needsUpdate = true;
+  }
+  if (!metadata.draftType) {
+    metadata.draftType = getDraftTypeFromFileName(fileName);
+    needsUpdate = true;
+  }
+  if (!metadata.entry) {
+    metadata.entry = getDefaultManuscriptPackageEntry(fileName);
+    needsUpdate = true;
+  }
+
+  if (needsUpdate) {
+    await fs.writeFile(manifestPath, JSON.stringify(metadata, null, 2), 'utf-8');
+  }
+
+  return { content, metadata };
+}
+
+async function saveManuscriptPackage(packagePath: string, content: string, metadata?: Record<string, unknown>) {
+  const fileName = path.basename(packagePath);
+  let existingMetadata: Record<string, unknown> = {};
+  try {
+    existingMetadata = JSON.parse(await fs.readFile(getManuscriptPackageManifestPath(packagePath), 'utf-8')) as Record<string, unknown>;
+  } catch {
+    existingMetadata = {};
+  }
+  const packageMetadata = {
+    ...existingMetadata,
+    ...(metadata || {}),
+    updatedAt: Date.now(),
+  } as Record<string, unknown>;
+  await fs.mkdir(packagePath, { recursive: true });
+  await fs.writeFile(getManuscriptPackageEntryPath(packagePath, fileName, packageMetadata), String(content || ''), 'utf-8');
+  await fs.writeFile(getManuscriptPackageManifestPath(packagePath), JSON.stringify(packageMetadata, null, 2), 'utf-8');
+}
+
+function createEmptyOtioTimeline(title: string) {
+  return {
+    OTIO_SCHEMA: 'Timeline.1',
+    name: title,
+    global_start_time: null,
+    tracks: {
+      OTIO_SCHEMA: 'Stack.1',
+      children: [
+        {
+          OTIO_SCHEMA: 'Track.1',
+          name: 'V1',
+          kind: 'Video',
+          children: [],
+        },
+        {
+          OTIO_SCHEMA: 'Track.1',
+          name: 'A1',
+          kind: 'Audio',
+          children: [],
+        },
+      ],
+    },
+    metadata: {
+      owner: 'redbox',
+      engine: 'ai-editing',
+      version: 1,
+    },
+  };
+}
+
+async function readJsonFromFile<T>(filePath: string, fallback: T): Promise<T> {
+  try {
+    const raw = await fs.readFile(filePath, 'utf-8');
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function buildTimelineClipSummaries(timeline: Record<string, unknown>) {
+  const tracks = Array.isArray((timeline as any)?.tracks?.children) ? (timeline as any).tracks.children : [];
+  const sourceRefs = Array.isArray((timeline as any)?.metadata?.sourceRefs) ? (timeline as any).metadata.sourceRefs : [];
+  const sourceRefByAssetId = new Map<string, Record<string, unknown>>();
+  for (const item of sourceRefs) {
+    const assetId = String((item as any)?.assetId || '').trim();
+    if (!assetId) continue;
+    sourceRefByAssetId.set(assetId, item as Record<string, unknown>);
+  }
+
+  const clips: Array<Record<string, unknown>> = [];
+  for (const track of tracks) {
+    const trackName = String((track as any)?.name || '').trim();
+    const trackKind = String((track as any)?.kind || '').trim();
+    const children = Array.isArray((track as any)?.children) ? (track as any).children : [];
+    for (let index = 0; index < children.length; index += 1) {
+      const clip = children[index] as any;
+      const metadata = (clip?.metadata && typeof clip.metadata === 'object') ? clip.metadata : {};
+      const mediaRef = clip?.media_references?.DEFAULT_MEDIA;
+      const assetId = String(metadata.assetId || mediaRef?.metadata?.assetId || '').trim();
+      const sourceRef = assetId ? sourceRefByAssetId.get(assetId) : null;
+      clips.push({
+        assetId,
+        name: String(clip?.name || assetId || `Clip ${index + 1}`),
+        track: trackName,
+        trackKind,
+        order: Number(metadata.order ?? index) || 0,
+        durationMs: metadata.durationMs ?? null,
+        trimInMs: Number(metadata.trimInMs ?? 0) || 0,
+        trimOutMs: Number(metadata.trimOutMs ?? 0) || 0,
+        enabled: metadata.enabled ?? true,
+        assetKind: String(metadata.assetKind || sourceRef?.assetKind || ''),
+        mediaPath: String(sourceRef?.mediaPath || mediaRef?.target_url || ''),
+        mimeType: String(sourceRef?.mimeType || mediaRef?.metadata?.mimeType || ''),
+      });
+    }
+  }
+  return { tracks, sourceRefs, clips };
+}
+
+function normalizePackageTimeline(timeline: Record<string, unknown>) {
+  const tracks = Array.isArray((timeline as any)?.tracks?.children) ? (timeline as any).tracks.children : [];
+  const nextSourceRefs: Array<Record<string, unknown>> = [];
+
+  for (const track of tracks) {
+    const trackName = String((track as any)?.name || '').trim();
+    const children = Array.isArray((track as any)?.children) ? track.children : [];
+    track.children = children.map((clip: any, index: number) => {
+      const metadata = (clip?.metadata && typeof clip.metadata === 'object') ? clip.metadata : {};
+      const assetId = String(metadata.assetId || clip?.media_references?.DEFAULT_MEDIA?.metadata?.assetId || '').trim();
+      const mediaRef = clip?.media_references?.DEFAULT_MEDIA;
+      nextSourceRefs.push({
+        assetId,
+        mediaPath: String(mediaRef?.target_url || ''),
+        mimeType: String(mediaRef?.metadata?.mimeType || ''),
+        track: trackName,
+        order: index,
+        assetKind: String(metadata.assetKind || ''),
+        addedAt: String(metadata.addedAt || new Date().toISOString()),
+      });
+      return {
+        ...clip,
+        metadata: {
+          ...metadata,
+          order: index,
+          durationMs: metadata.durationMs ?? null,
+          trimInMs: Number(metadata.trimInMs ?? 0) || 0,
+          trimOutMs: Number(metadata.trimOutMs ?? 0) || 0,
+          enabled: metadata.enabled ?? true,
+        },
+      };
+    });
+  }
+
+  (timeline as any).metadata = {
+    ...((timeline as any).metadata || {}),
+    sourceRefs: nextSourceRefs.filter((item) => String(item.assetId || '').trim()),
+  };
+  return timeline;
+}
+
+async function getManuscriptPackageState(packagePath: string) {
+  const fileName = path.basename(packagePath);
+  const manifest = await readJsonFromFile<Record<string, unknown>>(getManuscriptPackageManifestPath(packagePath), {});
+  const assets = await readJsonFromFile<{ items: Array<Record<string, unknown>> }>(getManuscriptPackageAssetsPath(packagePath), { items: [] });
+  const cover = await readJsonFromFile<Record<string, unknown>>(getManuscriptPackageCoverPath(packagePath), { assetId: null });
+  const images = await readJsonFromFile<{ items: Array<Record<string, unknown>> }>(getManuscriptPackageImagesPath(packagePath), { items: [] });
+  const timeline = await readJsonFromFile<Record<string, unknown>>(getManuscriptPackageTimelinePath(packagePath), {});
+  const { tracks, sourceRefs, clips } = buildTimelineClipSummaries(timeline);
+  const clipCount = tracks.reduce((count: number, track: any) => {
+    const children = Array.isArray(track?.children) ? track.children : [];
+    return count + children.length;
+  }, 0);
+  let hasLayoutHtml = false;
+  let hasWechatHtml = false;
+  let layoutHtml = '';
+  let wechatHtml = '';
+  try {
+    await fs.access(getManuscriptPackageLayoutHtmlPath(packagePath));
+    layoutHtml = await fs.readFile(getManuscriptPackageLayoutHtmlPath(packagePath), 'utf-8');
+    hasLayoutHtml = Boolean(layoutHtml.trim());
+  } catch {}
+  try {
+    await fs.access(getManuscriptPackageWechatHtmlPath(packagePath));
+    wechatHtml = await fs.readFile(getManuscriptPackageWechatHtmlPath(packagePath), 'utf-8');
+    hasWechatHtml = Boolean(wechatHtml.trim());
+  } catch {}
+
+  return {
+    manifest: {
+      ...manifest,
+      packageKind: manifest.packageKind || getPackageKindFromFileName(fileName),
+      draftType: manifest.draftType || getDraftTypeFromFileName(fileName),
+    },
+    assets,
+    cover,
+    images,
+    timelineSummary: {
+      trackCount: tracks.length,
+      clipCount,
+      sourceRefs,
+      clips,
+    },
+    hasLayoutHtml,
+    hasWechatHtml,
+    layoutHtml,
+    wechatHtml,
+  };
+}
+
+async function createManuscriptPackage(packagePath: string, content: string, fileName: string, titleOverride?: string) {
+  const now = Date.now();
+  const title = String(titleOverride || '').trim() || '未命名';
+  const packageKind = getPackageKindFromFileName(fileName);
+  const draftType = getDraftTypeFromFileName(fileName);
+  const entryFile = getDefaultManuscriptPackageEntry(fileName);
+  const manifest = {
+    id: ulid(),
+    type: 'manuscript-package',
+    packageKind,
+    draftType,
+    title,
+    status: 'writing',
+    version: 1,
+    createdAt: now,
+    updatedAt: now,
+    entry: entryFile,
+    timeline: packageKind === 'video' || packageKind === 'audio' ? 'timeline.otio.json' : undefined,
+  };
+
+  await fs.mkdir(packagePath, { recursive: true });
+  await fs.mkdir(path.join(packagePath, 'cache'), { recursive: true });
+  await fs.mkdir(path.join(packagePath, 'exports'), { recursive: true });
+  await fs.writeFile(getManuscriptPackageManifestPath(packagePath), JSON.stringify(manifest, null, 2), 'utf-8');
+  await fs.writeFile(getManuscriptPackageEntryPath(packagePath, fileName, manifest), content || '', 'utf-8');
+  if (packageKind === 'video' || packageKind === 'audio') {
+    await fs.writeFile(path.join(packagePath, 'assets.json'), JSON.stringify({ items: [] }, null, 2), 'utf-8');
+    await fs.writeFile(
+      getManuscriptPackageTimelinePath(packagePath),
+      JSON.stringify(createEmptyOtioTimeline(title), null, 2),
+      'utf-8'
+    );
+    if (packageKind === 'audio') {
+      await fs.writeFile(path.join(packagePath, 'segments.json'), JSON.stringify({ items: [] }, null, 2), 'utf-8');
+      await fs.writeFile(path.join(packagePath, 'transcript.json'), JSON.stringify({ items: [] }, null, 2), 'utf-8');
+    } else {
+      await fs.writeFile(path.join(packagePath, 'storyboard.json'), JSON.stringify({ scenes: [] }, null, 2), 'utf-8');
+      await fs.writeFile(path.join(packagePath, 'transcript.json'), JSON.stringify({ items: [] }, null, 2), 'utf-8');
+    }
+  } else if (packageKind === 'article') {
+    await fs.writeFile(path.join(packagePath, 'layout.html'), '', 'utf-8');
+    await fs.writeFile(path.join(packagePath, 'wechat.html'), '', 'utf-8');
+    await fs.writeFile(path.join(packagePath, 'styles.json'), JSON.stringify({ theme: 'default' }, null, 2), 'utf-8');
+    await fs.writeFile(path.join(packagePath, 'assets.json'), JSON.stringify({ items: [] }, null, 2), 'utf-8');
+  } else if (packageKind === 'post') {
+    await fs.writeFile(path.join(packagePath, 'images.json'), JSON.stringify({ items: [] }, null, 2), 'utf-8');
+    await fs.writeFile(path.join(packagePath, 'cover.json'), JSON.stringify({ assetId: null }, null, 2), 'utf-8');
+    await fs.writeFile(path.join(packagePath, 'layout.json'), JSON.stringify({ cards: [] }, null, 2), 'utf-8');
+    await fs.writeFile(path.join(packagePath, 'assets.json'), JSON.stringify({ items: [] }, null, 2), 'utf-8');
+  }
+}
+
+async function upgradeMarkdownManuscriptToPackage(sourcePath: string, targetPackageExtension: string) {
+  const sourceFullPath = path.join(getManuscriptsDir(), sourcePath);
+  const sourceDir = path.dirname(sourceFullPath);
+  const sourceFileName = path.basename(sourceFullPath);
+  const targetFileName = `${stripManuscriptExtension(sourceFileName)}${targetPackageExtension}`;
+  const targetFullPath = path.join(sourceDir, targetFileName);
+
+  const rawContent = await fs.readFile(sourceFullPath, 'utf-8');
+  const parsed = matter(rawContent);
+  const metadata = (parsed.data || {}) as Record<string, unknown>;
+  const packageMetadata = {
+    ...metadata,
+    title: String(metadata.title || '').trim() || stripManuscriptExtension(sourceFileName),
+    draftType: targetPackageExtension === ARTICLE_DRAFT_EXTENSION ? 'longform' : 'richpost',
+    packageKind: targetPackageExtension === ARTICLE_DRAFT_EXTENSION ? 'article' : 'post',
+    migratedFrom: sourcePath,
+    migratedAt: Date.now(),
+  };
+
+  try {
+    await fs.access(targetFullPath);
+    throw new Error('目标工程已存在');
+  } catch (error: any) {
+    if (error?.code !== 'ENOENT') {
+      throw error;
+    }
+  }
+
+  await createManuscriptPackage(targetFullPath, parsed.content || '', targetFileName);
+  await saveManuscriptPackage(targetFullPath, parsed.content || '', packageMetadata);
+  await fs.rm(sourceFullPath, { force: true });
+  return path.relative(getManuscriptsDir(), targetFullPath);
+}
+
 async function ensureManuscriptsDir() {
   const fs = require('fs/promises');
   try {
@@ -5525,6 +6237,24 @@ async function buildFileTree(dirPath: string, basePath: string): Promise<{ name:
     const relativePath = path.relative(basePath, fullPath);
 
     if (entry.isDirectory()) {
+      if (isManuscriptPackageName(entry.name)) {
+        let status = 'writing';
+        try {
+          const { metadata } = await readManuscriptPackage(fullPath);
+          if (metadata && metadata.status) {
+            status = String(metadata.status);
+          }
+        } catch {
+          // Ignore error
+        }
+        result.push({
+          name: entry.name,
+          path: relativePath,
+          isDirectory: false,
+          status
+        });
+        continue;
+      }
       const children = await buildFileTree(fullPath, basePath);
       result.push({
         name: entry.name,
@@ -5532,7 +6262,7 @@ async function buildFileTree(dirPath: string, basePath: string): Promise<{ name:
         isDirectory: true,
         children
       });
-    } else if (entry.name.endsWith('.md')) {
+    } else if (isSupportedManuscriptFile(entry.name)) {
       let status = 'writing';
       try {
         const content = await fs.readFile(fullPath, 'utf-8');
@@ -5576,6 +6306,11 @@ ipcMain.handle('manuscripts:read', async (_, filePath: string) => {
   const fullPath = path.join(getManuscriptsDir(), filePath);
 
   try {
+    const stat = await fs.stat(fullPath);
+    if (stat.isDirectory()) {
+      return await readManuscriptPackage(fullPath);
+    }
+
     const rawContent = await fs.readFile(fullPath, 'utf-8');
 
     // Parse frontmatter
@@ -5610,10 +6345,30 @@ ipcMain.handle('manuscripts:read', async (_, filePath: string) => {
 
 // 保存文件内容
 ipcMain.handle('manuscripts:save', async (_, { path: filePath, content, metadata }: { path: string; content: string; metadata?: any }) => {
-  const fs = require('fs/promises');
   const fullPath = path.join(getManuscriptsDir(), filePath);
 
   try {
+    const stat = await fs.stat(fullPath);
+    if (stat.isDirectory()) {
+      await saveManuscriptPackage(fullPath, content, metadata || {});
+      const title = metadata?.title || getManuscriptDisplayName(path.basename(filePath));
+      if (content && content.trim().length > 0) {
+        indexManager.addToQueue({
+          id: `manuscript_${filePath}`,
+          sourceId: filePath,
+          title,
+          content,
+          sourceType: 'file',
+          scope: 'user',
+          displayData: {
+            platform: 'manuscript',
+            url: filePath
+          }
+        });
+      }
+      return { success: true };
+    }
+
     // If metadata provided, update timestamp
     const data = metadata || {};
     data.updatedAt = Date.now();
@@ -5625,7 +6380,7 @@ ipcMain.handle('manuscripts:save', async (_, { path: filePath, content, metadata
 
     // 自动将稿件加入索引队列计算 embedding
     if (content && content.trim().length > 0) {
-      const title = data.title || path.basename(filePath, '.md');
+      const title = data.title || getManuscriptDisplayName(path.basename(filePath));
       indexManager.addToQueue({
         id: `manuscript_${filePath}`,
         sourceId: filePath,
@@ -5644,6 +6399,67 @@ ipcMain.handle('manuscripts:save', async (_, { path: filePath, content, metadata
   } catch (error) {
     console.error('Failed to save manuscript:', error);
     return { success: false, error: String(error) };
+  }
+});
+
+ipcMain.handle('manuscripts:format-wechat', async (_, payload?: {
+  content?: string;
+  title?: string;
+  metadata?: Record<string, unknown>;
+}) => {
+  try {
+    const content = String(payload?.content || '').trim();
+    if (!content) {
+      throw new Error('content is required');
+    }
+    const metadata = payload?.metadata && typeof payload.metadata === 'object'
+      ? payload.metadata
+      : {};
+    const title = String(payload?.title || metadata.title || '').trim();
+    const formatted = formatWechatArticleFromMarkdown({
+      content,
+      title,
+      metadata,
+    });
+    return {
+      success: true,
+      ...formatted,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+});
+
+ipcMain.handle('wechat-official:create-draft', async (_, payload?: {
+  bindingId?: string;
+  content?: string;
+  title?: string;
+  metadata?: Record<string, unknown>;
+  sourcePath?: string;
+}) => {
+  try {
+    const content = String(payload?.content || '').trim();
+    if (!content) {
+      throw new Error('content is required');
+    }
+    const result = await createWechatOfficialDraftFromMarkdown({
+      bindingId: String(payload?.bindingId || '').trim() || undefined,
+      content,
+      title: String(payload?.title || '').trim() || undefined,
+      metadata: payload?.metadata && typeof payload.metadata === 'object'
+        ? payload.metadata
+        : undefined,
+      sourcePath: String(payload?.sourcePath || '').trim() || undefined,
+    });
+    return { success: true, ...result };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
   }
 });
 
@@ -5691,9 +6507,9 @@ ipcMain.handle('manuscripts:create-folder', async (_, { parentPath, name }: { pa
 });
 
 // 创建文件
-ipcMain.handle('manuscripts:create-file', async (_, { parentPath, name, content }: { parentPath: string; name: string; content?: string }) => {
-  const fs = require('fs/promises');
-  const fileName = name.endsWith('.md') ? name : `${name}.md`;
+ipcMain.handle('manuscripts:create-file', async (_, { parentPath, name, content, title }: { parentPath: string; name: string; content?: string; title?: string }) => {
+  const fallbackExtension = getManuscriptExtension(name) || '.md';
+  const fileName = ensureManuscriptFileName(name, fallbackExtension);
   const fullPath = path.join(getManuscriptsDir(), parentPath, fileName);
 
   try {
@@ -5707,7 +6523,11 @@ ipcMain.handle('manuscripts:create-file', async (_, { parentPath, name, content 
 
     // Ensure parent directory exists
     await fs.mkdir(path.dirname(fullPath), { recursive: true });
-    await fs.writeFile(fullPath, content || '', 'utf-8');
+    if (isManuscriptPackageName(fileName)) {
+      await createManuscriptPackage(fullPath, content || '', fileName, String(title || '').trim() || '未命名');
+    } else {
+      await fs.writeFile(fullPath, content || '', 'utf-8');
+    }
     return { success: true, path: path.relative(getManuscriptsDir(), fullPath) };
   } catch (error) {
     console.error('Failed to create file:', error);
@@ -5742,6 +6562,137 @@ ipcMain.handle('manuscripts:rename', async (_, { oldPath, newName }: { oldPath: 
   } catch (error) {
     console.error('Failed to rename manuscript:', error);
     return { success: false, error: String(error) };
+  }
+});
+
+ipcMain.handle('manuscripts:upgrade-to-package', async (_, {
+  sourcePath,
+  targetKind,
+}: {
+  sourcePath: string;
+  targetKind: 'article' | 'post';
+}) => {
+  try {
+    const targetExtension = targetKind === 'article' ? ARTICLE_DRAFT_EXTENSION : POST_DRAFT_EXTENSION;
+    const newPath = await upgradeMarkdownManuscriptToPackage(sourcePath, targetExtension);
+    return { success: true, newPath };
+  } catch (error) {
+    console.error('Failed to upgrade manuscript to package:', error);
+    return { success: false, error: error instanceof Error ? error.message : String(error) };
+  }
+});
+
+ipcMain.handle('manuscripts:get-package-state', async (_, filePath: string) => {
+  try {
+    if (!filePath) {
+      return { success: false, error: 'filePath is required' };
+    }
+    const fullPath = path.join(getManuscriptsDir(), filePath);
+    const stats = await fs.stat(fullPath);
+    if (!stats.isDirectory() || !isManuscriptPackageName(path.basename(fullPath))) {
+      return { success: false, error: 'Not a manuscript package' };
+    }
+    return { success: true, state: await getManuscriptPackageState(fullPath) };
+  } catch (error) {
+    console.error('Failed to get manuscript package state:', error);
+    return { success: false, error: error instanceof Error ? error.message : String(error) };
+  }
+});
+
+ipcMain.handle('manuscripts:update-package-clip', async (_, payload?: {
+  filePath?: string;
+  assetId?: string;
+  track?: string;
+  order?: number;
+  durationMs?: number | null;
+  trimInMs?: number;
+  trimOutMs?: number;
+  enabled?: boolean;
+}) => {
+  try {
+    const filePath = String(payload?.filePath || '').trim();
+    const assetId = String(payload?.assetId || '').trim();
+    if (!filePath || !assetId) {
+      return { success: false, error: 'filePath and assetId are required' };
+    }
+    const fullPath = path.join(getManuscriptsDir(), filePath);
+    const stats = await fs.stat(fullPath);
+    if (!stats.isDirectory() || !isManuscriptPackageName(path.basename(fullPath))) {
+      return { success: false, error: 'Not a manuscript package' };
+    }
+
+    const timelinePath = getManuscriptPackageTimelinePath(fullPath);
+    const timeline = await readJsonFromFile<Record<string, unknown>>(timelinePath, createEmptyOtioTimeline(path.basename(fullPath)));
+    const tracks = Array.isArray((timeline as any)?.tracks?.children) ? (timeline as any).tracks.children : [];
+    let clipToMove: any = null;
+    let currentTrack: any = null;
+
+    for (const track of tracks) {
+      const children = Array.isArray((track as any)?.children) ? track.children : [];
+      const clipIndex = children.findIndex((clip: any) => String(clip?.metadata?.assetId || clip?.media_references?.DEFAULT_MEDIA?.metadata?.assetId || '').trim() === assetId);
+      if (clipIndex >= 0) {
+        clipToMove = children.splice(clipIndex, 1)[0];
+        currentTrack = track;
+        break;
+      }
+    }
+
+    if (!clipToMove || !currentTrack) {
+      return { success: false, error: 'Clip not found in timeline' };
+    }
+
+    const nextTrackName = String(payload?.track || currentTrack?.name || '').trim() || String(currentTrack?.name || '');
+    const targetTrack = tracks.find((track: any) => String(track?.name || '').trim() === nextTrackName) || currentTrack;
+    const targetChildren = Array.isArray(targetTrack.children) ? targetTrack.children : [];
+    const nextMetadata = (clipToMove?.metadata && typeof clipToMove.metadata === 'object') ? clipToMove.metadata : {};
+    clipToMove = {
+      ...clipToMove,
+      metadata: {
+        ...nextMetadata,
+        durationMs: payload?.durationMs === null ? null : (payload?.durationMs ?? nextMetadata.durationMs ?? null),
+        trimInMs: payload?.trimInMs ?? nextMetadata.trimInMs ?? 0,
+        trimOutMs: payload?.trimOutMs ?? nextMetadata.trimOutMs ?? 0,
+        enabled: payload?.enabled ?? nextMetadata.enabled ?? true,
+      },
+    };
+    const desiredOrder = typeof payload?.order === 'number' && Number.isFinite(payload.order)
+      ? Math.max(0, Math.min(Math.trunc(payload.order), targetChildren.length))
+      : targetChildren.length;
+    targetChildren.splice(desiredOrder, 0, clipToMove);
+    targetTrack.children = targetChildren;
+
+    normalizePackageTimeline(timeline);
+    await fs.writeFile(timelinePath, JSON.stringify(timeline, null, 2), 'utf-8');
+    return { success: true, state: await getManuscriptPackageState(fullPath) };
+  } catch (error) {
+    console.error('Failed to update manuscript package clip:', error);
+    return { success: false, error: error instanceof Error ? error.message : String(error) };
+  }
+});
+
+ipcMain.handle('manuscripts:save-formatted-html', async (_, payload?: {
+  sourcePath?: string;
+  layoutHtml?: string;
+  wechatHtml?: string;
+}) => {
+  try {
+    const sourcePath = String(payload?.sourcePath || '').trim();
+    if (!sourcePath) {
+      return { success: false, error: 'sourcePath is required' };
+    }
+    const fullPath = path.join(getManuscriptsDir(), sourcePath);
+    const stats = await fs.stat(fullPath);
+    if (!stats.isDirectory() || !isManuscriptPackageName(path.basename(fullPath))) {
+      return { success: false, error: 'Not a manuscript package' };
+    }
+    const layoutHtml = String(payload?.layoutHtml || '');
+    const wechatHtml = String(payload?.wechatHtml || layoutHtml);
+    await fs.writeFile(getManuscriptPackageLayoutHtmlPath(fullPath), layoutHtml, 'utf-8');
+    await fs.writeFile(getManuscriptPackageWechatHtmlPath(fullPath), wechatHtml, 'utf-8');
+    return { success: true };
+  } catch (error) {
+    console.error('Failed to save manuscript formatted html:', error);
+    return { success: false, error: error instanceof Error ? error.message : String(error) };
   }
 });
 
@@ -6714,6 +7665,7 @@ const runWanderDeepThinkWithAgent = async (params: {
     });
   }
 
+  const PiChatService = await getPiChatServiceCtor();
   const service = new PiChatService();
   let responseBuffer = '';
   let lastPreview = '';

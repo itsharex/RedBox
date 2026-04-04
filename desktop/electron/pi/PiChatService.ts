@@ -35,6 +35,7 @@ import {
   type ToolResult,
 } from '../core/toolRegistry';
 import { createBuiltinTools } from '../core/tools';
+import type { BuiltinToolPack } from '../core/tools/catalog';
 import { createCompressionService } from '../core/compressionService';
 import { QueryRuntime } from '../core/queryRuntime';
 import { getLongTermMemoryPrompt } from '../core/fileMemoryStore';
@@ -130,6 +131,8 @@ interface PiChatServiceOptions {
     params: unknown,
     details: ToolConfirmationDetails,
   ) => Promise<ToolConfirmationOutcome>;
+  toolPack?: BuiltinToolPack;
+  workspacePathsOverride?: ReturnType<typeof getWorkspacePaths>;
 }
 
 interface TextualToolCall {
@@ -217,6 +220,8 @@ export class PiChatService {
   private toolExecutor: ToolExecutor;
   private activeRuntimeExecution: PreparedRuntimeExecution | null = null;
   private discoveredWorkspaceForSkills: string | null = null;
+  private readonly toolPack: BuiltinToolPack;
+  private readonly workspacePathsOverride: ReturnType<typeof getWorkspacePaths> | null;
   private runtimeState: SessionRuntimeState = {
     isProcessing: false,
     partialResponse: '',
@@ -227,9 +232,12 @@ export class PiChatService {
     this.sessionId = `session_${Date.now()}`;
     this.skillManager = new SkillManager();
     this.toolRegistry = new ToolRegistry();
+    this.toolPack = options.toolPack || 'redclaw';
+    this.workspacePathsOverride = options.workspacePathsOverride || null;
     const tools = createBuiltinTools({
-      pack: 'redclaw',
+      pack: this.toolPack,
       skillManager: this.skillManager,
+      workspaceRootOverride: this.workspacePathsOverride?.base,
       onSkillActivated: (payload) => {
         this.sendToUI('chat:skill-activated', payload);
       },
@@ -251,6 +259,39 @@ export class PiChatService {
 
   getSkillManager() {
     return this.skillManager;
+  }
+
+  async activateSkills(skillNames: string[]): Promise<Array<{ name: string; description: string }>> {
+    const normalized = Array.from(new Set(
+      Array.isArray(skillNames)
+        ? skillNames.map((item) => String(item || '').trim()).filter(Boolean)
+        : [],
+    ));
+    if (!normalized.length) {
+      return [];
+    }
+
+    const workspacePaths = this.workspacePathsOverride || getWorkspacePaths();
+    await this.ensureSkillsDiscovered(workspacePaths.base);
+
+    const activated: Array<{ name: string; description: string }> = [];
+    for (const skillName of normalized) {
+      const skill = this.skillManager.getSkill(skillName);
+      if (!skill || skill.disabled) continue;
+      const wasActive = this.skillManager.isSkillActive(skill.name);
+      const content = await this.skillManager.activateSkill(skill.name);
+      if (!content || wasActive) continue;
+      activated.push({
+        name: skill.name,
+        description: skill.description,
+      });
+      this.sendToUI('chat:skill-activated', {
+        name: skill.name,
+        description: skill.description,
+      });
+    }
+
+    return activated;
   }
 
   private sendToUI(channel: string, data: unknown) {
@@ -750,7 +791,7 @@ export class PiChatService {
     const modelName = String(modelOverride?.modelName || resolveScopedModelName(settings, modelScope, (settings.openaiModel as string) || 'gpt-4o')).trim();
     const runtimeMode = this.resolveRuntimeMode(metadata);
 
-    const workspacePaths = getWorkspacePaths();
+    const workspacePaths = this.workspacePathsOverride || getWorkspacePaths();
     const workspace = workspacePaths.base;
     Instance.init(workspace);
     this.emitDebugLog('info', 'runtime:prepare:start', {
@@ -2870,7 +2911,7 @@ export class PiChatService {
 
   private async loadLongTermMemoryContext(): Promise<string> {
     try {
-      return await getLongTermMemoryPrompt(40);
+      return await getLongTermMemoryPrompt(40, this.workspacePathsOverride?.base);
     } catch (error) {
       console.warn('[PiChatService] Failed to load long-term memory:', error);
       return '';

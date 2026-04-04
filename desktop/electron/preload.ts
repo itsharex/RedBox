@@ -286,6 +286,18 @@ contextBridge.exposeInMainWorld('ipcRenderer', {
     startWeixinLogin: (payload?: { accountId?: string; force?: boolean }) => ipcRenderer.invoke('assistant:daemon-weixin-login-start', payload || {}),
     waitForWeixinLogin: (payload?: { sessionKey?: string; timeoutMs?: number }) => ipcRenderer.invoke('assistant:daemon-weixin-login-wait', payload || {}),
   },
+  wechatOfficial: {
+    getStatus: () => ipcRenderer.invoke('wechat-official:get-status'),
+    bind: (payload: { name?: string; appId: string; secret: string; setActive?: boolean }) => ipcRenderer.invoke('wechat-official:bind', payload),
+    unbind: (payload?: { bindingId?: string }) => ipcRenderer.invoke('wechat-official:unbind', payload || {}),
+    createDraft: (payload: {
+      bindingId?: string;
+      title?: string;
+      content: string;
+      metadata?: Record<string, unknown>;
+      sourcePath?: string;
+    }) => ipcRenderer.invoke('wechat-official:create-draft', payload),
+  },
 
   // Skills
   listSkills: () => ipcRenderer.invoke('skills:list'),

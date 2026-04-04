@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback, lazy, Suspense } from 'react'
 import { Link2, Loader2 } from 'lucide-react';
 import { Layout } from './components/Layout';
 import { FirstRunTour } from './components/FirstRunTour';
+import type { AuthoringTaskHints } from './utils/redclawAuthoring';
 
 const ChatPage = lazy(async () => ({ default: (await import('./pages/Chat')).Chat }));
 const CreativeChatPage = lazy(async () => ({ default: (await import('./pages/CreativeChat')).CreativeChat }));
@@ -18,27 +19,17 @@ const CoverStudioPage = lazy(async () => ({ default: (await import('./pages/Cove
 const SubjectsPage = lazy(async () => ({ default: (await import('./pages/Subjects')).Subjects }));
 const WorkboardPage = lazy(async () => ({ default: (await import('./pages/Workboard')).Workboard }));
 
-const VIEW_PRELOADERS: Array<() => Promise<unknown>> = [
-  () => import('./pages/Knowledge'),
-  () => import('./pages/Settings'),
-  () => import('./pages/RedClaw'),
-  () => import('./pages/MediaLibrary'),
-  () => import('./pages/CoverStudio'),
-  () => import('./pages/Subjects'),
-  () => import('./pages/Workboard'),
-];
-
 export type ViewType = 'chat' | 'creative-chat' | 'skills' | 'knowledge' | 'advisors' | 'settings' | 'manuscripts' | 'archives' | 'wander' | 'redclaw' | 'media-library' | 'cover-studio' | 'subjects' | 'workboard';
+
+const PINNED_VIEWS: ViewType[] = ['manuscripts'];
+const MAX_CACHED_VIEWS = 5;
+const CLIPBOARD_POLL_BOOT_DELAY_MS = 4000;
 
 // 待发送的聊天消息（用于跨页面传递）
 export interface PendingChatMessage {
   content: string;          // 实际发送给 AI 的完整内容
   displayContent?: string;  // UI 上显示的简短内容
-  taskHints?: {
-    intent?: string;
-    forceMultiAgent?: boolean;
-    forceLongRunningTask?: boolean;
-  };
+  taskHints?: AuthoringTaskHints;
   attachment?: {
     type: 'youtube-video';
     title: string;
@@ -139,12 +130,22 @@ function ViewLoadingFallback() {
   );
 }
 
+function computeMountedViews(history: ViewType[]): Set<ViewType> {
+  const next = new Set<ViewType>(PINNED_VIEWS);
+  const recent = history.slice(-MAX_CACHED_VIEWS);
+  for (const view of recent) {
+    next.add(view);
+  }
+  return next;
+}
+
 function App() {
   const [currentView, setCurrentView] = useState<ViewType>('manuscripts');
+  const [isImmersiveEditor, setIsImmersiveEditor] = useState(false);
   const [pendingChatMessage, setPendingChatMessage] = useState<PendingChatMessage | null>(null);
   const [pendingRedClawMessage, setPendingRedClawMessage] = useState<PendingChatMessage | null>(null);
   const [pendingManuscriptFile, setPendingManuscriptFile] = useState<string | null>(null);
-  const [mountedViews, setMountedViews] = useState<Set<ViewType>>(() => new Set<ViewType>(['manuscripts']));
+  const [mountedViews, setMountedViews] = useState<Set<ViewType>>(() => computeMountedViews(['manuscripts']));
   const [clipboardCandidate, setClipboardCandidate] = useState<YouTubeClipboardCandidate | null>(null);
   const [isCapturePromptOpen, setIsCapturePromptOpen] = useState(false);
   const [captureStatus, setCaptureStatus] = useState<'idle' | 'saving' | 'success' | 'error'>('idle');
@@ -153,15 +154,18 @@ function App() {
   const lastClipboardTextRef = useRef('');
   const clipboardPollingRef = useRef(false);
   const capturedYouTubeSetRef = useRef<Set<string>>(new Set());
+  const viewHistoryRef = useRef<ViewType[]>(['manuscripts']);
 
   useEffect(() => {
-    setMountedViews((prev) => {
-      if (prev.has(currentView)) return prev;
-      const next = new Set(prev);
-      next.add(currentView);
-      return next;
-    });
+    viewHistoryRef.current = [...viewHistoryRef.current.filter((item) => item !== currentView), currentView];
+    setMountedViews(computeMountedViews(viewHistoryRef.current));
   }, [currentView]);
+
+  useEffect(() => {
+    if (currentView !== 'manuscripts' && isImmersiveEditor) {
+      setIsImmersiveEditor(false);
+    }
+  }, [currentView, isImmersiveEditor]);
 
   // 导航到 Chat 页面并发送消息
   const navigateToChat = (message: PendingChatMessage) => {
@@ -255,71 +259,49 @@ function App() {
 
   useEffect(() => {
     (window as unknown as { __redboxGlobalClipboardWatcher?: boolean }).__redboxGlobalClipboardWatcher = true;
+    let intervalId: number | null = null;
+    const bootTimerId = window.setTimeout(() => {
+      intervalId = window.setInterval(() => {
+        void (async () => {
+          if (clipboardPollingRef.current) return;
+          if (isCapturePromptOpen || captureStatus === 'saving') return;
+          if (document.visibilityState !== 'visible') return;
 
-    const timer = window.setInterval(() => {
-      void (async () => {
-        if (clipboardPollingRef.current) return;
-        if (isCapturePromptOpen || captureStatus === 'saving') return;
-        if (document.visibilityState !== 'visible') return;
+          clipboardPollingRef.current = true;
+          try {
+            const text = await window.ipcRenderer.invoke('clipboard:read-text') as string;
+            const normalizedText = String(text || '').trim();
+            if (!normalizedText || normalizedText === lastClipboardTextRef.current) {
+              return;
+            }
 
-        clipboardPollingRef.current = true;
-        try {
-          const text = await window.ipcRenderer.invoke('clipboard:read-text') as string;
-          const normalizedText = String(text || '').trim();
-          if (!normalizedText || normalizedText === lastClipboardTextRef.current) {
-            return;
+            lastClipboardTextRef.current = normalizedText;
+            const candidate = extractYouTubeCandidateFromClipboard(normalizedText);
+            if (!candidate) return;
+            if (capturedYouTubeSetRef.current.has(candidate.videoId)) return;
+
+            setClipboardCandidate(candidate);
+            setCaptureStatus('idle');
+            setCaptureMessage('检测到剪贴板里的 YouTube 链接，是否开始后台采集？');
+            setIsCapturePromptOpen(true);
+          } finally {
+            clipboardPollingRef.current = false;
           }
-
-          lastClipboardTextRef.current = normalizedText;
-          const candidate = extractYouTubeCandidateFromClipboard(normalizedText);
-          if (!candidate) return;
-          if (capturedYouTubeSetRef.current.has(candidate.videoId)) return;
-
-          setClipboardCandidate(candidate);
-          setCaptureStatus('idle');
-          setCaptureMessage('检测到剪贴板里的 YouTube 链接，是否开始后台采集？');
-          setIsCapturePromptOpen(true);
-        } finally {
-          clipboardPollingRef.current = false;
-        }
-      })();
-    }, CLIPBOARD_POLL_INTERVAL_MS);
-
-    return () => window.clearInterval(timer);
-  }, [captureStatus, isCapturePromptOpen]);
-
-  useEffect(() => {
-    let cancelled = false;
-    const scheduleIdle = window.requestIdleCallback
-      ? window.requestIdleCallback.bind(window)
-      : ((callback: IdleRequestCallback) => window.setTimeout(() => callback({
-          didTimeout: false,
-          timeRemaining: () => 0,
-        } as IdleDeadline), 1200));
-    const cancelIdle = window.cancelIdleCallback
-      ? window.cancelIdleCallback.bind(window)
-      : window.clearTimeout.bind(window);
-
-    const idleId = scheduleIdle(async () => {
-      for (const preload of VIEW_PRELOADERS) {
-        if (cancelled) return;
-        try {
-          await preload();
-        } catch (error) {
-          console.warn('View preload skipped:', error);
-        }
-      }
-    });
+        })();
+      }, CLIPBOARD_POLL_INTERVAL_MS);
+    }, CLIPBOARD_POLL_BOOT_DELAY_MS);
 
     return () => {
-      cancelled = true;
-      cancelIdle(idleId);
+      window.clearTimeout(bootTimerId);
+      if (intervalId !== null) {
+        window.clearInterval(intervalId);
+      }
     };
-  }, []);
+  }, [captureStatus, isCapturePromptOpen]);
 
   return (
     <>
-      <Layout currentView={currentView} onNavigate={setCurrentView}>
+    <Layout currentView={currentView} onNavigate={setCurrentView} immersiveMode={isImmersiveEditor}>
         {mountedViews.has('chat') && (
           <div className={currentView === 'chat' ? 'h-full min-h-0 flex flex-col' : 'hidden'}>
             <Suspense fallback={currentView === 'chat' ? <ViewLoadingFallback /> : null}>
@@ -349,6 +331,7 @@ function App() {
             <Suspense fallback={currentView === 'knowledge' ? <ViewLoadingFallback /> : null}>
               <KnowledgePage
                 onNavigateToChat={navigateToChat}
+                onNavigateToRedClaw={navigateToRedClaw}
                 isActive={currentView === 'knowledge'}
               />
             </Suspense>
@@ -374,7 +357,9 @@ function App() {
               <ManuscriptsPage
                 pendingFile={pendingManuscriptFile}
                 onFileConsumed={clearPendingManuscriptFile}
+                onNavigateToRedClaw={navigateToRedClaw}
                 isActive={currentView === 'manuscripts'}
+                onImmersiveModeChange={setIsImmersiveEditor}
               />
             </Suspense>
           </div>

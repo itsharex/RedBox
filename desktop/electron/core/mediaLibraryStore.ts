@@ -3,6 +3,7 @@ import * as path from 'path';
 import { randomUUID } from 'node:crypto';
 import matter from 'gray-matter';
 import { getWorkspacePaths } from '../db';
+import { getPackageKindFromFileName, isManuscriptPackageName } from '../../shared/manuscriptFiles';
 
 export type MediaAssetSource = 'generated' | 'planned' | 'imported';
 
@@ -60,9 +61,14 @@ function getGeneratedDir(): string {
   return path.join(getMediaRootDir(), 'generated');
 }
 
+function getImportedDir(): string {
+  return path.join(getMediaRootDir(), 'imported');
+}
+
 async function ensureMediaDirs(): Promise<void> {
   await fs.mkdir(getMediaRootDir(), { recursive: true });
   await fs.mkdir(getGeneratedDir(), { recursive: true });
+  await fs.mkdir(getImportedDir(), { recursive: true });
 }
 
 async function readCatalog(): Promise<MediaCatalog> {
@@ -98,10 +104,55 @@ function extByMime(mimeType: string): string {
   return 'png';
 }
 
-async function updateManuscriptBinding(manuscriptPath: string, asset: MediaAsset): Promise<void> {
+function guessMimeTypeByExtension(inputPath: string): string {
+  const ext = path.extname(inputPath).toLowerCase();
+  if (['.jpg', '.jpeg'].includes(ext)) return 'image/jpeg';
+  if (ext === '.png') return 'image/png';
+  if (ext === '.webp') return 'image/webp';
+  if (ext === '.gif') return 'image/gif';
+  if (ext === '.bmp') return 'image/bmp';
+  if (ext === '.svg') return 'image/svg+xml';
+  if (ext === '.mp4') return 'video/mp4';
+  if (ext === '.mov') return 'video/quicktime';
+  if (ext === '.webm') return 'video/webm';
+  if (ext === '.m4v') return 'video/x-m4v';
+  if (ext === '.avi') return 'video/x-msvideo';
+  if (ext === '.mkv') return 'video/x-matroska';
+  if (ext === '.mp3') return 'audio/mpeg';
+  if (ext === '.wav') return 'audio/wav';
+  if (ext === '.m4a') return 'audio/mp4';
+  if (ext === '.aac') return 'audio/aac';
+  if (ext === '.flac') return 'audio/flac';
+  if (ext === '.ogg') return 'audio/ogg';
+  if (ext === '.opus') return 'audio/opus';
+  return 'application/octet-stream';
+}
+
+function sanitizeImportedFileBaseName(fileName: string): string {
+  const ext = path.extname(fileName);
+  const base = path.basename(fileName, ext);
+  const normalizedBase = base
+    .normalize('NFKD')
+    .replace(/[^\w\-.一-龥]+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .trim();
+  return normalizedBase || `asset_${Date.now()}`;
+}
+
+async function updateManuscriptBinding(
+  manuscriptPath: string,
+  asset: MediaAsset,
+  role: 'cover' | 'image' | 'asset' = 'asset'
+): Promise<void> {
   const manuscriptsRoot = getWorkspacePaths().manuscripts;
   const normalized = normalizePathForStore(manuscriptPath);
   const absolutePath = path.join(manuscriptsRoot, normalized);
+  const stats = await fs.stat(absolutePath);
+  if (stats.isDirectory() && isManuscriptPackageName(path.basename(absolutePath))) {
+    await updateManuscriptPackageBinding(normalized, asset, role);
+    return;
+  }
   const raw = await fs.readFile(absolutePath, 'utf-8');
   const parsed = matter(raw);
   const data = parsed.data as Record<string, unknown>;
@@ -128,6 +179,11 @@ async function removeManuscriptBinding(manuscriptPath: string, assetId: string):
   const normalized = normalizePathForStore(manuscriptPath);
   const absolutePath = path.join(manuscriptsRoot, normalized);
   try {
+    const stats = await fs.stat(absolutePath);
+    if (stats.isDirectory() && isManuscriptPackageName(path.basename(absolutePath))) {
+      await removeManuscriptPackageBinding(normalized, assetId);
+      return;
+    }
     const raw = await fs.readFile(absolutePath, 'utf-8');
     const parsed = matter(raw);
     const data = parsed.data as Record<string, unknown>;
@@ -144,6 +200,224 @@ async function removeManuscriptBinding(manuscriptPath: string, assetId: string):
   } catch {
     // Ignore missing manuscript or malformed frontmatter during delete cleanup.
   }
+}
+
+async function readJsonFile<T>(filePath: string, fallback: T): Promise<T> {
+  try {
+    const raw = await fs.readFile(filePath, 'utf-8');
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+async function writeJsonFile(filePath: string, value: unknown): Promise<void> {
+  await fs.writeFile(filePath, JSON.stringify(value, null, 2), 'utf-8');
+}
+
+function getPackageTimelinePath(packagePath: string): string {
+  return path.join(packagePath, 'timeline.otio.json');
+}
+
+function inferAssetKind(asset: MediaAsset): 'image' | 'video' | 'audio' | 'unknown' {
+  const mime = String(asset.mimeType || '').toLowerCase();
+  const ref = `${asset.relativePath || ''}`.toLowerCase();
+  if (mime.startsWith('image/') || /\.(png|jpg|jpeg|webp|gif|bmp|svg)$/i.test(ref)) return 'image';
+  if (mime.startsWith('video/') || /\.(mp4|mov|webm|m4v|avi|mkv)$/i.test(ref)) return 'video';
+  if (mime.startsWith('audio/') || /\.(mp3|wav|m4a|aac|flac|ogg|opus)$/i.test(ref)) return 'audio';
+  return 'unknown';
+}
+
+function createDefaultOtioTimeline(title: string) {
+  return {
+    OTIO_SCHEMA: 'Timeline.1',
+    name: title,
+    global_start_time: null,
+    tracks: {
+      OTIO_SCHEMA: 'Stack.1',
+      children: [
+        {
+          OTIO_SCHEMA: 'Track.1',
+          name: 'V1',
+          kind: 'Video',
+          children: [],
+        },
+        {
+          OTIO_SCHEMA: 'Track.1',
+          name: 'A1',
+          kind: 'Audio',
+          children: [],
+        },
+      ],
+    },
+    metadata: {
+      owner: 'redbox',
+      engine: 'ai-editing',
+      version: 1,
+      sourceRefs: [],
+    },
+  };
+}
+
+async function syncPackageTimelineForAsset(packagePath: string, asset: MediaAsset, action: 'add' | 'remove'): Promise<void> {
+  const packageKind = getPackageKindFromFileName(path.basename(packagePath));
+  if (packageKind !== 'video' && packageKind !== 'audio') {
+    return;
+  }
+
+  const timelinePath = getPackageTimelinePath(packagePath);
+  const timeline = await readJsonFile<any>(timelinePath, createDefaultOtioTimeline(path.basename(packagePath)));
+  const tracks = Array.isArray(timeline?.tracks?.children) ? timeline.tracks.children : [];
+  const sourceRefs = Array.isArray(timeline?.metadata?.sourceRefs) ? timeline.metadata.sourceRefs : [];
+  const assetKind = inferAssetKind(asset);
+  const targetTrackName = assetKind === 'audio' ? 'A1' : 'V1';
+  const targetTrack = tracks.find((track: any) => String(track?.name || '') === targetTrackName);
+  if (!targetTrack) {
+    await writeJsonFile(timelinePath, timeline);
+    return;
+  }
+
+  const normalizedSourceRefs = sourceRefs.filter((item: any) => String(item?.assetId || '') !== asset.id);
+  const nextChildren = Array.isArray(targetTrack.children) ? targetTrack.children.filter((item: any) => String(item?.metadata?.assetId || '') !== asset.id) : [];
+
+  if (action === 'add') {
+    const clipOrder = nextChildren.length;
+    normalizedSourceRefs.push({
+      assetId: asset.id,
+      mediaPath: asset.relativePath || '',
+      mimeType: asset.mimeType || '',
+      track: targetTrackName,
+      order: clipOrder,
+      assetKind,
+      addedAt: nowIso(),
+    });
+    nextChildren.push({
+      OTIO_SCHEMA: 'Clip.2',
+      name: asset.title || asset.id,
+      source_range: null,
+      media_references: {
+        DEFAULT_MEDIA: {
+          OTIO_SCHEMA: 'ExternalReference.1',
+          target_url: asset.relativePath || '',
+          available_range: null,
+          metadata: {
+            assetId: asset.id,
+            mimeType: asset.mimeType || '',
+          },
+        },
+      },
+      active_media_reference_key: 'DEFAULT_MEDIA',
+      metadata: {
+        assetId: asset.id,
+        assetKind,
+        source: 'media-library',
+        order: clipOrder,
+        durationMs: null,
+        trimInMs: 0,
+        trimOutMs: 0,
+        enabled: true,
+      },
+    });
+  }
+
+  const normalizedChildren = nextChildren.map((item: any, index: number) => ({
+    ...item,
+    metadata: {
+      ...(item?.metadata || {}),
+      order: index,
+      durationMs: item?.metadata?.durationMs ?? null,
+      trimInMs: item?.metadata?.trimInMs ?? 0,
+      trimOutMs: item?.metadata?.trimOutMs ?? 0,
+      enabled: item?.metadata?.enabled ?? true,
+    },
+  }));
+  const normalizedSourceRefsWithOrder = normalizedSourceRefs.map((item: any, index: number) => ({
+    ...item,
+    order: index,
+  }));
+
+  targetTrack.children = normalizedChildren;
+  timeline.metadata = {
+    ...(timeline.metadata || {}),
+    sourceRefs: normalizedSourceRefsWithOrder,
+  };
+
+  await writeJsonFile(timelinePath, timeline);
+}
+
+async function updateManuscriptPackageBinding(
+  manuscriptPath: string,
+  asset: MediaAsset,
+  role: 'cover' | 'image' | 'asset'
+): Promise<void> {
+  const manuscriptsRoot = getWorkspacePaths().manuscripts;
+  const packagePath = path.join(manuscriptsRoot, normalizePathForStore(manuscriptPath));
+  const assetsPath = path.join(packagePath, 'assets.json');
+  const coverPath = path.join(packagePath, 'cover.json');
+  const imagesPath = path.join(packagePath, 'images.json');
+  const record = {
+    assetId: asset.id,
+    mediaPath: asset.relativePath || '',
+    source: asset.source,
+    boundAt: nowIso(),
+    role,
+  };
+
+  const assetsJson = await readJsonFile<{ items: Array<Record<string, unknown>> }>(assetsPath, { items: [] });
+  assetsJson.items = (assetsJson.items || []).filter((item) => String(item.assetId || '') !== asset.id || String(item.role || '') !== role);
+  assetsJson.items.push(record);
+  await writeJsonFile(assetsPath, assetsJson);
+
+  if (role === 'cover') {
+    await writeJsonFile(coverPath, {
+      assetId: asset.id,
+      mediaPath: asset.relativePath || '',
+      updatedAt: nowIso(),
+    });
+  }
+
+  if (role === 'image') {
+    const imagesJson = await readJsonFile<{ items: Array<Record<string, unknown>> }>(imagesPath, { items: [] });
+    imagesJson.items = (imagesJson.items || []).filter((item) => String(item.assetId || '') !== asset.id);
+    imagesJson.items.push({
+      assetId: asset.id,
+      mediaPath: asset.relativePath || '',
+      addedAt: nowIso(),
+    });
+    await writeJsonFile(imagesPath, imagesJson);
+  }
+
+  if (role === 'asset') {
+    await syncPackageTimelineForAsset(packagePath, asset, 'add');
+  }
+}
+
+async function removeManuscriptPackageBinding(manuscriptPath: string, assetId: string): Promise<void> {
+  const manuscriptsRoot = getWorkspacePaths().manuscripts;
+  const packagePath = path.join(manuscriptsRoot, normalizePathForStore(manuscriptPath));
+  const assetsPath = path.join(packagePath, 'assets.json');
+  const coverPath = path.join(packagePath, 'cover.json');
+  const imagesPath = path.join(packagePath, 'images.json');
+
+  const assetsJson = await readJsonFile<{ items: Array<Record<string, unknown>> }>(assetsPath, { items: [] });
+  assetsJson.items = (assetsJson.items || []).filter((item) => String(item.assetId || '') !== assetId);
+  await writeJsonFile(assetsPath, assetsJson);
+
+  const coverJson = await readJsonFile<Record<string, unknown>>(coverPath, { assetId: null });
+  if (String(coverJson.assetId || '') === assetId) {
+    await writeJsonFile(coverPath, { assetId: null, updatedAt: nowIso() });
+  }
+
+  const imagesJson = await readJsonFile<{ items: Array<Record<string, unknown>> }>(imagesPath, { items: [] });
+  imagesJson.items = (imagesJson.items || []).filter((item) => String(item.assetId || '') !== assetId);
+  await writeJsonFile(imagesPath, imagesJson);
+
+  await syncPackageTimelineForAsset(packagePath, {
+    id: assetId,
+    source: 'imported',
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+  }, 'remove');
 }
 
 export async function listMediaAssets(limit = 200): Promise<MediaAsset[]> {
@@ -200,6 +474,49 @@ export async function createGeneratedMediaAsset(input: {
   catalog.assets.push(asset);
   await writeCatalog(catalog);
   return asset;
+}
+
+export async function importMediaFiles(filePaths: string[]): Promise<MediaAsset[]> {
+  await ensureMediaDirs();
+  const catalog = await readCatalog();
+  const imported: MediaAsset[] = [];
+
+  for (const rawPath of filePaths) {
+    const absoluteSourcePath = path.resolve(path.normalize(rawPath));
+    const stat = await fs.stat(absoluteSourcePath).catch(() => null);
+    if (!stat?.isFile()) {
+      continue;
+    }
+
+    const sourceName = path.basename(absoluteSourcePath);
+    const ext = path.extname(sourceName).toLowerCase();
+    const mimeType = guessMimeTypeByExtension(sourceName);
+    const assetId = `media_${Date.now()}_${randomUUID().slice(0, 8)}`;
+    const safeBaseName = sanitizeImportedFileBaseName(sourceName);
+    const targetFileName = `${assetId}_${safeBaseName}${ext}`;
+    const relativePath = normalizePathForStore(path.join('imported', targetFileName));
+    const absoluteTargetPath = path.join(getMediaRootDir(), relativePath);
+    await fs.copyFile(absoluteSourcePath, absoluteTargetPath);
+
+    const timestamp = nowIso();
+    const asset: MediaAsset = {
+      id: assetId,
+      source: 'imported',
+      title: path.basename(sourceName, ext) || safeBaseName,
+      mimeType,
+      relativePath,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    catalog.assets.push(asset);
+    imported.push(asset);
+  }
+
+  if (imported.length > 0) {
+    await writeCatalog(catalog);
+  }
+
+  return imported;
 }
 
 export async function ensurePlannedMediaAssetsForProject(input: {
@@ -260,6 +577,7 @@ export async function ensurePlannedMediaAssetsForProject(input: {
 export async function bindMediaAssetToManuscript(input: {
   assetId: string;
   manuscriptPath: string;
+  role?: 'cover' | 'image' | 'asset';
 }): Promise<MediaAsset> {
   const catalog = await readCatalog();
   const asset = catalog.assets.find((item) => item.id === input.assetId);
@@ -272,9 +590,7 @@ export async function bindMediaAssetToManuscript(input: {
   asset.updatedAt = nowIso();
   await writeCatalog(catalog);
 
-  if (asset.relativePath) {
-    await updateManuscriptBinding(boundPath, asset);
-  }
+  await updateManuscriptBinding(boundPath, asset, input.role || 'asset');
 
   return asset;
 }

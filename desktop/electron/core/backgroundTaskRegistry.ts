@@ -36,6 +36,7 @@ export interface BackgroundTaskProgressTurn {
 export interface BackgroundTaskRecord {
   id: string;
   kind: BackgroundTaskKind;
+  spaceId?: string;
   title: string;
   workItemId?: string;
   status: BackgroundTaskStatus;
@@ -86,7 +87,7 @@ export class BackgroundTaskRegistry extends EventEmitter {
   private cancelHandles = new Map<string, CancelHandle>();
 
   private getStorePath(): string {
-    return path.join(getWorkspacePaths().redclaw, 'background-tasks.json');
+    return path.join(getWorkspacePaths().workspaceRoot, 'redclaw', 'background-tasks.json');
   }
 
   private async ensureLoaded(): Promise<void> {
@@ -150,12 +151,14 @@ export class BackgroundTaskRegistry extends EventEmitter {
     contextId?: string;
     sessionId?: string;
     workItemId?: string;
+    spaceId?: string;
   }): Promise<BackgroundTaskRecord> {
     await this.ensureLoaded();
     const now = nowIso();
     const task: BackgroundTaskRecord = {
       id: input.id || nextId('bg_task'),
       kind: input.kind,
+      spaceId: input.spaceId || getWorkspacePaths().activeSpaceId,
       title: input.title,
       workItemId: input.workItemId,
       status: 'running',

@@ -243,14 +243,21 @@ export async function buildRuntimeBaseSystemPrompt(params?: {
   runtimeMode?: string;
   interactive?: boolean;
   customRules?: string;
+  forcedSkillNames?: string[];
   workspacePaths?: WorkspacePaths;
 }): Promise<string> {
   const toolPack = resolveBuiltinToolPack(params?.runtimeMode);
   const workspacePaths = params?.workspacePaths || getWorkspacePaths();
+  const normalizedForcedSkillNames = Array.from(new Set(
+    Array.isArray(params?.forcedSkillNames)
+      ? params!.forcedSkillNames.map((item) => String(item || '').trim()).filter(Boolean)
+      : [],
+  )).sort((a, b) => a.localeCompare(b, 'zh-CN'));
   const cacheKey = JSON.stringify({
     runtimeMode: params?.runtimeMode || 'redclaw',
     interactive: params?.interactive ?? true,
     customRules: params?.customRules || '',
+    forcedSkillNames: normalizedForcedSkillNames,
     base: path.resolve(workspacePaths.base),
     workspaceRoot: path.resolve(workspacePaths.workspaceRoot),
     toolPack,
@@ -261,11 +268,15 @@ export async function buildRuntimeBaseSystemPrompt(params?: {
   }
   const skillManager = new SkillManager();
   await skillManager.discoverSkills(workspacePaths.base);
+  for (const skillName of normalizedForcedSkillNames) {
+    await skillManager.activateSkill(skillName);
+  }
   const value = await buildDefaultSystemPrompt({
     skills: skillManager.getSkills(),
     tools: createBuiltinTools({ pack: toolPack, skillManager }),
     interactive: params?.interactive ?? true,
     customRules: params?.customRules,
+    activatedSkillContent: skillManager.getActiveSkillContents().join('\n\n'),
     workspacePaths,
   });
   runtimeBasePromptCache.set(cacheKey, {

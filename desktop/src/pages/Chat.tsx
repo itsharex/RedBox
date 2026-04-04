@@ -51,6 +51,7 @@ interface ChatProps {
   messageWorkflowPlacement?: 'top' | 'bottom';
   messageWorkflowVariant?: 'default' | 'compact';
   messageWorkflowEmphasis?: 'default' | 'thoughts-first';
+  surfaceTone?: 'default' | 'dark';
 }
 
 interface UploadedFileAttachment {
@@ -379,6 +380,7 @@ export function Chat({
   messageWorkflowPlacement = 'bottom',
   messageWorkflowVariant = 'compact',
   messageWorkflowEmphasis = 'default',
+  surfaceTone = 'default',
 }: ChatProps) {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
@@ -1750,6 +1752,7 @@ export function Chat({
       ? 'text-amber-500'
       : 'text-emerald-500';
   const isCompactWorkflowMode = Boolean(fixedSessionId && fixedSessionContextIndicatorMode === 'corner-ring');
+  const darkSurface = surfaceTone === 'dark';
 
   return (
     <div className={clsx('flex h-full min-w-0', wideContent && 'chat-layout-wide', narrowContent && 'chat-layout-narrow')}>
@@ -1803,7 +1806,7 @@ export function Chat({
       )}
 
       {/* Main Chat Area */}
-      <div className="flex-1 min-w-0 flex flex-col h-full relative overflow-hidden">
+      <div className={clsx('flex-1 min-w-0 flex flex-col h-full relative overflow-hidden', darkSurface && 'bg-[#121212] text-white')}>
         {/* Header - Sidebar Controls - Hide if fixed session */}
         {!fixedSessionId && (
           <div className="absolute top-4 left-4 z-20 flex items-center gap-2">
@@ -1923,9 +1926,9 @@ export function Chat({
 
               {/* 欢迎文字 */}
               <div className="space-y-2">
-                <h1 className="text-2xl font-semibold text-text-primary">{welcomeTitle}</h1>
+                <h1 className={clsx('text-2xl font-semibold', darkSurface ? 'text-white' : 'text-text-primary')}>{welcomeTitle}</h1>
                 {welcomeSubtitle ? (
-                  <p className="text-sm text-text-tertiary">{welcomeSubtitle}</p>
+                  <p className={clsx('text-sm', darkSurface ? 'text-white/45' : 'text-text-tertiary')}>{welcomeSubtitle}</p>
                 ) : null}
               </div>
 
@@ -1935,7 +1938,12 @@ export function Chat({
                     <button
                       key={shortcut.label}
                       onClick={() => sendMessage(shortcut.text)}
-                      className="px-3 py-1.5 bg-surface-secondary hover:bg-surface-tertiary border border-transparent hover:border-border rounded-full text-text-secondary hover:text-accent-primary transition-all cursor-pointer"
+                      className={clsx(
+                        'px-3 py-1.5 rounded-full transition-all cursor-pointer',
+                        darkSurface
+                          ? 'bg-white/[0.04] border border-white/10 text-white/65 hover:border-cyan-400/25 hover:text-cyan-300'
+                          : 'bg-surface-secondary hover:bg-surface-tertiary border border-transparent hover:border-border text-text-secondary hover:text-accent-primary'
+                      )}
                     >
                       {shortcut.label}
                     </button>
@@ -1946,7 +1954,12 @@ export function Chat({
               {/* 居中的输入框 (Codex Style) */}
               <form onSubmit={handleSubmit} className="relative w-full mt-10">
                 <ToolConfirmDialog request={confirmRequest} onConfirm={handleConfirmTool} onCancel={handleCancelTool} />
-                <div className="group relative flex flex-col w-full bg-[#fdfcf9] border border-[#edebe4] rounded-[28px] p-2 transition-all duration-200 focus-within:shadow-lg focus-within:border-accent-primary/20">
+                <div className={clsx(
+                  'group relative flex flex-col w-full rounded-[28px] p-2 transition-all duration-200',
+                  darkSurface
+                    ? 'bg-[#1a1a1a] border border-white/10 focus-within:border-cyan-400/25 focus-within:shadow-[0_0_0_1px_rgba(34,211,238,0.08)]'
+                    : 'bg-[#fdfcf9] border border-[#edebe4] focus-within:shadow-lg focus-within:border-accent-primary/20'
+                )}>
                   <textarea
                     ref={inputRef}
                     value={input}
@@ -1962,27 +1975,33 @@ export function Chat({
                       }
                     }}
                     placeholder="问我任何问题，使用 @ 引用文件，/ 执行指令..."
-                    className="w-full bg-transparent px-4 py-3 text-[16px] text-text-primary placeholder:text-[#b4b2a8] focus:outline-none resize-none min-h-[100px] overflow-y-auto"
+                    className={clsx(
+                      'w-full bg-transparent px-4 py-3 text-[16px] focus:outline-none resize-none min-h-[100px] overflow-y-auto',
+                      darkSurface ? 'text-white placeholder:text-white/30' : 'text-text-primary placeholder:text-[#b4b2a8]'
+                    )}
                     disabled={isProcessing}
                     autoFocus
                     rows={1}
                   />
                   <div className="flex items-center justify-between px-2 pb-1">
                     <div className="flex items-center gap-1">
-                      <button type="button" onClick={() => void pickAttachment()} className="p-2 text-text-tertiary hover:text-text-secondary transition-colors" title="添加文件">
+                      <button type="button" onClick={() => void pickAttachment()} className={clsx('p-2 transition-colors', darkSurface ? 'text-white/45 hover:text-white/80' : 'text-text-tertiary hover:text-text-secondary')} title="添加文件">
                         <Plus className="w-[18px] h-[18px]" />
                       </button>
                       <div ref={modelPickerRef} className="relative flex items-center gap-4 px-2">
                         <button
                           type="button"
                           onClick={() => setShowModelPicker((prev) => !prev)}
-                          className="flex items-center gap-1.5 text-text-tertiary hover:text-text-secondary transition-colors text-[13px] font-medium"
+                          className={clsx('flex items-center gap-1.5 transition-colors text-[13px] font-medium', darkSurface ? 'text-white/45 hover:text-white/80' : 'text-text-tertiary hover:text-text-secondary')}
                         >
                           <span className="max-w-[180px] truncate">{selectedChatModel?.modelName || '默认模型'}</span>
                           <ChevronDown className={clsx('w-3.5 h-3.5 transition-transform', showModelPicker && 'rotate-180')} />
                         </button>
                         {showModelPicker && (
-                          <div className="absolute left-0 bottom-full mb-2 w-72 max-h-72 overflow-auto rounded-xl border border-border bg-surface-primary shadow-xl z-[130]">
+                          <div className={clsx(
+                            'absolute left-0 bottom-full mb-2 w-72 max-h-72 overflow-auto rounded-xl shadow-xl z-[130]',
+                            darkSurface ? 'border border-white/10 bg-[#181818]' : 'border border-border bg-surface-primary'
+                          )}>
                             {chatModelOptions.length ? chatModelOptions.map((option) => {
                               const active = option.key === selectedChatModelKey;
                               return (
@@ -1995,15 +2014,17 @@ export function Chat({
                                   }}
                                   className={clsx(
                                     'w-full px-3 py-2.5 text-left transition-colors',
-                                    active ? 'bg-accent-primary/10 text-text-primary' : 'hover:bg-surface-secondary/50 text-text-secondary'
+                                    darkSurface
+                                      ? (active ? 'bg-cyan-500/10 text-white' : 'hover:bg-white/[0.04] text-white/70')
+                                      : (active ? 'bg-accent-primary/10 text-text-primary' : 'hover:bg-surface-secondary/50 text-text-secondary')
                                   )}
                                 >
                                   <div className="text-sm font-medium truncate">{option.modelName}</div>
-                                  <div className="text-[11px] text-text-tertiary truncate">{option.sourceName}</div>
+                                  <div className={clsx('text-[11px] truncate', darkSurface ? 'text-white/35' : 'text-text-tertiary')}>{option.sourceName}</div>
                                 </button>
                               );
                             }) : (
-                              <div className="px-3 py-2 text-sm text-text-tertiary">请先在设置里配置模型源</div>
+                              <div className={clsx('px-3 py-2 text-sm', darkSurface ? 'text-white/35' : 'text-text-tertiary')}>请先在设置里配置模型源</div>
                             )}
                           </div>
                         )}
@@ -2012,14 +2033,14 @@ export function Chat({
                     <div className="flex items-center gap-2">
                       <button
                         type="button"
-                        onClick={handleAudioInput}
-                        disabled={isTranscribingAudio}
-                        className={clsx(
-                          'p-2 transition-colors',
-                          isRecordingAudio ? 'text-red-500 hover:text-red-600' : 'text-text-tertiary hover:text-text-secondary',
-                          isTranscribingAudio && 'opacity-60 cursor-not-allowed'
-                        )}
-                        title={isTranscribingAudio ? '语音转录中' : isRecordingAudio ? '停止录音并转写' : '语音输入'}
+                            onClick={handleAudioInput}
+                            disabled={isTranscribingAudio}
+                            className={clsx(
+                              'p-2 transition-colors',
+                              isRecordingAudio ? 'text-red-500 hover:text-red-600' : (darkSurface ? 'text-white/45 hover:text-white/80' : 'text-text-tertiary hover:text-text-secondary'),
+                              isTranscribingAudio && 'opacity-60 cursor-not-allowed'
+                            )}
+                            title={isTranscribingAudio ? '语音转录中' : isRecordingAudio ? '停止录音并转写' : '语音输入'}
                       >
                         {isTranscribingAudio ? (
                           <Loader2 className="w-[18px] h-[18px] animate-spin" />
@@ -2029,16 +2050,30 @@ export function Chat({
                           <Mic className="w-[18px] h-[18px]" />
                         )}
                       </button>
-                      <button type="submit" disabled={(!input.trim() && !pendingAttachment) || isProcessing} className={clsx("w-9 h-9 flex items-center justify-center rounded-full transition-all duration-200", input.trim() || pendingAttachment ? "bg-[#b4b2a8] text-white hover:bg-accent-primary" : "bg-[#edebe4] text-white opacity-60")}>
-                        {isProcessing ? <Loader2 className="w-4 h-4 animate-spin text-[#b4b2a8]" /> : <ArrowUp className="w-5 h-5" />}
+                      <button
+                        type="submit"
+                        disabled={(!input.trim() && !pendingAttachment) || isProcessing}
+                        className={clsx(
+                          'w-9 h-9 flex items-center justify-center rounded-full transition-all duration-200',
+                          input.trim() || pendingAttachment
+                            ? (darkSurface ? 'bg-cyan-500 text-white hover:bg-cyan-400' : 'bg-[#b4b2a8] text-white hover:bg-accent-primary')
+                            : (darkSurface ? 'bg-white/10 text-white/55 opacity-70' : 'bg-[#edebe4] text-white opacity-60')
+                        )}
+                      >
+                        {isProcessing ? <Loader2 className={clsx('w-4 h-4 animate-spin', darkSurface ? 'text-cyan-300' : 'text-[#b4b2a8]')} /> : <ArrowUp className="w-5 h-5" />}
                       </button>
                     </div>
                   </div>
                 </div>
                 {pendingAttachment && (
-                  <div className="mt-3 mx-4 rounded-lg border border-border bg-surface-secondary/60 px-3 py-2 text-xs text-text-secondary flex items-center justify-between">
+                  <div className={clsx(
+                    'mt-3 mx-4 rounded-lg px-3 py-2 text-xs flex items-center justify-between',
+                    darkSurface
+                      ? 'border border-white/10 bg-white/[0.05] text-white/70'
+                      : 'border border-border bg-surface-secondary/60 text-text-secondary'
+                  )}>
                     <span className="truncate">附件: {pendingAttachment.name}</span>
-                    <button type="button" onClick={() => setPendingAttachment(null)} className="ml-2 text-text-tertiary hover:text-text-primary">
+                    <button type="button" onClick={() => setPendingAttachment(null)} className={clsx('ml-2', darkSurface ? 'text-white/45 hover:text-white/80' : 'text-text-tertiary hover:text-text-primary')}>
                       <FileX className="w-3.5 h-3.5" />
                     </button>
                   </div>
@@ -2099,7 +2134,7 @@ export function Chat({
             </div>
 
             {/* Input Area - Bottom Fixed */}
-            <div className={clsx('bg-surface-primary pb-4 pt-2 md:pb-5', contentOuterPaddingClass)}>
+            <div className={clsx(darkSurface ? 'bg-[#121212] pb-4 pt-2 md:pb-5' : 'bg-surface-primary pb-4 pt-2 md:pb-5', contentOuterPaddingClass)}>
               <div className={clsx('mx-auto space-y-3.5', contentMaxWidthClass, contentWidthClass)}>
                 {errorNotice && (
                   <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">{errorNotice}</div>
@@ -2107,7 +2142,17 @@ export function Chat({
                 {showComposerShortcuts && shortcuts.length > 0 && (
                   <div className="flex gap-2 overflow-x-auto py-1 no-scrollbar">
                     {shortcuts.map((shortcut) => (
-                      <button key={shortcut.label} onClick={() => sendMessage(shortcut.text)} disabled={isProcessing} className="flex-shrink-0 rounded-full border border-border bg-surface-primary px-3 py-1.5 text-xs text-text-secondary transition-colors hover:border-accent-primary/30 hover:text-accent-primary disabled:opacity-50">
+                      <button
+                        key={shortcut.label}
+                        onClick={() => sendMessage(shortcut.text)}
+                        disabled={isProcessing}
+                        className={clsx(
+                          'flex-shrink-0 rounded-full px-3 py-1.5 text-xs transition-colors disabled:opacity-50',
+                          darkSurface
+                            ? 'border border-white/10 bg-[#1a1a1a] text-white/70 hover:border-cyan-400/30 hover:text-cyan-300'
+                            : 'border border-border bg-surface-primary text-text-secondary hover:border-accent-primary/30 hover:text-accent-primary'
+                        )}
+                      >
                         {shortcut.label}
                       </button>
                     ))}
@@ -2117,12 +2162,22 @@ export function Chat({
                 <form onSubmit={handleSubmit} className="relative w-full">
                   <ToolConfirmDialog request={confirmRequest} onConfirm={handleConfirmTool} onCancel={handleCancelTool} />
                   {pendingAttachment && (
-                    <div className="mb-3 rounded-lg border border-border bg-surface-secondary/60 px-3 py-2 text-xs text-text-secondary flex items-center justify-between">
+                    <div className={clsx(
+                      'mb-3 rounded-lg px-3 py-2 text-xs flex items-center justify-between',
+                      darkSurface
+                        ? 'border border-white/10 bg-white/[0.05] text-white/70'
+                        : 'border border-border bg-surface-secondary/60 text-text-secondary'
+                    )}>
                       <span className="truncate">附件: {pendingAttachment.name}</span>
                       <button type="button" onClick={() => setPendingAttachment(null)} className="ml-2 text-text-tertiary hover:text-text-primary"><FileX className="w-3.5 h-3.5" /></button>
                     </div>
                   )}
-                  <div className="group relative flex flex-col w-full bg-[#fdfcf9] border border-[#edebe4] rounded-[24px] p-1.5 transition-all duration-200 focus-within:shadow-lg focus-within:border-accent-primary/20">
+                  <div className={clsx(
+                    'group relative flex flex-col w-full rounded-[24px] p-1.5 transition-all duration-200',
+                    darkSurface
+                      ? 'bg-[#1a1a1a] border border-white/10 focus-within:border-cyan-400/25 focus-within:shadow-[0_0_0_1px_rgba(34,211,238,0.08)]'
+                      : 'bg-[#fdfcf9] border border-[#edebe4] focus-within:shadow-lg focus-within:border-accent-primary/20'
+                  )}>
                     <textarea
                       ref={inputRef}
                       value={input}
@@ -2138,20 +2193,23 @@ export function Chat({
                         }
                       }}
                       placeholder="发送消息..."
-                      className="w-full bg-transparent px-3.5 py-2.5 text-[14px] text-text-primary placeholder:text-[#b4b2a8] focus:outline-none resize-none min-h-[72px] max-h-[280px] overflow-y-auto"
+                      className={clsx(
+                        'w-full bg-transparent px-3.5 py-2.5 text-[14px] focus:outline-none resize-none min-h-[72px] max-h-[280px] overflow-y-auto',
+                        darkSurface ? 'text-white placeholder:text-white/30' : 'text-text-primary placeholder:text-[#b4b2a8]'
+                      )}
                       disabled={isProcessing}
                       rows={1}
                     />
                     <div className="flex items-center justify-between px-1.5 pb-0.5">
                       <div className="flex items-center gap-1">
-                        <button type="button" onClick={() => void pickAttachment()} className="p-2 text-text-tertiary hover:text-text-secondary transition-colors" title="添加文件">
+                        <button type="button" onClick={() => void pickAttachment()} className={clsx('p-2 transition-colors', darkSurface ? 'text-white/45 hover:text-white/80' : 'text-text-tertiary hover:text-text-secondary')} title="添加文件">
                           <Plus className="w-[18px] h-[18px]" />
                         </button>
                         <div ref={modelPickerRef} className="relative flex items-center gap-4 px-2">
                           <button
                             type="button"
                             onClick={() => setShowModelPicker((prev) => !prev)}
-                            className="flex items-center gap-1.5 text-text-tertiary hover:text-text-secondary transition-colors text-[13px] font-medium"
+                            className={clsx('flex items-center gap-1.5 transition-colors text-[13px] font-medium', darkSurface ? 'text-white/45 hover:text-white/80' : 'text-text-tertiary hover:text-text-secondary')}
                           >
                             <span className="max-w-[180px] truncate">{selectedChatModel?.modelName || '默认模型'}</span>
                             <ChevronDown className={clsx('w-3.5 h-3.5 transition-transform', showModelPicker && 'rotate-180')} />
@@ -2186,7 +2244,7 @@ export function Chat({
                       </div>
                       <div className="flex items-center gap-2">
                         {isProcessing ? (
-                          <button type="button" onClick={handleCancel} className="p-2 text-red-500 hover:bg-red-50 rounded-lg transition-colors" title="停止生成"><StopCircle className="w-5 h-5" /></button>
+                          <button type="button" onClick={handleCancel} className={clsx('p-2 rounded-lg transition-colors text-red-500', darkSurface ? 'hover:bg-red-500/10' : 'hover:bg-red-50')} title="停止生成"><StopCircle className="w-5 h-5" /></button>
                         ) : (
                           <button
                             type="button"
@@ -2194,7 +2252,7 @@ export function Chat({
                             disabled={isTranscribingAudio}
                             className={clsx(
                               'p-2 transition-colors',
-                              isRecordingAudio ? 'text-red-500 hover:text-red-600' : 'text-text-tertiary hover:text-text-secondary',
+                              isRecordingAudio ? 'text-red-500 hover:text-red-600' : (darkSurface ? 'text-white/45 hover:text-white/80' : 'text-text-tertiary hover:text-text-secondary'),
                               isTranscribingAudio && 'opacity-60 cursor-not-allowed'
                             )}
                             title={isTranscribingAudio ? '语音转录中' : isRecordingAudio ? '停止录音并转写' : '语音输入'}
@@ -2208,8 +2266,17 @@ export function Chat({
                             )}
                           </button>
                         )}
-                        <button type="submit" disabled={(!input.trim() && !pendingAttachment) || isProcessing} className={clsx("w-9 h-9 flex items-center justify-center rounded-full transition-all duration-200", input.trim() || pendingAttachment ? "bg-[#b4b2a8] text-white hover:bg-accent-primary" : "bg-[#edebe4] text-white opacity-60")}>
-                          {isProcessing ? <Loader2 className="w-4 h-4 animate-spin text-[#b4b2a8]" /> : <ArrowUp className="w-5 h-5" />}
+                        <button
+                          type="submit"
+                          disabled={(!input.trim() && !pendingAttachment) || isProcessing}
+                          className={clsx(
+                            'w-9 h-9 flex items-center justify-center rounded-full transition-all duration-200',
+                            input.trim() || pendingAttachment
+                              ? (darkSurface ? 'bg-cyan-500 text-white hover:bg-cyan-400' : 'bg-[#b4b2a8] text-white hover:bg-accent-primary')
+                              : (darkSurface ? 'bg-white/10 text-white/55 opacity-70' : 'bg-[#edebe4] text-white opacity-60')
+                          )}
+                        >
+                          {isProcessing ? <Loader2 className={clsx('w-4 h-4 animate-spin', darkSurface ? 'text-cyan-300' : 'text-[#b4b2a8]')} /> : <ArrowUp className="w-5 h-5" />}
                         </button>
                       </div>
                     </div>

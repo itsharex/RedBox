@@ -906,12 +906,33 @@ export async function markMemoryAccessed(id: string): Promise<void> {
   await writeData(data);
 }
 
-export async function getLongTermMemoryPrompt(maxItems = 30): Promise<string> {
-  const data = await readData();
+export async function getLongTermMemoryPrompt(maxItems = 30, workspaceBase?: string): Promise<string> {
+  const data = workspaceBase
+    ? await (async () => {
+        const filePath = path.join(workspaceBase, MEMORY_DIR, MEMORY_FILE);
+        try {
+          const raw = await fs.readFile(filePath, 'utf-8');
+          const parsed = JSON.parse(raw) as Partial<MemoryFileData>;
+          return normalizeAndPruneData({
+            version: Number(parsed.version || 1),
+            updatedAt: Number(parsed.updatedAt || now()),
+            memories: Array.isArray(parsed.memories) ? parsed.memories as FileUserMemory[] : [],
+            history: Array.isArray(parsed.history) ? parsed.history as MemoryHistoryEntry[] : [],
+          });
+        } catch {
+          return defaultData();
+        }
+      })()
+    : await readData();
   const memories = sortMemories(activeMemoriesOf(data.memories));
   const curatedMemoryMarkdown = await (async () => {
     try {
-      return await fs.readFile(curatedMemoryFilePath(), 'utf-8');
+      return await fs.readFile(
+        workspaceBase
+          ? path.join(workspaceBase, MEMORY_DIR, CURATED_MEMORY_FILE)
+          : curatedMemoryFilePath(),
+        'utf-8',
+      );
     } catch {
       return '';
     }

@@ -76,7 +76,7 @@ const ensureBuiltinToolDescriptorsRegistered = (): void => {
         failureSignal: 'workspace write/edit failed or unsupported action was blocked',
         artifactOutput: ['file'],
         retryPolicy: 'manual',
-        create: () => new WorkspaceTool(),
+        create: ({ workspaceRootOverride }) => new WorkspaceTool(workspaceRootOverride),
     });
     register({
         name: 'bash',
@@ -91,14 +91,14 @@ const ensureBuiltinToolDescriptorsRegistered = (): void => {
         failureSignal: 'command blocked or failed',
         artifactOutput: ['command-output'],
         retryPolicy: 'manual',
-        create: () => new BashTool(),
+        create: ({ workspaceRootOverride }) => new BashTool(workspaceRootOverride),
     });
     register({
         name: 'app_cli',
         displayName: 'App CLI',
         description: 'CLI-style app control layer for spaces, manuscripts, media, RedClaw and settings.',
         kind: ToolKind.Execute,
-        contexts: publicAllContexts,
+        contexts: ['redclaw', 'diagnostics'],
         visibility: 'public',
         requiresContext: null,
         preconditions: ['command must use supported namespace/action'],
@@ -203,6 +203,7 @@ export function createBuiltinTools(options: {
     chatService?: any;
     skillManager?: any;
     onSkillActivated?: (payload: { name: string; description: string }) => void;
+    workspaceRootOverride?: string;
     pack?: BuiltinToolPack;
 } = {}): ToolDefinition<unknown, ToolResult>[] {
     ensureBuiltinToolDescriptorsRegistered();

@@ -7,7 +7,7 @@ if [[ $# -lt 1 ]]; then
 fi
 
 TAG="$1"
-ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
 REPO="${REDBOX_PUBLIC_REPO:-Jamailar/RedBox}"
 VERSION="${TAG#v}"
 NOTES_FILE="$(mktemp -t redbox-release-notes.XXXXXX.md)"

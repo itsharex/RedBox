@@ -33,6 +33,14 @@ export class EditTool extends DeclarativeTool<typeof EditToolParamsSchema> {
     readonly parameterSchema = EditToolParamsSchema;
     readonly requiresConfirmation = false; // Opencode allows edits on certain files, user can override
 
+    constructor(private readonly workspaceRootOverride?: string) {
+        super();
+    }
+
+    private getWorkspaceRoot(): string {
+        return this.workspaceRootOverride || Instance.directory;
+    }
+
     protected validateValues(params: EditToolParams): string | null {
         if (params.oldString === params.newString) {
             return "oldString and newString must be different.";
@@ -48,7 +56,7 @@ export class EditTool extends DeclarativeTool<typeof EditToolParamsSchema> {
         try {
             let filePath = params.filePath;
             try {
-                filePath = resolvePathInWorkspace(filePath, Instance.directory);
+                filePath = resolvePathInWorkspace(filePath, this.getWorkspaceRoot());
             } catch (error) {
                 const message = error instanceof Error ? error.message : String(error);
                 return createErrorResult(message, ToolErrorType.PERMISSION_DENIED);
