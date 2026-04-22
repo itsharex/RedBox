@@ -84,11 +84,17 @@ import {
 } from './core/fileMemoryStore';
 import { getRedClawProject, listRedClawProjects } from './core/redclawStore';
 import {
+  handleRedClawOnboardingTurn,
+  loadRedClawProfilePromptBundle,
+  updateRedClawProfileDocument,
+} from './core/redclawProfileStore';
+import {
   listMediaAssets,
   bindMediaAssetToManuscript,
   updateMediaAssetMetadata,
   deleteMediaAsset,
   importMediaFiles,
+  importMediaSources,
   getAbsoluteMediaPath,
   type MediaAsset,
 } from './core/mediaLibraryStore';
@@ -100,15 +106,14 @@ import {
   saveCoverTemplateImage,
   type CoverAsset,
 } from './core/coverStudioStore';
-import { getRedClawBackgroundRunner } from './core/redclawBackgroundRunner';
-import { getAdvisorYoutubeBackgroundRunner, getDefaultAdvisorYoutubeChannelConfig } from './core/advisorYoutubeRunner';
+import {
+  deleteCoverTemplate,
+  importLegacyCoverTemplates,
+  listCoverTemplates,
+  saveCoverTemplate,
+} from './core/coverTemplateStore';
 import { loadOfficialFeatureModule } from './officialFeatureBridge';
-import { getMemoryMaintenanceService } from './core/memoryMaintenanceService';
-import { getBackgroundTaskRegistry } from './core/backgroundTaskRegistry';
-import { getHeadlessWorkerProcessManager } from './core/headlessWorkerProcessManager';
-import { getAssistantDaemonService } from './core/assistantDaemonService';
 import { applyGlobalNetworkProxy } from './core/networkProxy';
-import { getSessionBridgeService } from './core/sessionBridgeService';
 import {
   getDebugLogDirectory,
   getRecentDebugLogs,
@@ -230,8 +235,232 @@ let redClawRunnerListenersAttached = false;
 let backgroundTaskRegistryListenersAttached = false;
 let advisorYoutubeRunnerListenersAttached = false;
 let assistantDaemonListenersAttached = false;
+let workItemStoreListenersAttached = false;
 let appShutdownInProgress = false;
 let appShutdownPromise: Promise<void> | null = null;
+const MANUSCRIPT_TREE_CACHE_TTL_MS = 4000;
+const manuscriptTreeCache = new Map<string, { tree: unknown[]; generatedAt: number }>();
+type EditorRuntimeStateRecord = {
+  filePath: string;
+  sessionId?: string;
+  playheadSeconds: number;
+  selectedClipId?: string;
+  selectedClipIds?: unknown;
+  activeTrackId?: string;
+  selectedTrackIds?: unknown;
+  selectedSceneId?: string;
+  previewTab?: string;
+  canvasRatioPreset?: string;
+  activePanel?: string;
+  drawerPanel?: string;
+  sceneItemTransforms?: unknown;
+  sceneItemVisibility?: unknown;
+  sceneItemOrder?: unknown;
+  sceneItemLocks?: unknown;
+  sceneItemGroups?: unknown;
+  focusedGroupId?: string;
+  trackUi?: unknown;
+  viewportScrollLeft: number;
+  viewportMaxScrollLeft: number;
+  viewportScrollTop: number;
+  viewportMaxScrollTop: number;
+  timelineZoomPercent: number;
+  undoStack: unknown[];
+  redoStack: unknown[];
+  updatedAt: number;
+};
+const editorRuntimeStates = new Map<string, EditorRuntimeStateRecord>();
+
+function nowMs() {
+  return Date.now();
+}
+
+function buildEmptyEditorRuntimeState(filePath: string): EditorRuntimeStateRecord {
+  return {
+    filePath,
+    playheadSeconds: 0,
+    viewportScrollLeft: 0,
+    viewportMaxScrollLeft: 0,
+    viewportScrollTop: 0,
+    viewportMaxScrollTop: 0,
+    timelineZoomPercent: 100,
+    selectedClipIds: [],
+    selectedTrackIds: [],
+    undoStack: [],
+    redoStack: [],
+    updatedAt: nowMs(),
+  };
+}
+
+function serializeEditorRuntimeState(filePath: string) {
+  const state = editorRuntimeStates.get(filePath) || buildEmptyEditorRuntimeState(filePath);
+  return {
+    filePath: state.filePath,
+    sessionId: state.sessionId ?? null,
+    playheadSeconds: state.playheadSeconds,
+    selectedClipId: state.selectedClipId ?? null,
+    selectedClipIds: state.selectedClipIds ?? [],
+    activeTrackId: state.activeTrackId ?? null,
+    selectedTrackIds: state.selectedTrackIds ?? [],
+    selectedSceneId: state.selectedSceneId ?? null,
+    previewTab: state.previewTab ?? null,
+    canvasRatioPreset: state.canvasRatioPreset ?? null,
+    activePanel: state.activePanel ?? null,
+    drawerPanel: state.drawerPanel ?? null,
+    sceneItemTransforms: state.sceneItemTransforms ?? null,
+    sceneItemVisibility: state.sceneItemVisibility ?? null,
+    sceneItemOrder: state.sceneItemOrder ?? null,
+    sceneItemLocks: state.sceneItemLocks ?? null,
+    sceneItemGroups: state.sceneItemGroups ?? null,
+    focusedGroupId: state.focusedGroupId ?? null,
+    trackUi: state.trackUi ?? null,
+    viewportScrollLeft: state.viewportScrollLeft,
+    viewportMaxScrollLeft: state.viewportMaxScrollLeft,
+    viewportScrollTop: state.viewportScrollTop,
+    viewportMaxScrollTop: state.viewportMaxScrollTop,
+    timelineZoomPercent: state.timelineZoomPercent,
+    canUndo: state.undoStack.length > 0,
+    canRedo: state.redoStack.length > 0,
+    updatedAt: state.updatedAt,
+  };
+}
+
+function normalizeBindingText(value: unknown): string {
+  return String(value || '').trim();
+}
+
+function normalizeBindingMetadata(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? { ...(value as Record<string, unknown>) }
+    : {};
+}
+
+function deriveEditorBindingInitialContext(
+  binding: {
+    filePath?: string;
+    contextId: string;
+    modeLabel?: string;
+    targetTypeLabel?: string;
+    targetPath?: string;
+    initialContext?: string;
+  },
+  metadata: Record<string, unknown>,
+): string | undefined {
+  const explicit = normalizeBindingText(binding.initialContext);
+  if (explicit) {
+    return explicit;
+  }
+
+  const modeLabel = normalizeBindingText(binding.modeLabel)
+    || normalizeBindingText(metadata.associatedPackageWorkspaceModeLabel)
+    || normalizeBindingText(metadata.associatedPackageWorkspaceMode)
+    || '文件';
+  const targetTypeLabel = normalizeBindingText(binding.targetTypeLabel)
+    || normalizeBindingText(metadata.associatedPackageKind)
+    || '文件';
+  const targetPath = normalizeBindingText(binding.targetPath)
+    || normalizeBindingText(metadata.associatedFilePath)
+    || normalizeBindingText(binding.filePath)
+    || normalizeBindingText(binding.contextId);
+  if (!targetPath) {
+    return undefined;
+  }
+
+  return `当前聊天窗口正处于${modeLabel}模式，正在编辑的${targetTypeLabel}文件路径是${targetPath}`;
+}
+
+function emitRendererDataChanged(scope: string, payload: Record<string, unknown> = {}) {
+  for (const browserWindow of BrowserWindow.getAllWindows()) {
+    if (browserWindow.isDestroyed()) continue;
+    browserWindow.webContents.send('data:changed', {
+      scope,
+      ...payload,
+    });
+  }
+}
+
+function invalidateManuscriptTreeCache(scopePath?: string) {
+  if (scopePath) {
+    manuscriptTreeCache.delete(scopePath);
+    return;
+  }
+  manuscriptTreeCache.clear();
+}
+
+function attachWorkItemStoreListeners() {
+  if (workItemStoreListenersAttached) return;
+  workItemStoreListenersAttached = true;
+  getWorkItemStore().on('work-item-updated', (item: { id?: string } | null | undefined) => {
+    emitRendererDataChanged('work', {
+      action: 'store-update',
+      entityId: String(item?.id || '').trim() || undefined,
+    });
+  });
+}
+
+async function getRedClawBackgroundRunnerLazy() {
+  const module = await import('./core/redclawBackgroundRunner');
+  return module.getRedClawBackgroundRunner();
+}
+
+async function getAdvisorYoutubeRunnerLazy() {
+  const module = await import('./core/advisorYoutubeRunner');
+  return module.getAdvisorYoutubeBackgroundRunner();
+}
+
+async function getDefaultAdvisorYoutubeChannelConfigLazy(input?: unknown) {
+  const module = await import('./core/advisorYoutubeRunner');
+  return module.getDefaultAdvisorYoutubeChannelConfig(input as Parameters<typeof module.getDefaultAdvisorYoutubeChannelConfig>[0]);
+}
+
+async function getMemoryMaintenanceServiceLazy() {
+  const module = await import('./core/memoryMaintenanceService');
+  return module.getMemoryMaintenanceService();
+}
+
+async function getBackgroundTaskRegistryLazy() {
+  const module = await import('./core/backgroundTaskRegistry');
+  return module.getBackgroundTaskRegistry();
+}
+
+async function getAssistantDaemonServiceLazy() {
+  const module = await import('./core/assistantDaemonService');
+  return module.getAssistantDaemonService();
+}
+
+async function getSessionBridgeServiceLazy() {
+  const module = await import('./core/sessionBridgeService');
+  return module.getSessionBridgeService();
+}
+
+async function getHeadlessWorkerProcessManagerLazy() {
+  const module = await import('./core/headlessWorkerProcessManager');
+  return module.getHeadlessWorkerProcessManager();
+}
+
+async function shouldAutoStartAssistantDaemonAcrossSpaces(): Promise<boolean> {
+  const knownSpaceIds = Array.from(new Set([
+    ...listSpaces().map((item) => item.id),
+    getActiveSpaceId(),
+  ].filter(Boolean)));
+  for (const spaceId of knownSpaceIds) {
+    const configPath = path.join(getWorkspacePathsForSpace(spaceId).redclaw, 'assistant-daemon.json');
+    try {
+      const raw = await fs.readFile(configPath, 'utf-8');
+      const parsed = JSON.parse(raw) as {
+        enabled?: boolean;
+        autoStart?: boolean;
+      };
+      if (Boolean(parsed?.enabled) && parsed?.autoStart !== false) {
+        return true;
+      }
+    } catch {
+      // ignore missing or malformed configs; the daemon service validates on demand
+    }
+  }
+  return false;
+}
+
 const appStartupEpochMs = Date.now();
 const startupPhaseMarks = new Map<string, number>();
 const DOWNLOAD_RETRY_DELAYS_MS = [0, 600, 1600];
@@ -292,6 +521,71 @@ const REDCLAW_EXPAND_XHS_TO_WECHAT_TEMPLATE = loadPrompt(
 );
 let appUpdateLastNotifiedVersion = '';
 const advisorAvatarLocalizationInFlight = new Set<string>();
+type AdvisorSummaryRecord = {
+  id: string;
+  name: string;
+  avatar: string;
+  personality: string;
+  knowledgeLanguage: string;
+  createdAt: string;
+  hasYoutubeChannel: boolean;
+};
+type AdvisorDetailRecord = AdvisorSummaryRecord & {
+  systemPrompt: string;
+  knowledgeFiles: string[];
+};
+let advisorListCache: AdvisorSummaryRecord[] | null = null;
+const advisorDetailCache = new Map<string, AdvisorDetailRecord>();
+
+function invalidateAdvisorCache(advisorId?: string): void {
+  advisorListCache = null;
+  if (advisorId) {
+    advisorDetailCache.delete(advisorId);
+    return;
+  }
+  advisorDetailCache.clear();
+}
+
+async function buildAdvisorSummary(advisorId: string, config: Record<string, unknown>): Promise<AdvisorSummaryRecord> {
+  const advisorDir = path.join(getAdvisorsDir(), advisorId);
+  const configPath = path.join(advisorDir, 'config.json');
+  const avatar = String(config.avatar || '').trim();
+  if (avatar.startsWith('http')) {
+    localizeAdvisorAvatarInBackground(advisorDir, configPath, config);
+  }
+  return {
+    id: advisorId,
+    name: String(config.name || ''),
+    avatar: resolveAdvisorAvatarForList(advisorDir, config),
+    personality: String(config.personality || ''),
+    knowledgeLanguage: String(config.knowledgeLanguage || ''),
+    createdAt: String(config.createdAt || ''),
+    hasYoutubeChannel: Boolean((config.youtubeChannel as Record<string, unknown> | undefined)?.url),
+  };
+}
+
+async function buildAdvisorDetail(advisorId: string): Promise<AdvisorDetailRecord> {
+  const advisorDir = path.join(getAdvisorsDir(), advisorId);
+  const configPath = path.join(advisorDir, 'config.json');
+  const knowledgeDir = path.join(advisorDir, 'knowledge');
+  const content = await fs.readFile(configPath, 'utf-8');
+  const config = JSON.parse(content) as Record<string, unknown>;
+  const summary = await buildAdvisorSummary(advisorId, config);
+
+  let knowledgeFiles: string[] = [];
+  try {
+    const files = await fs.readdir(knowledgeDir);
+    knowledgeFiles = files.filter((f: string) => f.endsWith('.txt') || f.endsWith('.md'));
+  } catch {
+    knowledgeFiles = [];
+  }
+
+  return {
+    ...summary,
+    systemPrompt: String(config.systemPrompt || ''),
+    knowledgeFiles,
+  };
+}
 let localAssetProtocolsRegistered = false;
 const BROWSER_PLUGIN_BUNDLE_RELATIVE_PATH = path.join('.plugin-runtime', 'browser-extension');
 const BROWSER_PLUGIN_EXPORT_RELATIVE_PATH = path.join('integrations', 'browser-extension', 'redbox-capture');
@@ -749,6 +1043,7 @@ async function checkForAppUpdate(force = false, forceNotify = false): Promise<Ap
 }
 
 function createWindow() {
+  attachWorkItemStoreListeners();
   const iconPath = path.join(app.getAppPath(), 'redbox.png');
   const devIconPath = path.join(process.cwd(), 'desktop', 'redbox.png');
   const resolvedIconPath = app.isPackaged ? iconPath : devIconPath;
@@ -825,15 +1120,15 @@ async function shutdownBackgroundServices(): Promise<void> {
     };
 
     fileWatcher.stop();
-    getMemoryMaintenanceService().stop();
-    getAdvisorYoutubeBackgroundRunner().stop();
+    (await getMemoryMaintenanceServiceLazy()).stop();
+    (await getAdvisorYoutubeRunnerLazy()).stop();
 
     await Promise.allSettled([
       capture('http-server', () => stopHttpServer()),
-      capture('redclaw-runner', () => getRedClawBackgroundRunner().stop({ persist: false })),
-      capture('assistant-daemon', () => getAssistantDaemonService().dispose()),
-      capture('headless-workers', () => getHeadlessWorkerProcessManager().dispose()),
-      capture('session-bridge', () => getSessionBridgeService().stop()),
+      capture('redclaw-runner', async () => (await getRedClawBackgroundRunnerLazy()).stop({ persist: false })),
+      capture('assistant-daemon', async () => (await getAssistantDaemonServiceLazy()).dispose()),
+      capture('headless-workers', async () => (await getHeadlessWorkerProcessManagerLazy()).dispose()),
+      capture('session-bridge', async () => (await getSessionBridgeServiceLazy()).stop()),
     ]);
 
     if (errors.length > 0) {
@@ -855,9 +1150,9 @@ app.on('window-all-closed', async () => {
     }
     try {
       const [keepRedClawAlive, keepAdvisorYoutubeAlive, keepAssistantDaemonAlive] = await Promise.all([
-        getRedClawBackgroundRunner().shouldKeepAliveWhenNoWindow(),
-        getAdvisorYoutubeBackgroundRunner().shouldKeepAliveWhenNoWindow(),
-        getAssistantDaemonService().shouldKeepAliveWhenNoWindow(),
+        (await getRedClawBackgroundRunnerLazy()).shouldKeepAliveWhenNoWindow(),
+        (await getAdvisorYoutubeRunnerLazy()).shouldKeepAliveWhenNoWindow(),
+        (await getAssistantDaemonServiceLazy()).shouldKeepAliveWhenNoWindow(),
       ]);
       if (keepRedClawAlive || keepAdvisorYoutubeAlive || keepAssistantDaemonAlive) {
         console.log('[BackgroundRunner] Keep app alive in background (no window).', {
@@ -1373,15 +1668,15 @@ async function refreshForSpaceChange() {
 
   const { vectorStore } = await import('./core/vector/VectorStore');
   await vectorStore.refreshCache();
-  await getRedClawBackgroundRunner().reloadForWorkspaceChange();
-  await getMemoryMaintenanceService().reloadForWorkspaceChange();
-  await getAssistantDaemonService().reloadForWorkspaceChange();
+  await (await getRedClawBackgroundRunnerLazy()).reloadForWorkspaceChange();
+  await (await getMemoryMaintenanceServiceLazy()).reloadForWorkspaceChange();
+  await (await getAssistantDaemonServiceLazy()).reloadForWorkspaceChange();
 
   win?.webContents.send('space:changed', { activeSpaceId: getActiveSpaceId() });
 }
 
 async function initializeRedClawBackgroundRunner() {
-  const runner = getRedClawBackgroundRunner();
+  const runner = await getRedClawBackgroundRunnerLazy();
   if (!redClawRunnerListenersAttached) {
     runner.on('status', (status) => {
       win?.webContents.send('redclaw:runner-status', status);
@@ -1398,7 +1693,7 @@ async function initializeRedClawBackgroundRunner() {
 }
 
 async function initializeBackgroundTaskRegistry() {
-  const registry = getBackgroundTaskRegistry();
+  const registry = await getBackgroundTaskRegistryLazy();
   if (!backgroundTaskRegistryListenersAttached) {
     registry.on('task-updated', (task) => {
       win?.webContents.send('background:task-updated', task);
@@ -1408,7 +1703,7 @@ async function initializeBackgroundTaskRegistry() {
 }
 
 async function initializeAssistantDaemon() {
-  const daemon = getAssistantDaemonService();
+  const daemon = await getAssistantDaemonServiceLazy();
   if (!assistantDaemonListenersAttached) {
     daemon.on('status', (status) => {
       win?.webContents.send('assistant:daemon-status', status);
@@ -1422,7 +1717,7 @@ async function initializeAssistantDaemon() {
 }
 
 async function initializeSessionBridge() {
-  await getSessionBridgeService().start();
+  await (await getSessionBridgeServiceLazy()).start();
 }
 
 let startupCoreServicesPromise: Promise<void> | null = null;
@@ -1539,13 +1834,15 @@ app.whenReady().then(async () => {
       void (async () => {
         markStartupPhase('background-phase-2-start');
         try {
-          await initializeAssistantDaemon();
+          if (await shouldAutoStartAssistantDaemonAcrossSpaces()) {
+            await initializeAssistantDaemon();
+          }
         } catch (e) {
           console.error('[AssistantDaemon] Init failed:', e);
         }
 
         try {
-          getMemoryMaintenanceService().start();
+          (await getMemoryMaintenanceServiceLazy()).start();
         } catch (e) {
           console.error('[MemoryMaintenance] Init failed:', e);
         }
@@ -1558,7 +1855,7 @@ app.whenReady().then(async () => {
         markStartupPhase('background-phase-3-start');
         try {
           initializeTaskQueueWithExecutors();
-          const advisorYoutubeRunner = getAdvisorYoutubeBackgroundRunner();
+          const advisorYoutubeRunner = await getAdvisorYoutubeRunnerLazy();
           if (!advisorYoutubeRunnerListenersAttached) {
             advisorYoutubeRunner.on('progress', ({ advisorId, progress }) => {
               win?.webContents.send('advisors:download-progress', { advisorId, progress });
@@ -1659,6 +1956,29 @@ ipcMain.handle('db:get-settings', () => {
   return getSettings()
 })
 
+ipcMain.handle('settings:pick-workspace-dir', async () => {
+  try {
+    const picker = await dialog.showOpenDialog({
+      title: '选择工作区目录',
+      properties: ['openDirectory', 'createDirectory'],
+      defaultPath: getDefaultWorkspaceDir(),
+    });
+    if (picker.canceled || !picker.filePaths.length) {
+      return { success: true, canceled: true, path: null };
+    }
+    return {
+      success: true,
+      canceled: false,
+      path: picker.filePaths[0],
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+});
+
 ipcMain.handle('debug:get-status', () => {
   const settings = (getSettings() || {}) as { debug_log_enabled?: boolean } | undefined;
   return {
@@ -1671,6 +1991,23 @@ ipcMain.handle('debug:get-recent', (_event, payload?: { limit?: number }) => {
   const limit = Number(payload?.limit || 200);
   return {
     lines: getRecentDebugLogs(Number.isFinite(limit) ? Math.max(1, Math.min(limit, 1000)) : 200),
+  };
+});
+
+ipcMain.handle('debug:get-runtime-summary', () => {
+  return {
+    generatedAt: Date.now(),
+    runtimeWarm: {
+      lastWarmedAt: 0,
+      entries: [],
+    },
+    phase0: {
+      personaGeneration: { count: 0, byAdvisor: [], recent: [] },
+      knowledgeIngest: { count: 0, byAdvisor: [], recent: [] },
+      runtimeQueries: { count: 0, byAdvisor: [], byMode: [], recent: [] },
+      skillInvocations: { count: 0, bySkill: [], recent: [] },
+      toolCalls: { count: 0, successCount: 0, successRate: 0, byAdvisor: [], byTool: [], recent: [] },
+    },
   };
 });
 
@@ -1929,13 +2266,15 @@ ipcMain.handle('work:update', async (_event, payload?: {
   if (!id) {
     throw new Error('work item id is required');
   }
-  return getWorkItemStore().updateWorkItem(id, {
+  const updated = await getWorkItemStore().updateWorkItem(id, {
     title: payload?.title,
     description: payload?.description === null ? '' : payload?.description,
     status: payload?.status,
     priority: payload?.priority,
     summary: payload?.summary === null ? null : payload?.summary,
   });
+  emitRendererDataChanged('work', { action: 'update', entityId: id });
+  return updated;
 });
 
 ipcMain.handle('tasks:resume', async (_event, payload?: { taskId?: string }) => {
@@ -2032,6 +2371,59 @@ ipcMain.handle('app:open-release-page', async (_, payload?: { url?: string }) =>
     return {
       success: false,
       error: error instanceof Error ? error.message : String(error),
+    };
+  }
+});
+
+ipcMain.handle('app:open-path', async (_, payload?: { path?: string }) => {
+  const targetPath = String(payload?.path || '').trim();
+  if (!targetPath) {
+    return { success: false, error: 'path is required' };
+  }
+  try {
+    const openError = await shell.openPath(targetPath);
+    if (openError) {
+      return { success: false, error: openError };
+    }
+    return { success: true };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+});
+
+ipcMain.handle('app:open-knowledge-api-guide', async () => {
+  const guidePath = path.join(__dirname, '../Docs/openai-compatible-video-api.md');
+  try {
+    const openError = await shell.openPath(guidePath);
+    if (openError) {
+      return { success: false, error: openError, path: guidePath };
+    }
+    return { success: true, path: guidePath };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+      path: guidePath,
+    };
+  }
+});
+
+ipcMain.handle('app:open-richpost-theme-guide', async () => {
+  const docsPath = path.join(__dirname, '../Docs');
+  try {
+    const openError = await shell.openPath(docsPath);
+    if (openError) {
+      return { success: false, error: openError, path: docsPath };
+    }
+    return { success: true, path: docsPath };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+      path: docsPath,
     };
   }
 });
@@ -2203,31 +2595,31 @@ ipcMain.handle('memory:search', async (_, payload?: { query?: string; includeArc
 });
 
 ipcMain.handle('memory:maintenance-status', async () => {
-  return getMemoryMaintenanceService().getStatus();
+  return (await getMemoryMaintenanceServiceLazy()).getStatus();
 });
 
 ipcMain.handle('memory:maintenance-run', async () => {
-  return getMemoryMaintenanceService().runNow();
+  return (await getMemoryMaintenanceServiceLazy()).runNow();
 });
 
 ipcMain.handle('background-tasks:list', async () => {
-  return getBackgroundTaskRegistry().listTasks();
+  return (await getBackgroundTaskRegistryLazy()).listTasks();
 });
 
 ipcMain.handle('background-tasks:get', async (_, payload?: { taskId?: string }) => {
-  return getBackgroundTaskRegistry().getTask(String(payload?.taskId || ''));
+  return (await getBackgroundTaskRegistryLazy()).getTask(String(payload?.taskId || ''));
 });
 
 ipcMain.handle('background-tasks:cancel', async (_, payload?: { taskId?: string }) => {
-  return getBackgroundTaskRegistry().cancelTask(String(payload?.taskId || ''));
+  return (await getBackgroundTaskRegistryLazy()).cancelTask(String(payload?.taskId || ''));
 });
 
 ipcMain.handle('background-workers:get-pool-state', async () => {
-  return getHeadlessWorkerProcessManager().getPoolSnapshot();
+  return (await getHeadlessWorkerProcessManagerLazy()).getPoolSnapshot();
 });
 
 ipcMain.handle('assistant:daemon-status', async () => {
-  return getAssistantDaemonService().getStatus();
+  return (await getAssistantDaemonServiceLazy()).getStatus();
 });
 
 ipcMain.handle('assistant:daemon-start', async (_, payload: {
@@ -2264,7 +2656,7 @@ ipcMain.handle('assistant:daemon-start', async (_, payload: {
   };
 } = {}) => {
   try {
-    return await getAssistantDaemonService().start(payload);
+    return await (await getAssistantDaemonServiceLazy()).start(payload);
   } catch (error) {
     return { success: false, error: String(error) };
   }
@@ -2272,7 +2664,7 @@ ipcMain.handle('assistant:daemon-start', async (_, payload: {
 
 ipcMain.handle('assistant:daemon-stop', async () => {
   try {
-    return await getAssistantDaemonService().stop();
+    return await (await getAssistantDaemonServiceLazy()).stop();
   } catch (error) {
     return { success: false, error: String(error) };
   }
@@ -2313,7 +2705,7 @@ ipcMain.handle('assistant:daemon-set-config', async (_, payload: {
   };
 } = {}) => {
   try {
-    return await getAssistantDaemonService().setConfig(payload);
+    return await (await getAssistantDaemonServiceLazy()).setConfig(payload);
   } catch (error) {
     return { success: false, error: String(error) };
   }
@@ -2324,7 +2716,7 @@ ipcMain.handle('assistant:daemon-weixin-login-start', async (_, payload: {
   force?: boolean;
 } = {}) => {
   try {
-    return await getAssistantDaemonService().startWeixinLogin(payload);
+    return await (await getAssistantDaemonServiceLazy()).startWeixinLogin(payload);
   } catch (error) {
     return {
       success: false,
@@ -2339,7 +2731,7 @@ ipcMain.handle('assistant:daemon-weixin-login-wait', async (_, payload: {
   timeoutMs?: number;
 } = {}) => {
   try {
-    return await getAssistantDaemonService().waitForWeixinLogin(payload);
+    return await (await getAssistantDaemonServiceLazy()).waitForWeixinLogin(payload);
   } catch (error) {
     return {
       success: false,
@@ -2351,19 +2743,19 @@ ipcMain.handle('assistant:daemon-weixin-login-wait', async (_, payload: {
 
 ipcMain.handle('session-bridge:status', async () => {
   await ensureSessionBridgeStarted();
-  return getSessionBridgeService().getStatus();
+  return (await getSessionBridgeServiceLazy()).getStatus();
 });
 
 ipcMain.handle('session-bridge:list-sessions', async () => {
   await ensureSessionBridgeStarted();
-  return getSessionBridgeService().listSessions();
+  return (await getSessionBridgeServiceLazy()).listSessions();
 });
 
 ipcMain.handle('session-bridge:get-session', async (_, payload?: { sessionId?: string }) => {
   await ensureSessionBridgeStarted();
   const sessionId = String(payload?.sessionId || '').trim();
   if (!sessionId) return null;
-  return getSessionBridgeService().getSessionSnapshot(sessionId);
+  return (await getSessionBridgeServiceLazy()).getSessionSnapshot(sessionId);
 });
 
 ipcMain.handle('session-bridge:create-session', async (_, payload?: {
@@ -2373,7 +2765,7 @@ ipcMain.handle('session-bridge:create-session', async (_, payload?: {
   metadata?: Record<string, unknown>;
 }) => {
   await ensureSessionBridgeStarted();
-  return getSessionBridgeService().createSession(payload);
+  return (await getSessionBridgeServiceLazy()).createSession(payload);
 });
 
 ipcMain.handle('session-bridge:send-message', async (_, payload?: {
@@ -2386,13 +2778,13 @@ ipcMain.handle('session-bridge:send-message', async (_, payload?: {
   if (!sessionId || !message) {
     return { accepted: false, error: 'sessionId and message are required' };
   }
-  return getSessionBridgeService().sendSessionMessage(sessionId, message);
+  return (await getSessionBridgeServiceLazy()).sendSessionMessage(sessionId, message);
 });
 
 ipcMain.handle('session-bridge:list-permissions', async (_, payload?: { sessionId?: string }) => {
   await ensureSessionBridgeStarted();
   const sessionId = String(payload?.sessionId || '').trim();
-  return getSessionBridgeService().listPermissionRequests(sessionId || undefined);
+  return (await getSessionBridgeServiceLazy()).listPermissionRequests(sessionId || undefined);
 });
 
 ipcMain.handle('session-bridge:resolve-permission', async (_, payload?: {
@@ -2406,7 +2798,7 @@ ipcMain.handle('session-bridge:resolve-permission', async (_, payload?: {
   }
   await ensureSessionBridgeStarted();
   const { ToolConfirmationOutcome } = require('./core/toolRegistry');
-  return getSessionBridgeService().resolvePermissionRequest(
+  return (await getSessionBridgeServiceLazy()).resolvePermissionRequest(
     requestId,
     outcome === ToolConfirmationOutcome.ProceedAlways
       ? ToolConfirmationOutcome.ProceedAlways
@@ -2494,6 +2886,34 @@ ipcMain.handle('mcp:oauth-status', async (_, payload: { serverId?: string }) => 
     const message = error instanceof Error ? error.message : String(error);
     return { success: false, error: message };
   }
+});
+
+ipcMain.handle('mcp:sessions', async () => {
+  return { success: true, sessions: [] };
+});
+
+ipcMain.handle('mcp:list-tools', async () => {
+  return { success: false, error: 'Not supported in Electron compatibility mode', tools: [] };
+});
+
+ipcMain.handle('mcp:list-resources', async () => {
+  return { success: false, error: 'Not supported in Electron compatibility mode', resources: [] };
+});
+
+ipcMain.handle('mcp:list-resource-templates', async () => {
+  return { success: false, error: 'Not supported in Electron compatibility mode', resourceTemplates: [] };
+});
+
+ipcMain.handle('mcp:call', async () => {
+  return { success: false, error: 'Not supported in Electron compatibility mode' };
+});
+
+ipcMain.handle('mcp:disconnect', async () => {
+  return { success: true };
+});
+
+ipcMain.handle('mcp:disconnect-all', async () => {
+  return { success: true };
 });
 
 // AI Source: protocol detect / test / model list
@@ -2682,6 +3102,137 @@ ipcMain.handle('chat:getOrCreateFileSession', async (_, { filePath, fileId }: { 
   return { id: sessionId, title, timestamp: Date.now(), metadata: JSON.stringify(metadata) };
 });
 
+ipcMain.handle('chat:update-session-metadata', async (_, payload?: {
+  sessionId?: string;
+  metadata?: Record<string, unknown>;
+}) => {
+  const sessionId = String(payload?.sessionId || '').trim();
+  if (!sessionId) {
+    return { success: false, error: 'sessionId is required' };
+  }
+
+  const session = getChatSession(sessionId);
+  if (!session) {
+    return { success: false, error: 'session not found' };
+  }
+
+  let currentMetadata: Record<string, unknown> = {};
+  if (session.metadata) {
+    try {
+      currentMetadata = JSON.parse(session.metadata);
+    } catch (error) {
+      console.warn('[chat:update-session-metadata] Failed to parse existing metadata:', error);
+    }
+  }
+
+  const nextMetadata = {
+    ...currentMetadata,
+    ...(payload?.metadata || {}),
+  };
+  updateChatSessionMetadata(sessionId, nextMetadata);
+  return { success: true };
+});
+
+ipcMain.handle('chat:bind-editor-session', async (_, payload?: {
+  session?: {
+    scope?: string;
+    filePath?: string;
+    contextType?: string;
+    contextId?: string;
+    title?: string;
+    modeLabel?: string;
+    targetTypeLabel?: string;
+    targetPath?: string;
+    initialContext?: string;
+  };
+  metadata?: Record<string, unknown>;
+}) => {
+  try {
+    const binding = payload?.session;
+    const scope = normalizeBindingText(binding?.scope).toLowerCase() || 'file';
+    const contextType = normalizeBindingText(binding?.contextType) || 'file';
+    const contextId = normalizeBindingText(binding?.contextId);
+    const filePath = normalizeBindingText(binding?.filePath) || contextId;
+    const metadata = normalizeBindingMetadata(payload?.metadata);
+    const title = normalizeBindingText(binding?.title)
+      || (filePath ? stripManuscriptExtension(path.basename(filePath)) : 'New Chat');
+
+    let session = null as ReturnType<typeof getChatSession> | null;
+    if (scope === 'context') {
+      if (!contextId) {
+        return { success: false, error: 'contextId is required for context-bound editor chat' };
+      }
+      session = getChatSessionByContext(contextId, contextType);
+      if (!session) {
+        const sessionId = `session_${Date.now()}`;
+        session = createChatSession(sessionId, title, {
+          contextType,
+          contextId,
+          isContextBound: true,
+        });
+      }
+    } else if (scope === 'file') {
+      if (!filePath) {
+        return { success: false, error: 'filePath is required for file-bound editor chat' };
+      }
+      session = getChatSessionByFile(filePath);
+      if (!session) {
+        const sessionId = `session_${Date.now()}`;
+        session = createChatSession(sessionId, title, {
+          associatedFilePath: filePath,
+        });
+      }
+    } else {
+      return { success: false, error: `unsupported editor chat binding scope: ${scope}` };
+    }
+
+    if (!session) {
+      return { success: false, error: 'failed to create editor chat session' };
+    }
+
+    const currentMetadata = (() => {
+      if (!session?.metadata) return {};
+      try {
+        return JSON.parse(session.metadata) as Record<string, unknown>;
+      } catch {
+        return {};
+      }
+    })();
+    const nextMetadata = {
+      ...currentMetadata,
+      ...metadata,
+      contextType,
+      contextId,
+      isContextBound: true,
+      editorBindingVersion: currentMetadata.editorBindingVersion ?? metadata.editorBindingVersion ?? 1,
+      editorBindingScope: scope,
+    } as Record<string, unknown>;
+    if (!normalizeBindingText(nextMetadata.associatedFilePath) && filePath) {
+      nextMetadata.associatedFilePath = filePath;
+    }
+
+    const derivedInitialContext = deriveEditorBindingInitialContext({
+      filePath,
+      contextId,
+      modeLabel: binding?.modeLabel,
+      targetTypeLabel: binding?.targetTypeLabel,
+      targetPath: binding?.targetPath,
+      initialContext: binding?.initialContext,
+    }, nextMetadata);
+    if (derivedInitialContext) {
+      nextMetadata.initialContext = derivedInitialContext;
+    }
+
+    updateChatSessionMetadata(session.id, nextMetadata);
+    return getChatSession(session.id) || session;
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+});
+
 // 获取或创建上下文关联的会话 (知识库聊天)
 ipcMain.handle('chat:getOrCreateContextSession', async (_, { contextId, contextType, title, initialContext }: { contextId: string; contextType: string; title: string; initialContext: string }) => {
   if (!contextId || !contextType) return null;
@@ -2717,12 +3268,186 @@ ipcMain.handle('chat:getOrCreateContextSession', async (_, { contextId, contextT
   return { id: sessionId, title, timestamp: Date.now(), metadata: JSON.stringify(metadata) };
 });
 
+ipcMain.handle('chat:list-context-sessions', async (_, payload?: { contextId?: string; contextType?: string }) => {
+  const contextId = String(payload?.contextId || '').trim();
+  const contextType = String(payload?.contextType || '').trim();
+  if (!contextId || !contextType) {
+    return [];
+  }
+
+  return getChatSessions()
+    .filter((session) => {
+      if (!session.metadata) return false;
+      try {
+        const meta = JSON.parse(session.metadata) as Record<string, unknown>;
+        return meta.contextId === contextId && meta.contextType === contextType;
+      } catch {
+        return false;
+      }
+    })
+    .map((session) => ({
+      id: session.id,
+      messageCount: 0,
+      summary: '',
+      transcriptCount: 0,
+      checkpointCount: 0,
+      context: null,
+      chatSession: {
+        id: session.id,
+        title: session.title,
+        updatedAt: new Date(session.updated_at).toISOString(),
+      },
+    }));
+});
+
+ipcMain.handle('chat:create-context-session', async (_, payload?: {
+  contextId?: string;
+  contextType?: string;
+  title?: string;
+  initialContext?: string;
+}) => {
+  const contextId = String(payload?.contextId || '').trim();
+  const contextType = String(payload?.contextType || '').trim();
+  if (!contextId || !contextType) {
+    return null;
+  }
+
+  const sessionId = `session_${Date.now()}`;
+  const title = String(payload?.title || 'Context Chat').trim() || 'Context Chat';
+  const metadata = {
+    contextId,
+    contextType,
+    contextContent: String(payload?.initialContext || '').trim(),
+    isContextBound: true,
+  };
+  const created = createChatSession(sessionId, title, metadata);
+  return {
+    id: created.id,
+    title: created.title,
+    updatedAt: new Date(created.updated_at).toISOString(),
+  };
+});
+
+ipcMain.handle('chat:create-diagnostics-session', async (_, payload?: {
+  title?: string;
+  contextId?: string;
+  contextType?: string;
+}) => {
+  const sessionId = `session_${Date.now()}`;
+  const title = String(payload?.title || 'Diagnostics').trim() || 'Diagnostics';
+  const metadata = {
+    contextId: String(payload?.contextId || '').trim() || undefined,
+    contextType: String(payload?.contextType || '').trim() || undefined,
+    diagnostics: true,
+  };
+  const created = createChatSession(sessionId, title, metadata);
+  return {
+    id: created.id,
+    title: created.title,
+    updatedAt: new Date(created.updated_at).toISOString(),
+  };
+});
+
 ipcMain.handle('redclaw:list-projects', async (_, { limit }: { limit?: number } = {}) => {
   try {
     return await listRedClawProjects(limit || 20);
   } catch (error) {
     console.error('Failed to list RedClaw projects:', error);
     return [];
+  }
+});
+
+ipcMain.handle('redclaw:profile:get-bundle', async () => {
+  try {
+    const bundle = await loadRedClawProfilePromptBundle();
+    return {
+      success: true,
+      profileRoot: bundle.profileRoot,
+      agent: bundle.files.agent,
+      soul: bundle.files.soul,
+      identity: bundle.files.identity,
+      user: bundle.files.user,
+      creatorProfile: bundle.files.creatorProfile,
+      bootstrap: bundle.files.bootstrap,
+      onboardingState: bundle.onboardingState,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+});
+
+ipcMain.handle('redclaw:profile:update-doc', async (_, payload?: {
+  docType?: 'agent' | 'soul' | 'user' | 'creator_profile';
+  markdown?: string;
+  reason?: string;
+}) => {
+  const docType = payload?.docType;
+  const markdown = String(payload?.markdown || '');
+  if (!docType) {
+    return { success: false, error: 'docType is required' };
+  }
+  if (!markdown.trim()) {
+    return { success: false, error: 'markdown is required' };
+  }
+
+  try {
+    const result = await updateRedClawProfileDocument(docType, markdown);
+    return {
+      success: true,
+      docType: result.docType,
+      fileName: path.basename(result.path),
+      path: result.path,
+      content: result.content,
+      reason: String(payload?.reason || '').trim() || undefined,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+});
+
+ipcMain.handle('redclaw:profile:onboarding-status', async () => {
+  try {
+    const bundle = await loadRedClawProfilePromptBundle();
+    return {
+      success: true,
+      completed: Boolean(bundle.onboardingState.completedAt),
+      state: bundle.onboardingState,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      completed: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+});
+
+ipcMain.handle('redclaw:profile:onboarding-turn', async (_, payload?: { input?: string }) => {
+  try {
+    const result = await handleRedClawOnboardingTurn(String(payload?.input || ''));
+    return {
+      success: true,
+      handled: result.handled,
+      completed: Boolean(result.completed),
+      responseText: result.responseText,
+      result: {
+        responseText: result.responseText,
+        completed: Boolean(result.completed),
+      },
+    };
+  } catch (error) {
+    return {
+      success: false,
+      handled: false,
+      completed: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
   }
 });
 
@@ -2756,7 +3481,7 @@ ipcMain.handle('redclaw:open-project', async (_, { projectDir }: { projectDir: s
 });
 
 ipcMain.handle('redclaw:runner-status', async () => {
-  return getRedClawBackgroundRunner().getStatus();
+  return (await getRedClawBackgroundRunnerLazy()).getStatus();
 });
 
 ipcMain.handle('redclaw:runner-start', async (_, payload: {
@@ -2768,7 +3493,7 @@ ipcMain.handle('redclaw:runner-start', async (_, payload: {
   heartbeatIntervalMinutes?: number;
 } = {}) => {
   try {
-    return await getRedClawBackgroundRunner().start(payload);
+    return await (await getRedClawBackgroundRunnerLazy()).start(payload);
   } catch (error) {
     return { success: false, error: String(error) };
   }
@@ -2776,7 +3501,7 @@ ipcMain.handle('redclaw:runner-start', async (_, payload: {
 
 ipcMain.handle('redclaw:runner-stop', async () => {
   try {
-    return await getRedClawBackgroundRunner().stop();
+    return await (await getRedClawBackgroundRunnerLazy()).stop();
   } catch (error) {
     return { success: false, error: String(error) };
   }
@@ -2784,7 +3509,7 @@ ipcMain.handle('redclaw:runner-stop', async () => {
 
 ipcMain.handle('redclaw:runner-run-now', async (_, payload: { projectId?: string } = {}) => {
   try {
-    return await getRedClawBackgroundRunner().runNow(payload.projectId);
+    return await (await getRedClawBackgroundRunnerLazy()).runNow(payload.projectId);
   } catch (error) {
     return { success: false, error: String(error) };
   }
@@ -2796,7 +3521,7 @@ ipcMain.handle('redclaw:runner-set-project', async (_, payload: {
   prompt?: string;
 }) => {
   try {
-    return await getRedClawBackgroundRunner().setProjectState(payload);
+    return await (await getRedClawBackgroundRunnerLazy()).setProjectState(payload);
   } catch (error) {
     return { success: false, error: String(error) };
   }
@@ -2814,7 +3539,7 @@ ipcMain.handle('redclaw:runner-set-config', async (_, payload: {
   heartbeatPrompt?: string;
 } = {}) => {
   try {
-    return await getRedClawBackgroundRunner().setRunnerConfig(payload);
+    return await (await getRedClawBackgroundRunnerLazy()).setRunnerConfig(payload);
   } catch (error) {
     return { success: false, error: String(error) };
   }
@@ -2822,7 +3547,7 @@ ipcMain.handle('redclaw:runner-set-config', async (_, payload: {
 
 ipcMain.handle('redclaw:runner-list-scheduled', async () => {
   try {
-    const tasks = getRedClawBackgroundRunner().listScheduledTasks();
+    const tasks = (await getRedClawBackgroundRunnerLazy()).listScheduledTasks();
     return { success: true, tasks };
   } catch (error) {
     return { success: false, error: String(error), tasks: [] };
@@ -2841,7 +3566,7 @@ ipcMain.handle('redclaw:runner-add-scheduled', async (_, payload: {
   enabled?: boolean;
 }) => {
   try {
-    const task = await getRedClawBackgroundRunner().addScheduledTask(payload);
+    const task = await (await getRedClawBackgroundRunnerLazy()).addScheduledTask(payload);
     return { success: true, task };
   } catch (error) {
     return { success: false, error: String(error) };
@@ -2850,7 +3575,7 @@ ipcMain.handle('redclaw:runner-add-scheduled', async (_, payload: {
 
 ipcMain.handle('redclaw:runner-remove-scheduled', async (_, payload: { taskId: string }) => {
   try {
-    const status = await getRedClawBackgroundRunner().removeScheduledTask(payload?.taskId || '');
+    const status = await (await getRedClawBackgroundRunnerLazy()).removeScheduledTask(payload?.taskId || '');
     return { success: true, status };
   } catch (error) {
     return { success: false, error: String(error) };
@@ -2859,7 +3584,7 @@ ipcMain.handle('redclaw:runner-remove-scheduled', async (_, payload: { taskId: s
 
 ipcMain.handle('redclaw:runner-set-scheduled-enabled', async (_, payload: { taskId: string; enabled: boolean }) => {
   try {
-    const task = await getRedClawBackgroundRunner().setScheduledTaskEnabled(payload?.taskId || '', Boolean(payload?.enabled));
+    const task = await (await getRedClawBackgroundRunnerLazy()).setScheduledTaskEnabled(payload?.taskId || '', Boolean(payload?.enabled));
     return { success: true, task };
   } catch (error) {
     return { success: false, error: String(error) };
@@ -2868,7 +3593,7 @@ ipcMain.handle('redclaw:runner-set-scheduled-enabled', async (_, payload: { task
 
 ipcMain.handle('redclaw:runner-run-scheduled-now', async (_, payload: { taskId: string }) => {
   try {
-    const status = await getRedClawBackgroundRunner().runScheduledTaskNow(payload?.taskId || '');
+    const status = await (await getRedClawBackgroundRunnerLazy()).runScheduledTaskNow(payload?.taskId || '');
     return { success: true, status };
   } catch (error) {
     return { success: false, error: String(error) };
@@ -2877,7 +3602,7 @@ ipcMain.handle('redclaw:runner-run-scheduled-now', async (_, payload: { taskId: 
 
 ipcMain.handle('redclaw:runner-list-long-cycle', async () => {
   try {
-    const tasks = getRedClawBackgroundRunner().listLongCycleTasks();
+    const tasks = (await getRedClawBackgroundRunnerLazy()).listLongCycleTasks();
     return { success: true, tasks };
   } catch (error) {
     return { success: false, error: String(error), tasks: [] };
@@ -2894,7 +3619,7 @@ ipcMain.handle('redclaw:runner-add-long-cycle', async (_, payload: {
   enabled?: boolean;
 }) => {
   try {
-    const task = await getRedClawBackgroundRunner().addLongCycleTask(payload);
+    const task = await (await getRedClawBackgroundRunnerLazy()).addLongCycleTask(payload);
     return { success: true, task };
   } catch (error) {
     return { success: false, error: String(error) };
@@ -2903,7 +3628,7 @@ ipcMain.handle('redclaw:runner-add-long-cycle', async (_, payload: {
 
 ipcMain.handle('redclaw:runner-remove-long-cycle', async (_, payload: { taskId: string }) => {
   try {
-    const status = await getRedClawBackgroundRunner().removeLongCycleTask(payload?.taskId || '');
+    const status = await (await getRedClawBackgroundRunnerLazy()).removeLongCycleTask(payload?.taskId || '');
     return { success: true, status };
   } catch (error) {
     return { success: false, error: String(error) };
@@ -2912,7 +3637,7 @@ ipcMain.handle('redclaw:runner-remove-long-cycle', async (_, payload: { taskId: 
 
 ipcMain.handle('redclaw:runner-set-long-cycle-enabled', async (_, payload: { taskId: string; enabled: boolean }) => {
   try {
-    const task = await getRedClawBackgroundRunner().setLongCycleTaskEnabled(payload?.taskId || '', Boolean(payload?.enabled));
+    const task = await (await getRedClawBackgroundRunnerLazy()).setLongCycleTaskEnabled(payload?.taskId || '', Boolean(payload?.enabled));
     return { success: true, task };
   } catch (error) {
     return { success: false, error: String(error) };
@@ -2921,7 +3646,7 @@ ipcMain.handle('redclaw:runner-set-long-cycle-enabled', async (_, payload: { tas
 
 ipcMain.handle('redclaw:runner-run-long-cycle-now', async (_, payload: { taskId: string }) => {
   try {
-    const status = await getRedClawBackgroundRunner().runLongCycleTaskNow(payload?.taskId || '');
+    const status = await (await getRedClawBackgroundRunnerLazy()).runLongCycleTaskNow(payload?.taskId || '');
     return { success: true, status };
   } catch (error) {
     return { success: false, error: String(error) };
@@ -2956,6 +3681,7 @@ ipcMain.handle('media:import-files', async () => {
 
     const imported = await importMediaFiles(picker.filePaths);
     const enriched = await Promise.all(imported.map((asset) => enrichMediaAsset(asset)));
+    emitRendererDataChanged('media', { action: 'import' });
     return {
       success: true,
       imported: enriched,
@@ -2973,6 +3699,7 @@ ipcMain.handle('media:update', async (_, payload: { assetId: string; projectId?:
       return { success: false, error: 'assetId is required' };
     }
     const updated = await updateMediaAssetMetadata(payload);
+    emitRendererDataChanged('media', { action: 'update', entityId: payload.assetId });
     return { success: true, asset: await enrichMediaAsset(updated) };
   } catch (error) {
     console.error('Failed to update media asset:', error);
@@ -2986,6 +3713,7 @@ ipcMain.handle('media:delete', async (_, { assetId }: { assetId: string }) => {
       return { success: false, error: 'assetId is required' };
     }
     const deleted = await deleteMediaAsset(assetId);
+    emitRendererDataChanged('media', { action: 'delete', entityId: assetId });
     return { success: true, deleted };
   } catch (error) {
     console.error('Failed to delete media asset:', error);
@@ -3014,6 +3742,7 @@ ipcMain.handle('media:bind', async (_, {
       manuscriptPath: normalizedManuscriptPath,
       role,
     });
+    emitRendererDataChanged('media', { action: 'bind', entityId: assetId });
     return { success: true, asset: await enrichMediaAsset(updated) };
   } catch (error) {
     console.error('Failed to bind media asset:', error);
@@ -3093,6 +3822,7 @@ ipcMain.handle('subjects:create', async (_, payload: {
 }) => {
   try {
     const subject = await createSubject(payload || { name: '' });
+    emitRendererDataChanged('subjects', { action: 'create', entityId: subject.id });
     return { success: true, subject };
   } catch (error) {
     console.error('Failed to create subject:', error);
@@ -3115,6 +3845,7 @@ ipcMain.handle('subjects:update', async (_, payload: {
       return { success: false, error: 'id is required' };
     }
     const subject = await updateSubject(payload);
+    emitRendererDataChanged('subjects', { action: 'update', entityId: payload.id });
     return { success: true, subject };
   } catch (error) {
     console.error('Failed to update subject:', error);
@@ -3128,6 +3859,7 @@ ipcMain.handle('subjects:delete', async (_, { id }: { id: string }) => {
       return { success: false, error: 'id is required' };
     }
     await deleteSubject(id);
+    emitRendererDataChanged('subjects', { action: 'delete', entityId: id });
     return { success: true };
   } catch (error) {
     console.error('Failed to delete subject:', error);
@@ -3158,6 +3890,7 @@ ipcMain.handle('subjects:categories:list', async () => {
 ipcMain.handle('subjects:categories:create', async (_, { name }: { name: string }) => {
   try {
     const category = await createSubjectCategory(name);
+    emitRendererDataChanged('subjects', { action: 'category-create', entityId: category.id });
     return { success: true, category };
   } catch (error) {
     console.error('Failed to create subject category:', error);
@@ -3168,6 +3901,7 @@ ipcMain.handle('subjects:categories:create', async (_, { name }: { name: string 
 ipcMain.handle('subjects:categories:update', async (_, payload: { id: string; name: string }) => {
   try {
     const category = await updateSubjectCategory(payload);
+    emitRendererDataChanged('subjects', { action: 'category-update', entityId: payload.id });
     return { success: true, category };
   } catch (error) {
     console.error('Failed to update subject category:', error);
@@ -3178,6 +3912,7 @@ ipcMain.handle('subjects:categories:update', async (_, payload: { id: string; na
 ipcMain.handle('subjects:categories:delete', async (_, { id }: { id: string }) => {
   try {
     await deleteSubjectCategory(id);
+    emitRendererDataChanged('subjects', { action: 'category-delete', entityId: id });
     return { success: true };
   } catch (error) {
     console.error('Failed to delete subject category:', error);
@@ -3193,6 +3928,52 @@ ipcMain.handle('cover:list', async (_, { limit }: { limit?: number } = {}) => {
   } catch (error) {
     console.error('Failed to list cover assets:', error);
     return { success: false, error: String(error), assets: [] };
+  }
+});
+
+ipcMain.handle('cover:templates:list', async () => {
+  try {
+    return {
+      success: true,
+      templates: await listCoverTemplates(),
+    };
+  } catch (error) {
+    return { success: false, error: String(error), templates: [] };
+  }
+});
+
+ipcMain.handle('cover:templates:save', async (_, payload?: { template?: Record<string, unknown> }) => {
+  try {
+    const template = await saveCoverTemplate(payload?.template || {});
+    return {
+      success: true,
+      template,
+      templates: await listCoverTemplates(),
+    };
+  } catch (error) {
+    return { success: false, error: String(error), templates: [] };
+  }
+});
+
+ipcMain.handle('cover:templates:delete', async (_, payload?: { templateId?: string }) => {
+  try {
+    const templates = await deleteCoverTemplate(String(payload?.templateId || '').trim());
+    return { success: true, templates };
+  } catch (error) {
+    return { success: false, error: String(error), templates: [] };
+  }
+});
+
+ipcMain.handle('cover:templates:import-legacy', async (_, payload?: { templates?: Record<string, unknown>[] }) => {
+  try {
+    const templates = await importLegacyCoverTemplates(Array.isArray(payload?.templates) ? payload!.templates! : []);
+    return {
+      success: true,
+      imported: templates.length,
+      templates,
+    };
+  } catch (error) {
+    return { success: false, error: String(error), templates: [] };
   }
 });
 
@@ -3367,6 +4148,7 @@ ipcMain.handle('image-gen:generate', async (_, {
       aspectRatio,
     });
     const assets = await Promise.all(result.assets.map((asset) => enrichMediaAsset(asset)));
+    emitRendererDataChanged('media', { action: 'generate-image' });
     return { success: true, assets };
   } catch (error) {
     console.error('Failed to generate images:', error);
@@ -3428,6 +4210,7 @@ ipcMain.handle('video-gen:generate', async (_, {
       firstClip,
     });
     const assets = await Promise.all(result.assets.map((asset) => enrichMediaAsset(asset)));
+    emitRendererDataChanged('media', { action: 'generate-video' });
     return { success: true, assets };
   } catch (error) {
     console.error('Failed to generate videos:', error);
@@ -4043,6 +4826,12 @@ ipcMain.on('ai:confirm-tool', (_, callId: string, confirmed: boolean) => {
   }
 })
 
+ipcMain.on('chat:confirm-tool', (_, payload?: { callId?: string; confirmed?: boolean }) => {
+  const callId = String(payload?.callId || '').trim();
+  if (!callId) return;
+  ipcMain.emit('ai:confirm-tool', {} as Electron.IpcMainEvent, callId, payload?.confirmed === true)
+})
+
 // 取消 Agent 执行（旧版）
 ipcMain.on('ai:cancel', () => {
   if (currentAgent) {
@@ -4429,6 +5218,9 @@ ipcMain.handle('advisors:list', async () => {
   const advisorsDir = getAdvisorsDir();
 
   try {
+    if (advisorListCache) {
+      return advisorListCache;
+    }
     await fs.mkdir(advisorsDir, { recursive: true });
     const dirs = await fs.readdir(advisorsDir, { withFileTypes: true });
     const advisorDirs = dirs.filter((dir) => dir.isDirectory());
@@ -4437,39 +5229,49 @@ ipcMain.handle('advisors:list', async () => {
       try {
         const content = await fs.readFile(configPath, 'utf-8');
         const config = JSON.parse(content) as Record<string, unknown>;
-        const advisorDir = path.join(advisorsDir, dir.name);
-
-        const avatar = String(config.avatar || '').trim();
-        if (avatar.startsWith('http')) {
-          localizeAdvisorAvatarInBackground(advisorDir, configPath, config);
-        }
-
-        const knowledgeDir = path.join(advisorDir, 'knowledge');
-        let knowledgeFiles: string[] = [];
-        try {
-          const files = await fs.readdir(knowledgeDir);
-          knowledgeFiles = files.filter((f: string) => f.endsWith('.txt') || f.endsWith('.md'));
-        } catch {
-          knowledgeFiles = [];
-        }
-
-        return {
-          id: dir.name,
-          ...config,
-          avatar: resolveAdvisorAvatarForList(advisorDir, config),
-          knowledgeFiles,
-        } as { id: string; knowledgeFiles: string[]; createdAt?: string } & Record<string, unknown>;
+        return await buildAdvisorSummary(dir.name, config);
       } catch {
         return null;
       }
-    }))).filter((item): item is { id: string; knowledgeFiles: string[]; createdAt?: string } & Record<string, unknown> => Boolean(item));
+    }))).filter((item): item is {
+      id: string;
+      name: string;
+      avatar: string;
+      personality: string;
+      knowledgeLanguage: string;
+      createdAt: string;
+      hasYoutubeChannel: boolean;
+    } => Boolean(item));
 
-    return advisors.sort((a, b) =>
+    advisorListCache = advisors.sort((a, b) =>
       (b.createdAt || '').localeCompare(a.createdAt || '')
     );
+    return advisorListCache;
   } catch (error) {
     console.error('Failed to list advisors:', error);
     return [];
+  }
+});
+
+ipcMain.handle('advisors:list-templates', async () => {
+  return [];
+});
+
+ipcMain.handle('advisors:get', async (_, advisorId: string) => {
+  try {
+    const cached = advisorDetailCache.get(advisorId);
+    if (cached) {
+      return {
+        success: true,
+        advisor: cached,
+      };
+    }
+    const advisor = await buildAdvisorDetail(advisorId);
+    advisorDetailCache.set(advisorId, advisor);
+    return { success: true, advisor };
+  } catch (error) {
+    console.error('Failed to get advisor:', error);
+    return { success: false, error: String(error) };
   }
 });
 
@@ -4538,7 +5340,7 @@ ipcMain.handle('advisors:create', async (_, data: { name: string; avatar: string
 
     // If YouTube channel provided, save it
     if (data.youtubeChannel) {
-      config.youtubeChannel = getDefaultAdvisorYoutubeChannelConfig({
+      config.youtubeChannel = await getDefaultAdvisorYoutubeChannelConfigLazy({
         url: data.youtubeChannel.url,
         channelId: data.youtubeChannel.channelId,
         lastRefreshed: new Date().toISOString()
@@ -4547,7 +5349,9 @@ ipcMain.handle('advisors:create', async (_, data: { name: string; avatar: string
     }
 
     await fs.writeFile(path.join(advisorDir, 'config.json'), JSON.stringify(config, null, 2), 'utf-8');
+    invalidateAdvisorCache(advisorId);
     win?.webContents.send('advisors:changed', { action: 'create', advisorId });
+    emitRendererDataChanged('advisors', { action: 'create', entityId: advisorId });
     return { success: true, id: advisorId };
   } catch (error) {
     console.error('Failed to create advisor:', error);
@@ -4584,7 +5388,9 @@ ipcMain.handle('advisors:update', async (_, data: { id: string; name: string; av
     };
 
     await fs.writeFile(configPath, JSON.stringify(updated, null, 2), 'utf-8');
+    invalidateAdvisorCache(data.id);
     win?.webContents.send('advisors:changed', { action: 'update', advisorId: data.id });
+    emitRendererDataChanged('advisors', { action: 'update', entityId: data.id });
     return { success: true };
   } catch (error) {
     console.error('Failed to update advisor:', error);
@@ -4617,13 +5423,38 @@ ipcMain.handle('advisors:select-avatar', async () => {
   }
 });
 
+ipcMain.handle('advisors:pick-knowledge-files', async () => {
+  const result = await dialog.showOpenDialog(win!, {
+    properties: ['openFile', 'multiSelections'],
+    filters: [{ name: 'Text Files', extensions: ['txt', 'md', 'markdown'] }],
+  });
+
+  if (result.canceled || result.filePaths.length === 0) {
+    return { success: true, canceled: true, filePaths: [], files: [] };
+  }
+
+  const files = result.filePaths.map((filePath) => ({
+    path: filePath,
+    name: path.basename(filePath),
+  }));
+
+  return {
+    success: true,
+    canceled: false,
+    filePaths: result.filePaths,
+    files,
+  };
+});
+
 ipcMain.handle('advisors:delete', async (_, advisorId: string) => {
   const fs = require('fs/promises');
   const advisorDir = path.join(getAdvisorsDir(), advisorId);
 
   try {
     await fs.rm(advisorDir, { recursive: true, force: true });
+    invalidateAdvisorCache(advisorId);
     win?.webContents.send('advisors:changed', { action: 'delete', advisorId });
+    emitRendererDataChanged('advisors', { action: 'delete', entityId: advisorId });
     return { success: true };
   } catch (error) {
     console.error('Failed to delete advisor:', error);
@@ -4631,23 +5462,35 @@ ipcMain.handle('advisors:delete', async (_, advisorId: string) => {
   }
 });
 
-ipcMain.handle('advisors:upload-knowledge', async (_, advisorId: string) => {
-  const { dialog } = require('electron');
+ipcMain.handle('advisors:upload-knowledge', async (_, payload: string | { advisorId?: string; filePaths?: string[] }) => {
   const fs = require('fs/promises');
+  const advisorId = typeof payload === 'string'
+    ? payload
+    : String(payload?.advisorId || '').trim();
+  if (!advisorId) {
+    return { success: false, error: 'advisorId is required' };
+  }
 
-  const result = await dialog.showOpenDialog(win!, {
-    properties: ['openFile', 'multiSelections'],
-    filters: [{ name: 'Text Files', extensions: ['txt', 'md'] }]
-  });
+  let filePaths = Array.isArray((payload as { filePaths?: string[] } | undefined)?.filePaths)
+    ? ((payload as { filePaths?: string[] }).filePaths || []).filter(Boolean)
+    : [];
 
-  if (result.canceled || result.filePaths.length === 0) {
-    return { success: false };
+  if (filePaths.length === 0) {
+    const result = await dialog.showOpenDialog(win!, {
+      properties: ['openFile', 'multiSelections'],
+      filters: [{ name: 'Text Files', extensions: ['txt', 'md', 'markdown'] }]
+    });
+
+    if (result.canceled || result.filePaths.length === 0) {
+      return { success: false };
+    }
+    filePaths = result.filePaths;
   }
 
   const knowledgeDir = path.join(getAdvisorsDir(), advisorId, 'knowledge');
   await fs.mkdir(knowledgeDir, { recursive: true });
 
-  for (const filePath of result.filePaths) {
+  for (const filePath of filePaths) {
     const fileName = path.basename(filePath);
     const destPath = path.join(knowledgeDir, fileName);
     await fs.copyFile(filePath, destPath);
@@ -4667,7 +5510,9 @@ ipcMain.handle('advisors:upload-knowledge', async (_, advisorId: string) => {
     }
   }
 
-  return { success: true, count: result.filePaths.length };
+  invalidateAdvisorCache(advisorId);
+  emitRendererDataChanged('advisors', { action: 'update', entityId: advisorId });
+  return { success: true, count: filePaths.length };
 });
 
 ipcMain.handle('advisors:delete-knowledge', async (_, { advisorId, fileName }: { advisorId: string; fileName: string }) => {
@@ -4676,6 +5521,8 @@ ipcMain.handle('advisors:delete-knowledge', async (_, { advisorId, fileName }: {
 
   try {
     await fs.unlink(filePath);
+    invalidateAdvisorCache(advisorId);
+    emitRendererDataChanged('advisors', { action: 'update', entityId: advisorId });
     return { success: true };
   } catch (error) {
     console.error('Failed to delete knowledge file:', error);
@@ -5035,11 +5882,13 @@ ipcMain.handle('advisors:update-youtube-settings', async (_event, payload: {
   try {
     const configRaw = await fs.readFile(configPath, 'utf-8');
     const config = JSON.parse(configRaw);
-    config.youtubeChannel = getDefaultAdvisorYoutubeChannelConfig({
+    config.youtubeChannel = await getDefaultAdvisorYoutubeChannelConfigLazy({
       ...config.youtubeChannel,
       ...payload?.settings,
     });
     await fs.writeFile(configPath, JSON.stringify(config, null, 2), 'utf-8');
+    invalidateAdvisorCache(advisorId);
+    emitRendererDataChanged('advisors', { action: 'update', entityId: advisorId });
     return { success: true, youtubeChannel: config.youtubeChannel };
   } catch (error) {
     console.error('Failed to update advisor youtube settings:', error);
@@ -5049,7 +5898,7 @@ ipcMain.handle('advisors:update-youtube-settings', async (_event, payload: {
 
 ipcMain.handle('advisors:youtube-runner-status', async () => {
   try {
-    return { success: true, status: getAdvisorYoutubeBackgroundRunner().getStatus() };
+    return { success: true, status: (await getAdvisorYoutubeRunnerLazy()).getStatus() };
   } catch (error) {
     return { success: false, error: String(error) };
   }
@@ -5057,7 +5906,7 @@ ipcMain.handle('advisors:youtube-runner-status', async () => {
 
 ipcMain.handle('advisors:youtube-runner-run-now', async (_event, payload: { advisorId?: string } = {}) => {
   try {
-    return await getAdvisorYoutubeBackgroundRunner().runNow(payload?.advisorId);
+    return await (await getAdvisorYoutubeRunnerLazy()).runNow(payload?.advisorId);
   } catch (error) {
     return { success: false, processed: 0, error: String(error) };
   }
@@ -5092,7 +5941,7 @@ ipcMain.handle('advisors:download-youtube-subtitles', async (event, { channelUrl
     const configRaw = await fs.readFile(configPath, 'utf-8');
     const config = JSON.parse(configRaw);
     config.videos = videos;
-    config.youtubeChannel = getDefaultAdvisorYoutubeChannelConfig({
+    config.youtubeChannel = await getDefaultAdvisorYoutubeChannelConfigLazy({
       ...config.youtubeChannel,
       lastRefreshed: new Date().toISOString()
     });
@@ -5228,7 +6077,7 @@ ipcMain.handle('advisors:refresh-videos', async (event, { advisorId, limit = 50 
     ];
 
     config.videos = mergedVideos;
-    config.youtubeChannel = getDefaultAdvisorYoutubeChannelConfig({
+    config.youtubeChannel = await getDefaultAdvisorYoutubeChannelConfigLazy({
       ...config.youtubeChannel,
       lastRefreshed: new Date().toISOString(),
     });
@@ -5252,7 +6101,7 @@ ipcMain.handle('advisors:get-videos', async (_, { advisorId }: { advisorId: stri
     return {
       success: true,
       videos: config.videos || [],
-      youtubeChannel: config.youtubeChannel ? getDefaultAdvisorYoutubeChannelConfig(config.youtubeChannel) : null,
+      youtubeChannel: config.youtubeChannel ? await getDefaultAdvisorYoutubeChannelConfigLazy(config.youtubeChannel) : null,
     };
   } catch (error) {
     return { success: false, error: String(error) };
@@ -5880,6 +6729,68 @@ function getManuscriptPackageEntryPath(packagePath: string, fileName: string, ma
   return path.join(packagePath, entry);
 }
 
+type ManuscriptTreeNode = {
+  name: string;
+  path: string;
+  isDirectory: boolean;
+  children?: ManuscriptTreeNode[];
+  status?: string;
+  title?: string;
+  draftType?: string;
+  updatedAt?: number;
+  summary?: string;
+};
+
+function summarizeManuscriptContent(content: string) {
+  return String(content || '')
+    .replace(/^#+\s+/gm, '')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/\[(.*?)\]\((.*?)\)/g, '$1')
+    .replace(/[*_>`~-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 72);
+}
+
+async function readManuscriptListMetadata(fullPath: string, fileName: string, isPackage: boolean) {
+  const stats = await fs.stat(fullPath);
+  const fallbackTitle = '未命名';
+  const fallbackDraftType = getDraftTypeFromFileName(fileName);
+  const fallbackUpdatedAt = Number.isFinite(stats.mtimeMs) ? Math.trunc(stats.mtimeMs) : Date.now();
+
+  try {
+    if (isPackage) {
+      const { content, metadata } = await readManuscriptPackage(fullPath);
+      return {
+        status: String(metadata?.status || 'writing'),
+        title: String(metadata?.title || '').trim() || fallbackTitle,
+        draftType: String(metadata?.draftType || '').trim() || fallbackDraftType,
+        updatedAt: Number(metadata?.updatedAt || metadata?.createdAt || fallbackUpdatedAt) || fallbackUpdatedAt,
+        summary: summarizeManuscriptContent(content),
+      };
+    }
+
+    const rawContent = await fs.readFile(fullPath, 'utf-8');
+    const parsed = matter(rawContent);
+    const metadata = (parsed.data || {}) as Record<string, unknown>;
+    return {
+      status: String(metadata?.status || 'writing'),
+      title: String(metadata?.title || '').trim() || fallbackTitle,
+      draftType: String(metadata?.draftType || '').trim() || fallbackDraftType,
+      updatedAt: Number(metadata?.updatedAt || metadata?.createdAt || fallbackUpdatedAt) || fallbackUpdatedAt,
+      summary: summarizeManuscriptContent(parsed.content || ''),
+    };
+  } catch {
+    return {
+      status: 'writing',
+      title: fallbackTitle,
+      draftType: fallbackDraftType,
+      updatedAt: fallbackUpdatedAt,
+      summary: '',
+    };
+  }
+}
+
 async function readManuscriptPackage(packagePath: string): Promise<{ content: string; metadata: Record<string, unknown> }> {
   const manifestPath = getManuscriptPackageManifestPath(packagePath);
   const fileName = path.basename(packagePath);
@@ -5957,6 +6868,20 @@ async function saveManuscriptPackage(packagePath: string, content: string, metad
   await fs.writeFile(getManuscriptPackageManifestPath(packagePath), JSON.stringify(packageMetadata, null, 2), 'utf-8');
 }
 
+async function touchManuscriptPackageUpdatedAt(packagePath: string) {
+  try {
+    const manifestPath = getManuscriptPackageManifestPath(packagePath);
+    const existing = await readJsonFromFile<Record<string, unknown>>(manifestPath, {});
+    const next = {
+      ...existing,
+      updatedAt: Date.now(),
+    };
+    await fs.writeFile(manifestPath, JSON.stringify(next, null, 2), 'utf-8');
+  } catch (error) {
+    console.error('Failed to touch manuscript package updatedAt:', error);
+  }
+}
+
 function createEmptyOtioTimeline(title: string) {
   return {
     OTIO_SCHEMA: 'Timeline.1',
@@ -5985,6 +6910,133 @@ function createEmptyOtioTimeline(title: string) {
       version: 1,
     },
   };
+}
+
+function createTimelineClipId(): string {
+  return `clip_${ulid()}`;
+}
+
+function guessMediaMimeTypeByFilePath(inputPath: string): string {
+  const ext = path.extname(inputPath).toLowerCase();
+  if (['.jpg', '.jpeg'].includes(ext)) return 'image/jpeg';
+  if (ext === '.png') return 'image/png';
+  if (ext === '.webp') return 'image/webp';
+  if (ext === '.gif') return 'image/gif';
+  if (ext === '.bmp') return 'image/bmp';
+  if (ext === '.svg') return 'image/svg+xml';
+  if (ext === '.mp4') return 'video/mp4';
+  if (ext === '.mov') return 'video/quicktime';
+  if (ext === '.webm') return 'video/webm';
+  if (ext === '.m4v') return 'video/x-m4v';
+  if (ext === '.avi') return 'video/x-msvideo';
+  if (ext === '.mkv') return 'video/x-matroska';
+  if (ext === '.mp3') return 'audio/mpeg';
+  if (ext === '.wav') return 'audio/wav';
+  if (ext === '.m4a') return 'audio/mp4';
+  if (ext === '.aac') return 'audio/aac';
+  if (ext === '.flac') return 'audio/flac';
+  if (ext === '.ogg') return 'audio/ogg';
+  if (ext === '.opus') return 'audio/opus';
+  return 'application/octet-stream';
+}
+
+function inferAssetKindFromPathOrMime(inputPath: string, mimeType?: string): 'image' | 'video' | 'audio' | 'unknown' {
+  const mime = String(mimeType || '').toLowerCase();
+  const ref = String(inputPath || '').toLowerCase();
+  if (mime.startsWith('image/') || /\.(png|jpg|jpeg|webp|gif|bmp|svg)$/i.test(ref)) return 'image';
+  if (mime.startsWith('video/') || /\.(mp4|mov|webm|m4v|avi|mkv)$/i.test(ref)) return 'video';
+  if (mime.startsWith('audio/') || /\.(mp3|wav|m4a|aac|flac|ogg|opus)$/i.test(ref)) return 'audio';
+  return 'unknown';
+}
+
+function getTimelineClipIdentity(clip: any, fallbackTrackName = '', fallbackIndex = 0): string {
+  const metadata = (clip?.metadata && typeof clip.metadata === 'object') ? clip.metadata : {};
+  const explicitClipId = String(metadata.clipId || '').trim();
+  if (explicitClipId) return explicitClipId;
+  const assetId = String(metadata.assetId || clip?.media_references?.DEFAULT_MEDIA?.metadata?.assetId || '').trim();
+  const name = String(clip?.name || '').trim();
+  return `${fallbackTrackName}:${assetId || name || 'clip'}:${fallbackIndex}`;
+}
+
+function ensureTimelineTrack(timeline: Record<string, unknown>, trackName: string, kind: 'Video' | 'Audio') {
+  const stack = ((timeline as any).tracks ||= { OTIO_SCHEMA: 'Stack.1', children: [] });
+  const tracks = Array.isArray(stack.children) ? stack.children : [];
+  const existing = tracks.find((track: any) => String(track?.name || '').trim() === trackName);
+  if (existing) return existing;
+  const nextTrack = {
+    OTIO_SCHEMA: 'Track.1',
+    name: trackName,
+    kind,
+    children: [],
+  };
+  tracks.push(nextTrack);
+  stack.children = tracks;
+  return nextTrack;
+}
+
+async function attachExternalFileToPackage(packagePath: string, input: {
+  absolutePath: string;
+  title?: string;
+  mimeType?: string;
+}): Promise<void> {
+  const normalizedAbsolutePath = path.resolve(input.absolutePath);
+  const mimeType = String(input.mimeType || guessMediaMimeTypeByFilePath(normalizedAbsolutePath)).trim();
+  const assetKind = inferAssetKindFromPathOrMime(normalizedAbsolutePath, mimeType);
+  const assetId = `external_${ulid()}`;
+  const title = String(input.title || path.basename(normalizedAbsolutePath)).trim() || path.basename(normalizedAbsolutePath);
+
+  const assetsPath = getManuscriptPackageAssetsPath(packagePath);
+  const assetsJson = await readJsonFromFile<{ items: Array<Record<string, unknown>> }>(assetsPath, { items: [] });
+  assetsJson.items.push({
+    assetId,
+    mediaPath: normalizedAbsolutePath,
+    source: 'external-file',
+    mimeType,
+    title,
+    role: 'asset',
+    boundAt: new Date().toISOString(),
+  });
+  await fs.writeFile(assetsPath, JSON.stringify(assetsJson, null, 2), 'utf-8');
+
+  const timelinePath = getManuscriptPackageTimelinePath(packagePath);
+  const timeline = await readJsonFromFile<Record<string, unknown>>(timelinePath, createEmptyOtioTimeline(path.basename(packagePath)));
+  const preferredTrackName = assetKind === 'audio' ? 'A1' : 'V1';
+  const preferredKind = preferredTrackName.startsWith('A') ? 'Audio' as const : 'Video' as const;
+  const targetTrack = ensureTimelineTrack(timeline, preferredTrackName, preferredKind);
+  const targetChildren = Array.isArray((targetTrack as any)?.children) ? targetTrack.children : [];
+  const desiredOrder = targetChildren.length;
+  targetChildren.push({
+    OTIO_SCHEMA: 'Clip.2',
+    name: title,
+    source_range: null,
+    media_references: {
+      DEFAULT_MEDIA: {
+        OTIO_SCHEMA: 'ExternalReference.1',
+        target_url: normalizedAbsolutePath,
+        available_range: null,
+        metadata: {
+          assetId,
+          mimeType,
+        },
+      },
+    },
+    active_media_reference_key: 'DEFAULT_MEDIA',
+    metadata: {
+      clipId: createTimelineClipId(),
+      assetId,
+      assetKind,
+      source: 'external-file',
+      order: desiredOrder,
+      durationMs: null,
+      trimInMs: 0,
+      trimOutMs: 0,
+      enabled: true,
+      addedAt: new Date().toISOString(),
+    },
+  });
+  targetTrack.children = targetChildren;
+  normalizePackageTimeline(timeline);
+  await fs.writeFile(timelinePath, JSON.stringify(timeline, null, 2), 'utf-8');
 }
 
 async function readJsonFromFile<T>(filePath: string, fallback: T): Promise<T> {
@@ -6018,6 +7070,7 @@ function buildTimelineClipSummaries(timeline: Record<string, unknown>) {
       const assetId = String(metadata.assetId || mediaRef?.metadata?.assetId || '').trim();
       const sourceRef = assetId ? sourceRefByAssetId.get(assetId) : null;
       clips.push({
+        clipId: getTimelineClipIdentity(clip, trackName, index),
         assetId,
         name: String(clip?.name || assetId || `Clip ${index + 1}`),
         track: trackName,
@@ -6060,6 +7113,7 @@ function normalizePackageTimeline(timeline: Record<string, unknown>) {
         ...clip,
         metadata: {
           ...metadata,
+          clipId: getTimelineClipIdentity(clip, trackName, index),
           order: index,
           durationMs: metadata.durationMs ?? null,
           trimInMs: Number(metadata.trimInMs ?? 0) || 0,
@@ -6104,13 +7158,40 @@ async function getManuscriptPackageState(packagePath: string) {
     hasWechatHtml = Boolean(wechatHtml.trim());
   } catch {}
 
+  const enrichedAssets = await Promise.all((assets.items || []).map(async (item) => {
+    const mediaPath = String(item.mediaPath || '').trim();
+    if (!mediaPath) {
+      return { ...item, exists: false };
+    }
+    const absolutePath = path.isAbsolute(mediaPath) ? mediaPath : getAbsoluteMediaPath(mediaPath);
+    try {
+      await fs.access(absolutePath);
+      return {
+        ...item,
+        absolutePath,
+        previewUrl: toLocalFileUrl(absolutePath),
+        exists: true,
+      };
+    } catch {
+      return {
+        ...item,
+        absolutePath,
+        previewUrl: toLocalFileUrl(absolutePath),
+        exists: false,
+      };
+    }
+  }));
+
   return {
     manifest: {
       ...manifest,
       packageKind: manifest.packageKind || getPackageKindFromFileName(fileName),
       draftType: manifest.draftType || getDraftTypeFromFileName(fileName),
     },
-    assets,
+    assets: {
+      ...assets,
+      items: enrichedAssets,
+    },
     cover,
     images,
     timelineSummary: {
@@ -6220,10 +7301,10 @@ async function ensureManuscriptsDir() {
 }
 
 // 递归构建文件树
-async function buildFileTree(dirPath: string, basePath: string): Promise<{ name: string; path: string; isDirectory: boolean; children?: unknown[]; status?: string }[]> {
+async function buildFileTree(dirPath: string, basePath: string): Promise<ManuscriptTreeNode[]> {
   const fs = require('fs/promises');
   const entries = await fs.readdir(dirPath, { withFileTypes: true });
-  const result: { name: string; path: string; isDirectory: boolean; children?: unknown[]; status?: string }[] = [];
+  const result: ManuscriptTreeNode[] = [];
 
   // Sort: directories first, then alphabetically
   const sorted = entries.sort((a: { isDirectory: () => boolean; name: string }, b: { isDirectory: () => boolean; name: string }) => {
@@ -6238,21 +7319,30 @@ async function buildFileTree(dirPath: string, basePath: string): Promise<{ name:
 
     if (entry.isDirectory()) {
       if (isManuscriptPackageName(entry.name)) {
-        let status = 'writing';
+        const metadata = await readManuscriptListMetadata(fullPath, entry.name, true);
         try {
-          const { metadata } = await readManuscriptPackage(fullPath);
-          if (metadata && metadata.status) {
-            status = String(metadata.status);
-          }
+          result.push({
+            name: entry.name,
+            path: relativePath,
+            isDirectory: false,
+            status: metadata.status,
+            title: metadata.title,
+            draftType: metadata.draftType,
+            updatedAt: metadata.updatedAt,
+            summary: metadata.summary,
+          });
         } catch {
-          // Ignore error
+          result.push({
+            name: entry.name,
+            path: relativePath,
+            isDirectory: false,
+            status: 'writing',
+            title: '未命名',
+            draftType: getDraftTypeFromFileName(entry.name),
+            updatedAt: undefined,
+            summary: '',
+          });
         }
-        result.push({
-          name: entry.name,
-          path: relativePath,
-          isDirectory: false,
-          status
-        });
         continue;
       }
       const children = await buildFileTree(fullPath, basePath);
@@ -6263,21 +7353,16 @@ async function buildFileTree(dirPath: string, basePath: string): Promise<{ name:
         children
       });
     } else if (isSupportedManuscriptFile(entry.name)) {
-      let status = 'writing';
-      try {
-        const content = await fs.readFile(fullPath, 'utf-8');
-        const { data } = matter(content);
-        if (data && data.status) {
-          status = data.status;
-        }
-      } catch (e) {
-        // Ignore error
-      }
+      const metadata = await readManuscriptListMetadata(fullPath, entry.name, false);
       result.push({
         name: entry.name,
         path: relativePath,
         isDirectory: false,
-        status
+        status: metadata.status,
+        title: metadata.title,
+        draftType: metadata.draftType,
+        updatedAt: metadata.updatedAt,
+        summary: metadata.summary,
       });
     }
   }
@@ -6285,14 +7370,26 @@ async function buildFileTree(dirPath: string, basePath: string): Promise<{ name:
   return result;
 }
 
-// 列出文件树
-ipcMain.handle('manuscripts:list', async () => {
-  const fs = require('fs/promises');
+async function listManuscriptTreeWithCache() {
   await ensureManuscriptsDir();
   const baseDir = getManuscriptsDir();
+  const cacheKey = baseDir;
+  const cached = manuscriptTreeCache.get(cacheKey);
+  if (cached && Date.now() - cached.generatedAt < MANUSCRIPT_TREE_CACHE_TTL_MS) {
+    return cached.tree as ManuscriptTreeNode[];
+  }
+  const tree = await buildFileTree(baseDir, baseDir);
+  manuscriptTreeCache.set(cacheKey, {
+    tree,
+    generatedAt: Date.now(),
+  });
+  return tree;
+}
 
+// 列出文件树
+ipcMain.handle('manuscripts:list', async () => {
   try {
-    const tree = await buildFileTree(baseDir, baseDir);
+    const tree = await listManuscriptTreeWithCache();
     return tree;
   } catch (error) {
     console.error('Failed to list manuscripts:', error);
@@ -6366,6 +7463,8 @@ ipcMain.handle('manuscripts:save', async (_, { path: filePath, content, metadata
           }
         });
       }
+      invalidateManuscriptTreeCache(getManuscriptsDir());
+      emitRendererDataChanged('manuscripts', { action: 'save', entityId: filePath });
       return { success: true };
     }
 
@@ -6395,6 +7494,8 @@ ipcMain.handle('manuscripts:save', async (_, { path: filePath, content, metadata
       });
     }
 
+    invalidateManuscriptTreeCache(getManuscriptsDir());
+    emitRendererDataChanged('manuscripts', { action: 'save', entityId: filePath });
     return { success: true };
   } catch (error) {
     console.error('Failed to save manuscript:', error);
@@ -6485,6 +7586,8 @@ ipcMain.handle('manuscripts:save-layout', async (_, layout: any) => {
 
   try {
     await fs.writeFile(layoutPath, JSON.stringify(layout, null, 2), 'utf-8');
+    invalidateManuscriptTreeCache(getManuscriptsDir());
+    emitRendererDataChanged('manuscripts', { action: 'layout-save' });
     return { success: true };
   } catch (error) {
     console.error('Failed to save layout:', error);
@@ -6499,6 +7602,8 @@ ipcMain.handle('manuscripts:create-folder', async (_, { parentPath, name }: { pa
 
   try {
     await fs.mkdir(fullPath, { recursive: true });
+    invalidateManuscriptTreeCache(getManuscriptsDir());
+    emitRendererDataChanged('manuscripts', { action: 'create-folder', entityId: path.relative(getManuscriptsDir(), fullPath) });
     return { success: true };
   } catch (error) {
     console.error('Failed to create folder:', error);
@@ -6528,6 +7633,8 @@ ipcMain.handle('manuscripts:create-file', async (_, { parentPath, name, content,
     } else {
       await fs.writeFile(fullPath, content || '', 'utf-8');
     }
+    invalidateManuscriptTreeCache(getManuscriptsDir());
+    emitRendererDataChanged('manuscripts', { action: 'create-file', entityId: path.relative(getManuscriptsDir(), fullPath) });
     return { success: true, path: path.relative(getManuscriptsDir(), fullPath) };
   } catch (error) {
     console.error('Failed to create file:', error);
@@ -6542,6 +7649,8 @@ ipcMain.handle('manuscripts:delete', async (_, filePath: string) => {
 
   try {
     await fs.rm(fullPath, { recursive: true, force: true });
+    invalidateManuscriptTreeCache(getManuscriptsDir());
+    emitRendererDataChanged('manuscripts', { action: 'delete', entityId: filePath });
     return { success: true };
   } catch (error) {
     console.error('Failed to delete manuscript:', error);
@@ -6558,6 +7667,12 @@ ipcMain.handle('manuscripts:rename', async (_, { oldPath, newName }: { oldPath: 
 
   try {
     await fs.rename(oldFullPath, newFullPath);
+    invalidateManuscriptTreeCache(getManuscriptsDir());
+    emitRendererDataChanged('manuscripts', {
+      action: 'rename',
+      entityId: path.relative(getManuscriptsDir(), newFullPath),
+      oldPath,
+    });
     return { success: true, newPath: path.relative(getManuscriptsDir(), newFullPath) };
   } catch (error) {
     console.error('Failed to rename manuscript:', error);
@@ -6575,6 +7690,12 @@ ipcMain.handle('manuscripts:upgrade-to-package', async (_, {
   try {
     const targetExtension = targetKind === 'article' ? ARTICLE_DRAFT_EXTENSION : POST_DRAFT_EXTENSION;
     const newPath = await upgradeMarkdownManuscriptToPackage(sourcePath, targetExtension);
+    invalidateManuscriptTreeCache(getManuscriptsDir());
+    emitRendererDataChanged('manuscripts', {
+      action: 'upgrade',
+      entityId: newPath,
+      sourcePath,
+    });
     return { success: true, newPath };
   } catch (error) {
     console.error('Failed to upgrade manuscript to package:', error);
@@ -6599,8 +7720,118 @@ ipcMain.handle('manuscripts:get-package-state', async (_, filePath: string) => {
   }
 });
 
+ipcMain.handle('manuscripts:get-editor-runtime-state', async (_, payload?: string | { filePath?: string }) => {
+  const filePath = typeof payload === 'string'
+    ? payload.trim()
+    : String(payload?.filePath || '').trim();
+  if (!filePath) {
+    return { success: false, error: 'filePath is required' };
+  }
+  return {
+    success: true,
+    state: serializeEditorRuntimeState(filePath),
+  };
+});
+
+ipcMain.handle('manuscripts:update-editor-runtime-state', async (_, payload?: {
+  filePath?: string;
+  sessionId?: string;
+  playheadSeconds?: number;
+  selectedClipId?: string;
+  selectedClipIds?: unknown;
+  activeTrackId?: string;
+  selectedTrackIds?: unknown;
+  selectedSceneId?: string;
+  previewTab?: string;
+  canvasRatioPreset?: string;
+  activePanel?: string;
+  drawerPanel?: string;
+  sceneItemTransforms?: unknown;
+  sceneItemVisibility?: unknown;
+  sceneItemOrder?: unknown;
+  sceneItemLocks?: unknown;
+  sceneItemGroups?: unknown;
+  focusedGroupId?: string;
+  trackUi?: unknown;
+  viewportScrollLeft?: number;
+  viewportMaxScrollLeft?: number;
+  viewportScrollTop?: number;
+  viewportMaxScrollTop?: number;
+  timelineZoomPercent?: number;
+}) => {
+  const filePath = String(payload?.filePath || '').trim();
+  if (!filePath) {
+    return { success: false, error: 'filePath is required' };
+  }
+
+  const previous = editorRuntimeStates.get(filePath) || buildEmptyEditorRuntimeState(filePath);
+  const next: EditorRuntimeStateRecord = {
+    ...previous,
+    filePath,
+    sessionId: String(payload?.sessionId || '').trim() || undefined,
+    playheadSeconds: Number.isFinite(Number(payload?.playheadSeconds))
+      ? Number(payload?.playheadSeconds)
+      : previous.playheadSeconds,
+    selectedClipId: String(payload?.selectedClipId || '').trim() || undefined,
+    selectedClipIds: payload && Object.prototype.hasOwnProperty.call(payload, 'selectedClipIds')
+      ? payload.selectedClipIds
+      : previous.selectedClipIds,
+    activeTrackId: String(payload?.activeTrackId || '').trim() || undefined,
+    selectedTrackIds: payload && Object.prototype.hasOwnProperty.call(payload, 'selectedTrackIds')
+      ? payload.selectedTrackIds
+      : previous.selectedTrackIds,
+    selectedSceneId: String(payload?.selectedSceneId || '').trim() || undefined,
+    previewTab: String(payload?.previewTab || '').trim() || undefined,
+    canvasRatioPreset: String(payload?.canvasRatioPreset || '').trim() || undefined,
+    activePanel: String(payload?.activePanel || '').trim() || undefined,
+    drawerPanel: String(payload?.drawerPanel || '').trim() || undefined,
+    sceneItemTransforms: payload && Object.prototype.hasOwnProperty.call(payload, 'sceneItemTransforms')
+      ? payload.sceneItemTransforms
+      : previous.sceneItemTransforms,
+    sceneItemVisibility: payload && Object.prototype.hasOwnProperty.call(payload, 'sceneItemVisibility')
+      ? payload.sceneItemVisibility
+      : previous.sceneItemVisibility,
+    sceneItemOrder: payload && Object.prototype.hasOwnProperty.call(payload, 'sceneItemOrder')
+      ? payload.sceneItemOrder
+      : previous.sceneItemOrder,
+    sceneItemLocks: payload && Object.prototype.hasOwnProperty.call(payload, 'sceneItemLocks')
+      ? payload.sceneItemLocks
+      : previous.sceneItemLocks,
+    sceneItemGroups: payload && Object.prototype.hasOwnProperty.call(payload, 'sceneItemGroups')
+      ? payload.sceneItemGroups
+      : previous.sceneItemGroups,
+    focusedGroupId: String(payload?.focusedGroupId || '').trim() || undefined,
+    trackUi: payload && Object.prototype.hasOwnProperty.call(payload, 'trackUi')
+      ? payload.trackUi
+      : previous.trackUi,
+    viewportScrollLeft: Number.isFinite(Number(payload?.viewportScrollLeft))
+      ? Number(payload?.viewportScrollLeft)
+      : previous.viewportScrollLeft,
+    viewportMaxScrollLeft: Number.isFinite(Number(payload?.viewportMaxScrollLeft))
+      ? Number(payload?.viewportMaxScrollLeft)
+      : previous.viewportMaxScrollLeft,
+    viewportScrollTop: Number.isFinite(Number(payload?.viewportScrollTop))
+      ? Number(payload?.viewportScrollTop)
+      : previous.viewportScrollTop,
+    viewportMaxScrollTop: Number.isFinite(Number(payload?.viewportMaxScrollTop))
+      ? Number(payload?.viewportMaxScrollTop)
+      : previous.viewportMaxScrollTop,
+    timelineZoomPercent: Number.isFinite(Number(payload?.timelineZoomPercent))
+      ? Number(payload?.timelineZoomPercent)
+      : previous.timelineZoomPercent,
+    updatedAt: nowMs(),
+  };
+
+  editorRuntimeStates.set(filePath, next);
+  return {
+    success: true,
+    state: serializeEditorRuntimeState(filePath),
+  };
+});
+
 ipcMain.handle('manuscripts:update-package-clip', async (_, payload?: {
   filePath?: string;
+  clipId?: string;
   assetId?: string;
   track?: string;
   order?: number;
@@ -6611,9 +7842,10 @@ ipcMain.handle('manuscripts:update-package-clip', async (_, payload?: {
 }) => {
   try {
     const filePath = String(payload?.filePath || '').trim();
+    const clipId = String(payload?.clipId || '').trim();
     const assetId = String(payload?.assetId || '').trim();
-    if (!filePath || !assetId) {
-      return { success: false, error: 'filePath and assetId are required' };
+    if (!filePath || (!clipId && !assetId)) {
+      return { success: false, error: 'filePath and clipId/assetId are required' };
     }
     const fullPath = path.join(getManuscriptsDir(), filePath);
     const stats = await fs.stat(fullPath);
@@ -6627,9 +7859,17 @@ ipcMain.handle('manuscripts:update-package-clip', async (_, payload?: {
     let clipToMove: any = null;
     let currentTrack: any = null;
 
+    const matchesTargetClip = (clip: any, trackName: string, index: number) => {
+      if (clipId) {
+        return getTimelineClipIdentity(clip, trackName, index) === clipId;
+      }
+      return String(clip?.metadata?.assetId || clip?.media_references?.DEFAULT_MEDIA?.metadata?.assetId || '').trim() === assetId;
+    };
+
     for (const track of tracks) {
       const children = Array.isArray((track as any)?.children) ? track.children : [];
-      const clipIndex = children.findIndex((clip: any) => String(clip?.metadata?.assetId || clip?.media_references?.DEFAULT_MEDIA?.metadata?.assetId || '').trim() === assetId);
+      const trackName = String((track as any)?.name || '').trim();
+      const clipIndex = children.findIndex((clip: any, index: number) => matchesTargetClip(clip, trackName, index));
       if (clipIndex >= 0) {
         clipToMove = children.splice(clipIndex, 1)[0];
         currentTrack = track;
@@ -6649,6 +7889,7 @@ ipcMain.handle('manuscripts:update-package-clip', async (_, payload?: {
       ...clipToMove,
       metadata: {
         ...nextMetadata,
+        clipId: String(nextMetadata.clipId || '').trim() || clipId || createTimelineClipId(),
         durationMs: payload?.durationMs === null ? null : (payload?.durationMs ?? nextMetadata.durationMs ?? null),
         trimInMs: payload?.trimInMs ?? nextMetadata.trimInMs ?? 0,
         trimOutMs: payload?.trimOutMs ?? nextMetadata.trimOutMs ?? 0,
@@ -6663,9 +7904,258 @@ ipcMain.handle('manuscripts:update-package-clip', async (_, payload?: {
 
     normalizePackageTimeline(timeline);
     await fs.writeFile(timelinePath, JSON.stringify(timeline, null, 2), 'utf-8');
+    await touchManuscriptPackageUpdatedAt(fullPath);
+    invalidateManuscriptTreeCache(getManuscriptsDir());
+    emitRendererDataChanged('manuscripts', { action: 'clip-update', entityId: filePath });
     return { success: true, state: await getManuscriptPackageState(fullPath) };
   } catch (error) {
     console.error('Failed to update manuscript package clip:', error);
+    return { success: false, error: error instanceof Error ? error.message : String(error) };
+  }
+});
+
+ipcMain.handle('manuscripts:add-package-track', async (_, payload?: {
+  filePath?: string;
+  kind?: 'video' | 'audio';
+}) => {
+  try {
+    const filePath = String(payload?.filePath || '').trim();
+    const kind = String(payload?.kind || 'video').trim().toLowerCase() === 'audio' ? 'audio' : 'video';
+    if (!filePath) {
+      return { success: false, error: 'filePath is required' };
+    }
+    const fullPath = path.join(getManuscriptsDir(), filePath);
+    const stats = await fs.stat(fullPath);
+    if (!stats.isDirectory() || !isManuscriptPackageName(path.basename(fullPath))) {
+      return { success: false, error: 'Not a manuscript package' };
+    }
+
+    const timelinePath = getManuscriptPackageTimelinePath(fullPath);
+    const timeline = await readJsonFromFile<Record<string, unknown>>(timelinePath, createEmptyOtioTimeline(path.basename(fullPath)));
+    const tracks = Array.isArray((timeline as any)?.tracks?.children) ? (timeline as any).tracks.children : [];
+    const prefix = kind === 'audio' ? 'A' : 'V';
+    const kindLabel = kind === 'audio' ? 'Audio' as const : 'Video' as const;
+    const existingIndexes = tracks
+      .map((track: any) => String(track?.name || '').trim())
+      .filter((name: string) => name.startsWith(prefix))
+      .map((name: string) => Number(name.slice(1)))
+      .filter((value: number) => Number.isFinite(value));
+    const nextIndex = existingIndexes.length > 0 ? Math.max(...existingIndexes) + 1 : 1;
+    ensureTimelineTrack(timeline, `${prefix}${nextIndex}`, kindLabel);
+    normalizePackageTimeline(timeline);
+    await fs.writeFile(timelinePath, JSON.stringify(timeline, null, 2), 'utf-8');
+    await touchManuscriptPackageUpdatedAt(fullPath);
+    invalidateManuscriptTreeCache(getManuscriptsDir());
+    emitRendererDataChanged('manuscripts', { action: 'track-add', entityId: filePath });
+    return { success: true, state: await getManuscriptPackageState(fullPath) };
+  } catch (error) {
+    console.error('Failed to add manuscript package track:', error);
+    return { success: false, error: error instanceof Error ? error.message : String(error) };
+  }
+});
+
+ipcMain.handle('manuscripts:add-package-clip', async (_, payload?: {
+  filePath?: string;
+  assetId?: string;
+  track?: string;
+  order?: number;
+  durationMs?: number | null;
+}) => {
+  try {
+    const filePath = String(payload?.filePath || '').trim();
+    const assetId = String(payload?.assetId || '').trim();
+    if (!filePath || !assetId) {
+      return { success: false, error: 'filePath and assetId are required' };
+    }
+    const fullPath = path.join(getManuscriptsDir(), filePath);
+    const stats = await fs.stat(fullPath);
+    if (!stats.isDirectory() || !isManuscriptPackageName(path.basename(fullPath))) {
+      return { success: false, error: 'Not a manuscript package' };
+    }
+
+    const asset = (await listMediaAssets(5000)).find((item) => item.id === assetId);
+    if (!asset) {
+      return { success: false, error: 'Media asset not found' };
+    }
+
+    const assetKind = String(asset.mimeType || '').startsWith('audio/')
+      ? 'audio'
+      : String(asset.mimeType || '').startsWith('video/')
+        ? 'video'
+        : /\.(mp3|wav|m4a|aac|flac|ogg|opus)$/i.test(String(asset.relativePath || ''))
+          ? 'audio'
+          : /\.(mp4|mov|webm|m4v|avi|mkv)$/i.test(String(asset.relativePath || ''))
+            ? 'video'
+            : /\.(png|jpg|jpeg|webp|gif|bmp|svg)$/i.test(String(asset.relativePath || ''))
+              ? 'image'
+              : 'unknown';
+
+    const timelinePath = getManuscriptPackageTimelinePath(fullPath);
+    const timeline = await readJsonFromFile<Record<string, unknown>>(timelinePath, createEmptyOtioTimeline(path.basename(fullPath)));
+    const preferredTrackName = String(payload?.track || '').trim()
+      || (assetKind === 'audio' ? 'A1' : 'V1');
+    const targetTrack = ensureTimelineTrack(
+      timeline,
+      preferredTrackName,
+      preferredTrackName.startsWith('A') ? 'Audio' : 'Video'
+    );
+    const targetChildren = Array.isArray((targetTrack as any)?.children) ? targetTrack.children : [];
+    const desiredOrder = typeof payload?.order === 'number' && Number.isFinite(payload.order)
+      ? Math.max(0, Math.min(Math.trunc(payload.order), targetChildren.length))
+      : targetChildren.length;
+
+    const nextClip = {
+      OTIO_SCHEMA: 'Clip.2',
+      name: asset.title || asset.id,
+      source_range: null,
+      media_references: {
+        DEFAULT_MEDIA: {
+          OTIO_SCHEMA: 'ExternalReference.1',
+          target_url: asset.relativePath || '',
+          available_range: null,
+          metadata: {
+            assetId: asset.id,
+            mimeType: asset.mimeType || '',
+          },
+        },
+      },
+      active_media_reference_key: 'DEFAULT_MEDIA',
+      metadata: {
+        clipId: createTimelineClipId(),
+        assetId: asset.id,
+        assetKind,
+        source: 'media-library',
+        order: desiredOrder,
+        durationMs: payload?.durationMs ?? null,
+        trimInMs: 0,
+        trimOutMs: 0,
+        enabled: true,
+        addedAt: new Date().toISOString(),
+      },
+    };
+
+    targetChildren.splice(desiredOrder, 0, nextClip);
+    targetTrack.children = targetChildren;
+    normalizePackageTimeline(timeline);
+    await fs.writeFile(timelinePath, JSON.stringify(timeline, null, 2), 'utf-8');
+    await touchManuscriptPackageUpdatedAt(fullPath);
+    invalidateManuscriptTreeCache(getManuscriptsDir());
+    emitRendererDataChanged('manuscripts', { action: 'clip-add', entityId: filePath });
+    return { success: true, state: await getManuscriptPackageState(fullPath) };
+  } catch (error) {
+    console.error('Failed to add manuscript package clip:', error);
+    return { success: false, error: error instanceof Error ? error.message : String(error) };
+  }
+});
+
+ipcMain.handle('manuscripts:delete-package-clip', async (_, payload?: {
+  filePath?: string;
+  clipId?: string;
+}) => {
+  try {
+    const filePath = String(payload?.filePath || '').trim();
+    const clipId = String(payload?.clipId || '').trim();
+    if (!filePath || !clipId) {
+      return { success: false, error: 'filePath and clipId are required' };
+    }
+    const fullPath = path.join(getManuscriptsDir(), filePath);
+    const stats = await fs.stat(fullPath);
+    if (!stats.isDirectory() || !isManuscriptPackageName(path.basename(fullPath))) {
+      return { success: false, error: 'Not a manuscript package' };
+    }
+    const timelinePath = getManuscriptPackageTimelinePath(fullPath);
+    const timeline = await readJsonFromFile<Record<string, unknown>>(timelinePath, createEmptyOtioTimeline(path.basename(fullPath)));
+    const tracks = Array.isArray((timeline as any)?.tracks?.children) ? (timeline as any).tracks.children : [];
+    let removed = false;
+    for (const track of tracks) {
+      const trackName = String((track as any)?.name || '').trim();
+      const children = Array.isArray((track as any)?.children) ? track.children : [];
+      const nextChildren = children.filter((clip: any, index: number) => {
+        const matches = getTimelineClipIdentity(clip, trackName, index) === clipId;
+        if (matches) removed = true;
+        return !matches;
+      });
+      track.children = nextChildren;
+    }
+    if (!removed) {
+      return { success: false, error: 'Clip not found in timeline' };
+    }
+    normalizePackageTimeline(timeline);
+    await fs.writeFile(timelinePath, JSON.stringify(timeline, null, 2), 'utf-8');
+    await touchManuscriptPackageUpdatedAt(fullPath);
+    invalidateManuscriptTreeCache(getManuscriptsDir());
+    emitRendererDataChanged('manuscripts', { action: 'clip-delete', entityId: filePath });
+    return { success: true, state: await getManuscriptPackageState(fullPath) };
+  } catch (error) {
+    console.error('Failed to delete manuscript package clip:', error);
+    return { success: false, error: error instanceof Error ? error.message : String(error) };
+  }
+});
+
+ipcMain.handle('manuscripts:split-package-clip', async (_, payload?: {
+  filePath?: string;
+  clipId?: string;
+  splitRatio?: number;
+}) => {
+  try {
+    const filePath = String(payload?.filePath || '').trim();
+    const clipId = String(payload?.clipId || '').trim();
+    const splitRatioRaw = Number(payload?.splitRatio);
+    const splitRatio = Number.isFinite(splitRatioRaw) ? Math.min(Math.max(splitRatioRaw, 0.1), 0.9) : 0.5;
+    if (!filePath || !clipId) {
+      return { success: false, error: 'filePath and clipId are required' };
+    }
+    const fullPath = path.join(getManuscriptsDir(), filePath);
+    const stats = await fs.stat(fullPath);
+    if (!stats.isDirectory() || !isManuscriptPackageName(path.basename(fullPath))) {
+      return { success: false, error: 'Not a manuscript package' };
+    }
+    const timelinePath = getManuscriptPackageTimelinePath(fullPath);
+    const timeline = await readJsonFromFile<Record<string, unknown>>(timelinePath, createEmptyOtioTimeline(path.basename(fullPath)));
+    const tracks = Array.isArray((timeline as any)?.tracks?.children) ? (timeline as any).tracks.children : [];
+    let splitDone = false;
+    for (const track of tracks) {
+      const trackName = String((track as any)?.name || '').trim();
+      const children = Array.isArray((track as any)?.children) ? track.children : [];
+      const nextChildren: any[] = [];
+      for (let index = 0; index < children.length; index += 1) {
+        const clip = children[index];
+        nextChildren.push(clip);
+        if (getTimelineClipIdentity(clip, trackName, index) !== clipId) continue;
+        const metadata = (clip?.metadata && typeof clip.metadata === 'object') ? clip.metadata : {};
+        const currentDuration = Number(metadata.durationMs ?? 4000) || 4000;
+        const firstDuration = Math.max(1000, Math.round(currentDuration * splitRatio));
+        const secondDuration = Math.max(1000, currentDuration - firstDuration);
+        clip.metadata = {
+          ...metadata,
+          clipId: String(metadata.clipId || '').trim() || clipId,
+          durationMs: firstDuration,
+        };
+        nextChildren.push({
+          ...clip,
+          metadata: {
+            ...metadata,
+            clipId: createTimelineClipId(),
+            durationMs: secondDuration,
+            trimInMs: Number(metadata.trimInMs ?? 0) + firstDuration,
+          },
+        });
+        splitDone = true;
+      }
+      track.children = nextChildren;
+      if (splitDone) break;
+    }
+    if (!splitDone) {
+      return { success: false, error: 'Clip not found in timeline' };
+    }
+    normalizePackageTimeline(timeline);
+    await fs.writeFile(timelinePath, JSON.stringify(timeline, null, 2), 'utf-8');
+    await touchManuscriptPackageUpdatedAt(fullPath);
+    invalidateManuscriptTreeCache(getManuscriptsDir());
+    emitRendererDataChanged('manuscripts', { action: 'clip-split', entityId: filePath });
+    return { success: true, state: await getManuscriptPackageState(fullPath) };
+  } catch (error) {
+    console.error('Failed to split manuscript package clip:', error);
     return { success: false, error: error instanceof Error ? error.message : String(error) };
   }
 });
@@ -6689,9 +8179,69 @@ ipcMain.handle('manuscripts:save-formatted-html', async (_, payload?: {
     const wechatHtml = String(payload?.wechatHtml || layoutHtml);
     await fs.writeFile(getManuscriptPackageLayoutHtmlPath(fullPath), layoutHtml, 'utf-8');
     await fs.writeFile(getManuscriptPackageWechatHtmlPath(fullPath), wechatHtml, 'utf-8');
+    await touchManuscriptPackageUpdatedAt(fullPath);
+    invalidateManuscriptTreeCache(getManuscriptsDir());
+    emitRendererDataChanged('manuscripts', { action: 'save-formatted-html', entityId: sourcePath });
     return { success: true };
   } catch (error) {
     console.error('Failed to save manuscript formatted html:', error);
+    return { success: false, error: error instanceof Error ? error.message : String(error) };
+  }
+});
+
+ipcMain.handle('manuscripts:attach-external-files', async (_, payload?: {
+  filePath?: string;
+}) => {
+  try {
+    const filePath = String(payload?.filePath || '').trim();
+    if (!filePath) {
+      return { success: false, error: 'filePath is required' };
+    }
+    const fullPath = path.join(getManuscriptsDir(), filePath);
+    const stats = await fs.stat(fullPath);
+    if (!stats.isDirectory() || !isManuscriptPackageName(path.basename(fullPath))) {
+      return { success: false, error: 'Not a manuscript package' };
+    }
+
+    const picked = await dialog.showOpenDialog({
+      properties: ['openFile', 'multiSelections'],
+      filters: [
+        { name: '媒体文件', extensions: ['mp4', 'mov', 'webm', 'm4v', 'avi', 'mkv', 'mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus', 'png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'svg'] },
+        { name: '所有文件', extensions: ['*'] },
+      ],
+    });
+    if (picked.canceled || !picked.filePaths.length) {
+      return { success: true, canceled: true, imported: [] };
+    }
+
+    const imported: Array<Record<string, unknown>> = [];
+    for (const pickedPath of picked.filePaths) {
+      const absolutePath = path.resolve(pickedPath);
+      const pickedStats = await fs.stat(absolutePath).catch(() => null);
+      if (!pickedStats?.isFile()) continue;
+      await attachExternalFileToPackage(fullPath, {
+        absolutePath,
+        title: path.basename(absolutePath),
+        mimeType: guessMediaMimeTypeByFilePath(absolutePath),
+      });
+      imported.push({
+        absolutePath,
+        title: path.basename(absolutePath),
+        mimeType: guessMediaMimeTypeByFilePath(absolutePath),
+      });
+    }
+
+    await touchManuscriptPackageUpdatedAt(fullPath);
+    invalidateManuscriptTreeCache(getManuscriptsDir());
+    emitRendererDataChanged('manuscripts', { action: 'attach-external-files', entityId: filePath });
+    return {
+      success: true,
+      canceled: false,
+      imported,
+      state: await getManuscriptPackageState(fullPath),
+    };
+  } catch (error) {
+    console.error('Failed to attach external files to manuscript package:', error);
     return { success: false, error: error instanceof Error ? error.message : String(error) };
   }
 });
@@ -6706,6 +8256,12 @@ ipcMain.handle('manuscripts:move', async (_, { sourcePath, targetDir }: { source
   try {
     await fs.mkdir(path.dirname(targetFullPath), { recursive: true });
     await fs.rename(sourceFullPath, targetFullPath);
+    invalidateManuscriptTreeCache(getManuscriptsDir());
+    emitRendererDataChanged('manuscripts', {
+      action: 'move',
+      entityId: path.relative(getManuscriptsDir(), targetFullPath),
+      sourcePath,
+    });
     return { success: true, newPath: path.relative(getManuscriptsDir(), targetFullPath) };
   } catch (error) {
     console.error('Failed to move manuscript:', error);
@@ -6902,6 +8458,172 @@ const scheduleStaleDocumentIndexRefresh = async (sources: DocumentSourceRecord[]
   } finally {
     docIndexRefreshRunning = false;
   }
+};
+
+const listKnowledgeCatalogNotes = async () => {
+  await ensureKnowledgeRedbookDir();
+  const dirs = await fs.readdir(getKnowledgeRedbookDir(), { withFileTypes: true }).catch(() => []);
+  const notes: Array<Record<string, any>> = [];
+
+  for (const dir of dirs) {
+    if (!dir.isDirectory()) continue;
+    const noteDir = path.join(getKnowledgeRedbookDir(), dir.name);
+    const metaPath = path.join(noteDir, 'meta.json');
+    try {
+      const metaContent = await fs.readFile(metaPath, 'utf-8');
+      const meta = JSON.parse(metaContent) as Record<string, any>;
+      let cover = String(meta.cover || '').trim();
+      if (cover && !cover.startsWith('http')) {
+        cover = toLocalFileUrl(path.join(noteDir, cover));
+      }
+      const tags = Array.isArray(meta.tags) ? meta.tags.map((value: unknown) => String(value || '').trim()).filter(Boolean) : [];
+      notes.push({
+        id: dir.name,
+        title: String(meta.title || dir.name),
+        author: String(meta.author || meta.siteName || '原文链接'),
+        content: String(meta.content || ''),
+        excerpt: String(meta.excerpt || meta.summary || meta.content || ''),
+        siteName: String(meta.siteName || ''),
+        sourceUrl: String(meta.sourceUrl || meta.url || ''),
+        folderPath: noteDir,
+        coverUrl: cover || undefined,
+        createdAt: String(meta.createdAt || meta.updatedAt || new Date().toISOString()),
+        updatedAt: String(meta.updatedAt || meta.createdAt || new Date().toISOString()),
+        noteType: String(meta.type || ''),
+        captureKind: String(meta.captureKind || ''),
+        hasVideo: Boolean(meta.video),
+        hasTranscript: Boolean(String(meta.transcript || '').trim()),
+        status: String(meta.transcriptionStatus || ''),
+        tags,
+      });
+    } catch {
+      continue;
+    }
+  }
+
+  return notes;
+};
+
+const listKnowledgeCatalogYoutubeVideos = async () => {
+  await ensureKnowledgeYoutubeDir();
+  const dirs = await fs.readdir(getKnowledgeYoutubeDir(), { withFileTypes: true }).catch(() => []);
+  const videos: Array<Record<string, any>> = [];
+
+  for (const dir of dirs) {
+    if (!dir.isDirectory()) continue;
+    const videoDir = path.join(getKnowledgeYoutubeDir(), dir.name);
+    const metaPath = path.join(videoDir, 'meta.json');
+    try {
+      const metaContent = await fs.readFile(metaPath, 'utf-8');
+      const meta = JSON.parse(metaContent) as Record<string, any>;
+      let thumbnailUrl = String(meta.thumbnailUrl || '').trim();
+      if (meta.thumbnail) {
+        thumbnailUrl = toLocalFileUrl(path.join(videoDir, String(meta.thumbnail)));
+      }
+      let subtitleContent = '';
+      if (meta.subtitleFile) {
+        subtitleContent = await fs.readFile(path.join(videoDir, String(meta.subtitleFile)), 'utf-8').catch(() => '');
+      }
+      videos.push({
+        id: dir.name,
+        title: String(meta.title || dir.name),
+        description: String(meta.description || ''),
+        summary: String(meta.summary || subtitleContent || meta.description || ''),
+        thumbnailUrl: thumbnailUrl || undefined,
+        sourceUrl: String(meta.videoUrl || ''),
+        folderPath: videoDir,
+        createdAt: String(meta.createdAt || meta.updatedAt || new Date().toISOString()),
+        updatedAt: String(meta.updatedAt || meta.createdAt || new Date().toISOString()),
+        hasSubtitle: Boolean(meta.hasSubtitle),
+        subtitleContent,
+        status: String(meta.status || ''),
+        tags: [],
+      });
+    } catch {
+      continue;
+    }
+  }
+
+  return videos;
+};
+
+const buildKnowledgeCatalogItems = async () => {
+  const [notes, videos, { views, sources }] = await Promise.all([
+    listKnowledgeCatalogNotes(),
+    listKnowledgeCatalogYoutubeVideos(),
+    buildDocumentKnowledgeSourceViews(),
+  ]);
+
+  const items = [
+    ...notes.map((note) => ({
+      itemId: note.id,
+      kind: 'redbook-note' as const,
+      noteType: note.noteType,
+      captureKind: note.captureKind,
+      title: note.title,
+      author: note.author,
+      siteName: note.siteName || undefined,
+      sourceUrl: note.sourceUrl || undefined,
+      folderPath: note.folderPath,
+      coverUrl: note.coverUrl,
+      thumbnailUrl: undefined,
+      previewText: note.excerpt || note.content || '',
+      createdAt: note.createdAt,
+      updatedAt: note.updatedAt,
+      hasVideo: note.hasVideo,
+      hasTranscript: note.hasTranscript,
+      tags: note.tags,
+      status: note.status || undefined,
+      sampleFiles: [],
+      fileCount: 0,
+    })),
+    ...videos.map((video) => ({
+      itemId: video.id,
+      kind: 'youtube-video' as const,
+      title: video.title,
+      author: 'YouTube',
+      siteName: 'YouTube',
+      sourceUrl: video.sourceUrl || undefined,
+      folderPath: video.folderPath,
+      coverUrl: undefined,
+      thumbnailUrl: video.thumbnailUrl,
+      previewText: video.summary || video.description || '',
+      createdAt: video.createdAt,
+      updatedAt: video.updatedAt,
+      hasVideo: true,
+      hasTranscript: Boolean(video.subtitleContent),
+      tags: video.tags,
+      status: video.status || undefined,
+      sampleFiles: [],
+      fileCount: 0,
+    })),
+    ...views.map((source) => ({
+      itemId: source.id,
+      kind: 'document-source' as const,
+      title: source.name,
+      author: source.kind === 'obsidian-vault' ? 'Obsidian' : 'Docs',
+      siteName: 'Documents',
+      sourceUrl: undefined,
+      folderPath: undefined,
+      rootPath: source.rootPath,
+      coverUrl: undefined,
+      thumbnailUrl: undefined,
+      previewText: source.sampleFiles.join('\n'),
+      createdAt: source.createdAt,
+      updatedAt: source.updatedAt,
+      hasVideo: false,
+      hasTranscript: false,
+      tags: [],
+      status: source.indexing ? 'processing' : source.indexError ? 'failed' : 'completed',
+      sampleFiles: source.sampleFiles,
+      fileCount: source.fileCount,
+    })),
+  ];
+
+  return {
+    items: items.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)),
+    sources,
+  };
 };
 
 ipcMain.handle('knowledge:docs:list', async () => {
@@ -7108,6 +8830,160 @@ ipcMain.handle('knowledge:docs:delete-source', async (_, sourceId: string) => {
   } catch (error) {
     console.error('Failed to delete document source:', error);
     return { success: false, error: String(error) };
+  }
+});
+
+ipcMain.handle('knowledge:get-index-status', async () => {
+  try {
+    const { items } = await buildKnowledgeCatalogItems();
+    const failedCount = items.filter((item) => item.status === 'failed').length;
+    const pendingCount = items.filter((item) => item.status === 'processing').length;
+    return {
+      indexedCount: Math.max(0, items.length - failedCount - pendingCount),
+      pendingCount,
+      failedCount,
+      lastIndexedAt: items[0]?.updatedAt || null,
+      isBuilding: pendingCount > 0,
+      lastError: null,
+    };
+  } catch (error) {
+    return {
+      indexedCount: 0,
+      pendingCount: 0,
+      failedCount: 0,
+      lastIndexedAt: null,
+      isBuilding: false,
+      lastError: error instanceof Error ? error.message : String(error),
+    };
+  }
+});
+
+ipcMain.handle('knowledge:list-page', async (_, payload?: {
+  payload?: {
+    cursor?: string | null;
+    limit?: number;
+    kind?: 'redbook-note' | 'youtube-video' | 'document-source';
+    query?: string;
+    sort?: string;
+  };
+}) => {
+  const query = String(payload?.payload?.query || '').trim().toLowerCase();
+  const kind = String(payload?.payload?.kind || '').trim();
+  const limit = Math.max(1, Math.min(Number(payload?.payload?.limit || 200) || 200, 500));
+  const cursor = Math.max(0, Number(payload?.payload?.cursor || 0) || 0);
+
+  const { items } = await buildKnowledgeCatalogItems();
+  const filtered = items.filter((item) => {
+    if (kind && item.kind !== kind) return false;
+    if (!query) return true;
+    const haystack = [
+      item.title,
+      item.author,
+      item.siteName,
+      item.previewText,
+      item.sourceUrl,
+      ...(Array.isArray(item.tags) ? item.tags : []),
+      ...(Array.isArray(item.sampleFiles) ? item.sampleFiles : []),
+    ].join('\n').toLowerCase();
+    return haystack.includes(query);
+  });
+
+  const pageItems = filtered.slice(cursor, cursor + limit);
+  const nextCursor = cursor + limit < filtered.length ? String(cursor + limit) : null;
+  const kindCounts = filtered.reduce<Record<string, number>>((acc, item) => {
+    acc[item.kind] = (acc[item.kind] || 0) + 1;
+    return acc;
+  }, {});
+
+  return {
+    items: pageItems,
+    nextCursor,
+    total: filtered.length,
+    kindCounts,
+  };
+});
+
+ipcMain.handle('knowledge:get-item-detail', async (_, payload?: {
+  payload?: {
+    itemId?: string;
+    kind?: 'redbook-note' | 'youtube-video' | 'document-source';
+  };
+}) => {
+  const itemId = String(payload?.payload?.itemId || '').trim();
+  const kind = String(payload?.payload?.kind || '').trim();
+  if (!itemId || !kind) {
+    return null;
+  }
+
+  if (kind === 'redbook-note') {
+    const notes = await (async () => {
+      const list = await listKnowledgeCatalogNotes();
+      return list.map((item) => ({
+        id: item.id,
+        title: item.title,
+        author: item.author,
+        content: item.content,
+        excerpt: item.excerpt,
+        siteName: item.siteName,
+        sourceUrl: item.sourceUrl,
+        images: [],
+        tags: item.tags,
+        cover: item.coverUrl,
+        video: undefined,
+        videoUrl: undefined,
+        transcript: item.hasTranscript ? '' : undefined,
+        transcriptionStatus: item.status || undefined,
+        stats: { likes: 0, collects: 0 },
+        createdAt: item.createdAt,
+        folderPath: item.folderPath,
+      }));
+    })();
+    return notes.find((item) => item.id === itemId) || null;
+  }
+
+  if (kind === 'youtube-video') {
+    const videos = await listKnowledgeCatalogYoutubeVideos();
+    const video = videos.find((item) => item.id === itemId);
+    if (!video) return null;
+    return {
+      id: video.id,
+      videoId: video.id,
+      videoUrl: video.sourceUrl || '',
+      title: video.title,
+      description: video.description,
+      summary: video.summary,
+      thumbnailUrl: video.thumbnailUrl,
+      hasSubtitle: video.hasSubtitle,
+      subtitleContent: video.subtitleContent,
+      status: video.status || undefined,
+      createdAt: video.createdAt,
+      folderPath: video.folderPath,
+    };
+  }
+
+  if (kind === 'document-source') {
+    const { views } = await buildDocumentKnowledgeSourceViews();
+    return views.find((item) => item.id === itemId) || null;
+  }
+
+  return null;
+});
+
+ipcMain.handle('knowledge:rebuild-catalog', async () => {
+  return { success: true };
+});
+
+ipcMain.handle('knowledge:open-index-root', async () => {
+  try {
+    const docsRoot = ensureKnowledgeDocsDir(getWorkspacePaths()).then(() => getKnowledgeDocsImportedDir(getWorkspacePaths()));
+    const targetPath = await docsRoot;
+    const openError = await shell.openPath(targetPath);
+    if (openError) {
+      return { success: false, error: openError };
+    }
+    return { success: true, path: targetPath };
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : String(error) };
   }
 });
 
@@ -8420,6 +10296,476 @@ const localizeGenericArticleHtml = async (
   }
 };
 
+type KnowledgeEntryPayload = {
+  kind?: string;
+  source?: {
+    sourceLink?: string;
+    sourceUrl?: string;
+    sourceDomain?: string;
+    externalId?: string;
+  };
+  content?: {
+    title?: string;
+    text?: string;
+    excerpt?: string;
+    description?: string;
+    html?: string;
+    indexText?: string;
+    author?: string;
+    authorProfileUrl?: string;
+    siteName?: string;
+    tags?: string[];
+    publishedAt?: string;
+    commentsSnapshot?: Array<{
+      author?: string;
+      text?: string;
+      likes?: number;
+      replies?: number;
+      createdAt?: string;
+      location?: string;
+    }>;
+    stats?: {
+      likes?: number;
+      collects?: number;
+      comments?: number;
+      shares?: number;
+    };
+  };
+  assets?: {
+    coverUrl?: string;
+    imageUrls?: string[];
+    videoUrl?: string;
+    thumbnailUrl?: string;
+  };
+  options?: {
+    allowUpdate?: boolean;
+    transcribe?: boolean;
+  };
+};
+
+function extByMimeLoose(mimeType: string, fallback = 'bin'): string {
+  const lower = String(mimeType || '').toLowerCase();
+  if (lower.includes('jpeg') || lower.includes('jpg')) return 'jpg';
+  if (lower.includes('png')) return 'png';
+  if (lower.includes('webp')) return 'webp';
+  if (lower.includes('gif')) return 'gif';
+  if (lower.includes('bmp')) return 'bmp';
+  if (lower.includes('svg')) return 'svg';
+  if (lower.includes('mp4')) return 'mp4';
+  if (lower.includes('webm')) return 'webm';
+  if (lower.includes('quicktime') || lower.includes('mov')) return 'mov';
+  if (lower.includes('mpeg')) return 'mp3';
+  if (lower.includes('wav')) return 'wav';
+  return fallback;
+}
+
+function decodeBase64DataUrl(raw: string): { mimeType: string; buffer: Buffer } | null {
+  const match = String(raw || '').trim().match(/^data:([^;]+);base64,(.+)$/i);
+  if (!match) return null;
+  return {
+    mimeType: String(match[1] || 'application/octet-stream').toLowerCase(),
+    buffer: Buffer.from(String(match[2] || ''), 'base64'),
+  };
+}
+
+function inferExtensionFromUrl(raw: string, fallback = 'bin'): string {
+  try {
+    const pathname = new URL(String(raw || '').trim()).pathname || '';
+    const ext = path.extname(pathname).replace(/^\./, '').trim().toLowerCase();
+    return ext || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function ensureFileNameWithExtension(fileName: string, ext: string): string {
+  const normalized = String(fileName || '').trim();
+  if (!normalized) {
+    return `asset.${ext}`;
+  }
+  if (path.extname(normalized)) {
+    return normalized;
+  }
+  return `${normalized}.${ext}`;
+}
+
+function sanitizeKnowledgeEntryId(raw: string, fallbackPrefix: string): string {
+  const normalized = String(raw || '').trim();
+  if (!normalized) {
+    return `${fallbackPrefix}_${Date.now()}`;
+  }
+  const sanitized = normalized
+    .normalize('NFKD')
+    .replace(/[^\w\-.一-龥]+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  return sanitized || `${fallbackPrefix}_${Date.now()}`;
+}
+
+function countTruthyDirectoryEntries(entries: Array<string | fsSync.Dirent>): number {
+  return entries.filter(Boolean).length;
+}
+
+function createKnowledgeAssetPersister(noteDir: string) {
+  const persistedBySource = new Map<string, string>();
+  let nextImageIndex = 0;
+
+  const persistAsset = async (input: {
+    source: string;
+    preferredName?: string;
+    kind: 'image' | 'video';
+  }): Promise<string> => {
+    const source = String(input.source || '').trim();
+    if (!source) return '';
+    if (persistedBySource.has(source)) {
+      return persistedBySource.get(source) || '';
+    }
+
+    const targetDir = input.kind === 'image' ? path.join(noteDir, 'images') : noteDir;
+    await fs.mkdir(targetDir, { recursive: true });
+
+    const decoded = decodeBase64DataUrl(source);
+    const fallbackExt = input.kind === 'image'
+      ? 'jpg'
+      : 'mp4';
+    const ext = decoded
+      ? extByMimeLoose(decoded.mimeType, fallbackExt)
+      : inferExtensionFromUrl(source, fallbackExt);
+    const defaultFileName = input.kind === 'image'
+      ? `${nextImageIndex++}.${ext}`
+      : `video.${ext}`;
+    const fileName = ensureFileNameWithExtension(input.preferredName || defaultFileName, ext);
+    const outputPath = path.join(targetDir, fileName);
+
+    if (decoded) {
+      await fs.writeFile(outputPath, decoded.buffer);
+    } else if (/^https?:\/\//i.test(source)) {
+      if (input.kind === 'image') {
+        await downloadImageToFile(source, outputPath);
+      } else {
+        await downloadFile(source, outputPath);
+      }
+    } else {
+      return '';
+    }
+
+    const relativePath = path.relative(noteDir, outputPath).replace(/\\/g, '/');
+    persistedBySource.set(source, relativePath);
+    return relativePath;
+  };
+
+  return {
+    persistImage: async (source: string, preferredName?: string) => {
+      return persistAsset({ source, preferredName, kind: 'image' });
+    },
+    persistVideo: async (source: string, preferredName?: string) => {
+      return persistAsset({ source, preferredName, kind: 'video' });
+    },
+  };
+}
+
+async function queueKnowledgeVideoTranscription(input: {
+  noteId: string;
+  noteDir: string;
+  metaPath: string;
+  meta: Record<string, any>;
+}) {
+  if (!input?.meta?.video) {
+    return;
+  }
+
+  const noteId = String(input.noteId || '').trim();
+  const noteDir = input.noteDir;
+  const metaPath = input.metaPath;
+  const meta = input.meta;
+
+  (async () => {
+    const videoPath = path.join(noteDir, String(meta.video));
+    const transcriptResult = await transcribeVideoToText(videoPath);
+    const transcript = transcriptResult.text;
+    if (transcript) {
+      meta.transcript = transcript;
+      meta.transcriptFile = 'transcript.txt';
+      meta.transcriptionStatus = 'completed';
+      await fs.writeFile(path.join(noteDir, meta.transcriptFile), transcript);
+      await fs.writeFile(metaPath, JSON.stringify(meta, null, 2));
+      indexManager.addToQueue(normalizeVideo(
+        noteId,
+        meta,
+        transcript,
+        'user'
+      ));
+      win?.webContents.send('knowledge:note-updated', { noteId, hasTranscript: true, transcriptionStatus: 'completed' });
+    } else if (transcriptResult.error) {
+      meta.transcriptionStatus = 'failed';
+      await fs.writeFile(metaPath, JSON.stringify(meta, null, 2));
+      console.warn(`[Transcription] Skipped background transcript for ${noteId}: ${transcriptResult.error}`);
+      win?.webContents.send('knowledge:note-updated', { noteId, hasTranscript: false, transcriptionStatus: 'failed' });
+    }
+  })().catch((err) => {
+    console.error('Failed to transcribe video:', err);
+    meta.transcriptionStatus = 'failed';
+    fs.writeFile(metaPath, JSON.stringify(meta, null, 2)).catch(() => {});
+    win?.webContents.send('knowledge:note-updated', { noteId, hasTranscript: false, transcriptionStatus: 'failed' });
+  });
+}
+
+async function persistStructuredKnowledgeNote(input: {
+  noteId: string;
+  kind: string;
+  title: string;
+  content: string;
+  indexText?: string;
+  sourceUrl?: string;
+  siteName?: string;
+  author?: string;
+  authorProfileUrl?: string;
+  excerpt?: string;
+  tags?: string[];
+  publishedAt?: string;
+  commentsSnapshot?: Array<{
+    author?: string;
+    text?: string;
+    likes?: number;
+    replies?: number;
+    createdAt?: string;
+    location?: string;
+  }>;
+  stats?: { likes?: number; collects?: number; comments?: number; shares?: number };
+  coverUrl?: string;
+  imageUrls?: string[];
+  videoUrl?: string;
+  videoSourceUrl?: string;
+  html?: string;
+  allowUpdate?: boolean;
+  transcribe?: boolean;
+}): Promise<{ success: boolean; noteId?: string; duplicate?: boolean; updated?: boolean; error?: string }> {
+  const noteId = sanitizeKnowledgeEntryId(input.noteId, 'entry');
+  const noteDir = path.join(getKnowledgeRedbookDir(), noteId);
+  const metaPath = path.join(noteDir, 'meta.json');
+
+  try {
+    await fs.mkdir(noteDir, { recursive: true });
+
+    let existingMeta: Record<string, any> | null = null;
+    try {
+      existingMeta = JSON.parse(await fs.readFile(metaPath, 'utf-8'));
+    } catch {
+      existingMeta = null;
+    }
+
+    if (existingMeta && !input.allowUpdate) {
+      return { success: true, noteId, duplicate: true };
+    }
+
+    const { persistImage, persistVideo } = createKnowledgeAssetPersister(noteDir);
+    const meta: Record<string, any> = {
+      id: noteId,
+      type: input.kind || 'webpage',
+      title: input.title || existingMeta?.title || '未命名内容',
+      author: input.author || existingMeta?.author || '未知',
+      authorProfileUrl: input.authorProfileUrl || existingMeta?.authorProfileUrl || '',
+      content: input.content || '',
+      indexText: input.indexText || existingMeta?.indexText || input.content || '',
+      sourceUrl: input.sourceUrl || existingMeta?.sourceUrl || '',
+      siteName: input.siteName || existingMeta?.siteName || '',
+      excerpt: input.excerpt || buildExcerpt(input.content || '', 180),
+      publishedAt: input.publishedAt || existingMeta?.publishedAt || '',
+      stats: {
+        likes: Number(input.stats?.likes ?? existingMeta?.stats?.likes ?? 0),
+        collects: Number(input.stats?.collects ?? existingMeta?.stats?.collects ?? 0),
+        comments: Number(input.stats?.comments ?? existingMeta?.stats?.comments ?? 0),
+        shares: Number(input.stats?.shares ?? existingMeta?.stats?.shares ?? 0),
+      },
+      commentsSnapshot: Array.isArray(input.commentsSnapshot)
+        ? input.commentsSnapshot.filter((item) => item && (item.author || item.text))
+        : Array.isArray(existingMeta?.commentsSnapshot)
+          ? existingMeta.commentsSnapshot
+          : [],
+      images: [],
+      cover: '',
+      tags: Array.isArray(input.tags) ? input.tags.filter(Boolean) : [],
+      createdAt: String(existingMeta?.createdAt || new Date().toISOString()),
+      updatedAt: new Date().toISOString(),
+    };
+
+    if (typeof input.coverUrl === 'string' && input.coverUrl.trim()) {
+      try {
+        const coverPath = await persistImage(input.coverUrl.trim(), 'cover');
+        if (coverPath) {
+          meta.cover = coverPath;
+          meta.images.push(coverPath);
+        }
+      } catch (error) {
+        console.error('Failed to persist knowledge cover:', error);
+      }
+    }
+
+    if (Array.isArray(input.imageUrls)) {
+      for (const imageSource of input.imageUrls) {
+        try {
+          const imagePath = await persistImage(String(imageSource || '').trim());
+          if (imagePath && !meta.images.includes(imagePath)) {
+            meta.images.push(imagePath);
+          }
+        } catch (error) {
+          console.error('Failed to persist knowledge image:', error);
+        }
+      }
+    }
+
+    if (!meta.cover && meta.images.length > 0) {
+      meta.cover = meta.images[0];
+    }
+
+    if (typeof input.videoUrl === 'string' && input.videoUrl.trim()) {
+      try {
+        const videoPath = await persistVideo(input.videoUrl.trim(), 'video');
+        if (videoPath) {
+          const absoluteVideoPath = path.join(noteDir, videoPath);
+          await verifyVideoFileDecodable(absoluteVideoPath);
+          meta.video = videoPath;
+          meta.videoUrl = input.videoSourceUrl || input.videoUrl;
+          if (input.transcribe) {
+            meta.transcriptionStatus = 'processing';
+          }
+        }
+      } catch (error) {
+        console.error('Failed to persist knowledge video:', error);
+        if (input.transcribe) {
+          meta.transcriptionStatus = 'failed';
+        }
+      }
+    }
+
+    if (typeof input.html === 'string' && input.html.trim()) {
+      const htmlFile = 'content.html';
+      const localizedHtml = await localizeGenericArticleHtml(
+        input.html,
+        noteDir,
+        async (imageSource, preferredName) => {
+          const imagePath = await persistImage(imageSource, preferredName);
+          if (imagePath && !meta.images.includes(imagePath)) {
+            meta.images.push(imagePath);
+          }
+          return imagePath;
+        },
+      );
+      if (!meta.cover && meta.images.length > 0) {
+        meta.cover = meta.images[0];
+      }
+      await fs.writeFile(path.join(noteDir, htmlFile), localizedHtml, 'utf-8');
+      meta.htmlFile = htmlFile;
+    }
+
+    await fs.writeFile(metaPath, JSON.stringify(meta, null, 2));
+    await fs.writeFile(path.join(noteDir, 'content.md'), meta.content || '', 'utf-8');
+
+    indexManager.addToQueue(normalizeNote(noteId, meta, meta.indexText || meta.content || ''));
+    if (existingMeta) {
+      win?.webContents.send('knowledge:note-updated', { noteId, hasTranscript: Boolean(meta.transcript), transcriptionStatus: meta.transcriptionStatus });
+    } else {
+      win?.webContents.send('knowledge:new-note', { noteId, title: meta.title });
+    }
+    win?.webContents.send('knowledge-updated');
+
+    if (meta.video && input.transcribe) {
+      await queueKnowledgeVideoTranscription({
+        noteId,
+        noteDir,
+        metaPath,
+        meta,
+      });
+    }
+
+    return {
+      success: true,
+      noteId,
+      duplicate: false,
+      updated: Boolean(existingMeta),
+    };
+  } catch (error) {
+    console.error('Failed to persist structured knowledge note:', error);
+    return { success: false, error: String(error) };
+  }
+}
+
+async function persistKnowledgeEntry(entry: KnowledgeEntryPayload): Promise<{ success: boolean; entryId?: string; duplicate?: boolean; updated?: boolean; error?: string }> {
+  const kind = String(entry?.kind || '').trim();
+  const source = entry?.source || {};
+  const content = entry?.content || {};
+  const assets = entry?.assets || {};
+  const options = entry?.options || {};
+  const sourceLink = String(source?.sourceLink || source?.sourceUrl || '').trim();
+  const externalId = String(source?.externalId || '').trim();
+
+  if (kind === 'youtube-video') {
+    const videoUrl = String(sourceLink || '').trim();
+    const videoId = externalId || (() => {
+      try {
+        const parsed = new URL(videoUrl);
+        if (parsed.hostname === 'youtu.be') {
+          return parsed.pathname.split('/').filter(Boolean).pop() || '';
+        }
+        return parsed.searchParams.get('v') || '';
+      } catch {
+        return '';
+      }
+    })();
+    const result = await persistYoutubeNote({
+      videoId,
+      videoUrl,
+      title: String(content?.title || '').trim(),
+      description: String(content?.description || content?.text || '').trim(),
+      thumbnailUrl: String(assets?.thumbnailUrl || assets?.coverUrl || '').trim(),
+    });
+    return {
+      success: result.success,
+      entryId: result.noteId,
+      duplicate: result.duplicate,
+      updated: false,
+      error: result.error,
+    };
+  }
+
+  const rawVideoSource = String(assets?.videoUrl || '').trim();
+  const persistedVideoSource = rawVideoSource.startsWith('data:')
+    ? rawVideoSource
+    : rawVideoSource || '';
+
+  const result = await persistStructuredKnowledgeNote({
+    noteId: externalId || `${kind || 'entry'}_${Date.now()}`,
+    kind: kind || 'webpage',
+    title: String(content?.title || '').trim() || '未命名内容',
+    content: String(content?.text || content?.description || '').trim(),
+    indexText: String(content?.indexText || content?.text || content?.description || '').trim(),
+    sourceUrl: sourceLink,
+    siteName: String(content?.siteName || source?.sourceDomain || '').trim(),
+    author: String(content?.author || '').trim(),
+    authorProfileUrl: String(content?.authorProfileUrl || '').trim(),
+    excerpt: String(content?.excerpt || '').trim(),
+    tags: Array.isArray(content?.tags) ? content.tags.filter(Boolean) : [],
+    publishedAt: String(content?.publishedAt || '').trim(),
+    commentsSnapshot: Array.isArray(content?.commentsSnapshot) ? content.commentsSnapshot : [],
+    stats: content?.stats,
+    coverUrl: String(assets?.coverUrl || assets?.thumbnailUrl || '').trim(),
+    imageUrls: Array.isArray(assets?.imageUrls) ? assets.imageUrls.filter(Boolean) : [],
+    videoUrl: persistedVideoSource,
+    videoSourceUrl: rawVideoSource.startsWith('data:') ? sourceLink : rawVideoSource,
+    html: String(content?.html || '').trim(),
+    allowUpdate: Boolean(options?.allowUpdate),
+    transcribe: Boolean(options?.transcribe),
+  });
+
+  return {
+    success: result.success,
+    entryId: result.noteId,
+    duplicate: result.duplicate,
+    updated: result.updated,
+    error: result.error,
+  };
+}
+
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const fetchWithRetries = async (
@@ -9045,7 +11391,7 @@ ipcMain.handle('archives:create', async (_, data: {
   toneTags?: string[];
 }) => {
   const id = `archive_${Date.now()}`;
-  return createArchiveProfile({
+  const created = createArchiveProfile({
     id,
     name: data.name,
     platform: data.platform || '',
@@ -9054,6 +11400,8 @@ ipcMain.handle('archives:create', async (_, data: {
     audience: data.audience || '',
     tone_tags: data.toneTags || []
   });
+  emitRendererDataChanged('archives', { action: 'create', entityId: id });
+  return created;
 });
 
 ipcMain.handle('archives:update', async (_, data: {
@@ -9065,7 +11413,7 @@ ipcMain.handle('archives:update', async (_, data: {
   audience?: string;
   toneTags?: string[];
 }) => {
-  return updateArchiveProfile({
+  const updated = updateArchiveProfile({
     id: data.id,
     name: data.name,
     platform: data.platform || '',
@@ -9074,10 +11422,13 @@ ipcMain.handle('archives:update', async (_, data: {
     audience: data.audience || '',
     tone_tags: data.toneTags || []
   });
+  emitRendererDataChanged('archives', { action: 'update', entityId: data.id });
+  return updated;
 });
 
 ipcMain.handle('archives:delete', async (_, profileId: string) => {
   deleteArchiveProfile(profileId);
+  emitRendererDataChanged('archives', { action: 'delete', entityId: profileId });
   return { success: true };
 });
 
@@ -9099,7 +11450,7 @@ ipcMain.handle('archives:samples:create', async (_, data: {
   const tags = data.tags && data.tags.length > 0
     ? data.tags
     : extractTagsFromText(data.title || '', data.content || '');
-  return createArchiveSample({
+  const created = createArchiveSample({
     id,
     profile_id: data.profileId,
     title: data.title || '',
@@ -9112,6 +11463,8 @@ ipcMain.handle('archives:samples:create', async (_, data: {
     sample_date: data.sampleDate || new Date().toISOString().slice(0, 10),
     is_featured: data.isFeatured ? 1 : 0
   });
+  emitRendererDataChanged('archives', { action: 'sample-create', entityId: id });
+  return created;
 
   // Index the new sample
   // Fetch profile to get platform info
@@ -9181,11 +11534,13 @@ ipcMain.handle('archives:samples:update', async (_, data: {
 
   indexManager.addToQueue(normalizeArchiveSample(sampleObj, profile));
 
+  emitRendererDataChanged('archives', { action: 'sample-update', entityId: data.id });
   return result;
 });
 
 ipcMain.handle('archives:samples:delete', async (_, sampleId: string) => {
   deleteArchiveSample(sampleId);
+  emitRendererDataChanged('archives', { action: 'sample-delete', entityId: sampleId });
   return { success: true };
 });
 
@@ -9232,7 +11587,7 @@ ipcMain.handle('indexing:rebuild-all', async () => {
         indexManager.addToQueue(normalizeNote(
           dir.name,
           meta,
-          meta.content || meta.transcript || ''
+          meta.indexText || meta.content || meta.transcript || ''
         ));
       } catch {}
     }
@@ -9504,36 +11859,14 @@ async function persistXhsNote(note: any): Promise<{ success: boolean; noteId?: s
 
     indexManager.addToQueue(normalizeNote(noteId, meta, noteContent || ''));
     win?.webContents.send('knowledge:new-note', { noteId, title: meta.title });
+    win?.webContents.send('knowledge-updated');
 
     if (meta.video) {
-      (async () => {
-        const videoPath = path.join(noteDir, meta.video as string);
-        const transcriptResult = await transcribeVideoToText(videoPath);
-        const transcript = transcriptResult.text;
-        if (transcript) {
-          meta.transcript = transcript;
-          meta.transcriptFile = 'transcript.txt';
-          meta.transcriptionStatus = 'completed';
-          await fs.writeFile(path.join(noteDir, meta.transcriptFile), transcript);
-          await fs.writeFile(metaPath, JSON.stringify(meta, null, 2));
-          indexManager.addToQueue(normalizeVideo(
-            noteId,
-            meta,
-            transcript,
-            'user'
-          ));
-          win?.webContents.send('knowledge:note-updated', { noteId, hasTranscript: true, transcriptionStatus: 'completed' });
-        } else if (transcriptResult.error) {
-          meta.transcriptionStatus = 'failed';
-          await fs.writeFile(metaPath, JSON.stringify(meta, null, 2));
-          console.warn(`[Transcription] Skipped background transcript for ${noteId}: ${transcriptResult.error}`);
-          win?.webContents.send('knowledge:note-updated', { noteId, hasTranscript: false, transcriptionStatus: 'failed' });
-        }
-      })().catch((err) => {
-        console.error('Failed to transcribe video:', err);
-        meta.transcriptionStatus = 'failed';
-        fs.writeFile(metaPath, JSON.stringify(meta, null, 2)).catch(() => {});
-        win?.webContents.send('knowledge:note-updated', { noteId, hasTranscript: false, transcriptionStatus: 'failed' });
+      await queueKnowledgeVideoTranscription({
+        noteId,
+        noteDir,
+        metaPath,
+        meta,
       });
     }
 
@@ -9836,6 +12169,100 @@ function startHttpServer() {
     if (req.method === 'OPTIONS') {
       res.writeHead(204);
       res.end();
+      return;
+    }
+
+    if (req.method === 'GET' && req.url === '/api/knowledge/health') {
+      try {
+        await ensureKnowledgeRedbookDir();
+        await ensureKnowledgeYoutubeDir();
+        const [redbookDirs, youtubeDirs, mediaAssets] = await Promise.all([
+          fs.readdir(getKnowledgeRedbookDir(), { withFileTypes: true }).catch(() => []),
+          fs.readdir(getKnowledgeYoutubeDir(), { withFileTypes: true }).catch(() => []),
+          listMediaAssets(5000).catch(() => []),
+        ]);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          success: true,
+          status: 'ok',
+          app: 'RedConvert',
+          counts: {
+            redbook: countTruthyDirectoryEntries(redbookDirs.filter((entry: fsSync.Dirent) => entry.isDirectory())),
+            youtube: countTruthyDirectoryEntries(youtubeDirs.filter((entry: fsSync.Dirent) => entry.isDirectory())),
+            media: Array.isArray(mediaAssets) ? mediaAssets.length : 0,
+          },
+        }));
+      } catch (error) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: String(error) }));
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && req.url === '/api/knowledge/entries') {
+      let body = '';
+      req.on('data', (chunk) => { body += chunk; });
+      req.on('end', async () => {
+        try {
+          const payload = JSON.parse(body || '{}') as KnowledgeEntryPayload;
+          const result = await persistKnowledgeEntry(payload);
+          if (!result.success) {
+            throw new Error(result.error || '保存失败');
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            success: true,
+            entryId: result.entryId,
+            duplicate: Boolean(result.duplicate),
+            updated: Boolean(result.updated),
+          }));
+        } catch (error) {
+          console.error('Failed to persist knowledge entry:', error);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, error: String(error) }));
+        }
+      });
+      return;
+    }
+
+    if (req.method === 'POST' && req.url === '/api/knowledge/media-assets') {
+      let body = '';
+      req.on('data', (chunk) => { body += chunk; });
+      req.on('end', async () => {
+        try {
+          const payload = JSON.parse(body || '{}') as {
+            items?: Array<{ title?: string; source?: string }>;
+          };
+          const items = Array.isArray(payload?.items)
+            ? payload.items
+                .map((item) => ({
+                  title: String(item?.title || '').trim(),
+                  source: String(item?.source || '').trim(),
+                }))
+                .filter((item) => item.source)
+            : [];
+          if (items.length === 0) {
+            throw new Error('items is required');
+          }
+          const imported = await importMediaSources(items);
+          emitRendererDataChanged('media', { action: 'import' });
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            success: true,
+            imported: imported.length,
+            items: imported.map((asset) => ({
+              id: asset.id,
+              title: asset.title,
+              mimeType: asset.mimeType,
+              relativePath: asset.relativePath,
+            })),
+          }));
+        } catch (error) {
+          console.error('Failed to import media assets:', error);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, error: String(error) }));
+        }
+      });
       return;
     }
 

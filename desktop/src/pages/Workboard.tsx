@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AlertCircle, Bot, Clock3, Link2, ListTodo, Loader2, Play, RefreshCw, X } from 'lucide-react';
+import { appAlert } from '../utils/appDialogs';
 
 type WorkItem = Awaited<ReturnType<typeof window.ipcRenderer.work.list>>[number];
 
@@ -26,7 +27,7 @@ function labelForType(type: string): string {
         case 'redclaw-note':
             return '笔记';
         case 'redclaw-project':
-            return '项目';
+            return '内容任务';
         case 'automation':
             return '自动化';
         case 'research':
@@ -99,7 +100,7 @@ function resolveColumnKey(item: WorkItem): WorkColumnKey {
     return 'blocked';
 }
 
-export function Workboard() {
+export function Workboard({ isActive = true }: { isActive?: boolean }) {
     const [items, setItems] = useState<WorkItem[]>([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
@@ -107,25 +108,41 @@ export function Workboard() {
     const [selectedId, setSelectedId] = useState<string>('');
     const [runningNowId, setRunningNowId] = useState<string>('');
     const [updatingStatusId, setUpdatingStatusId] = useState<string>('');
+    const itemsRef = useRef<WorkItem[]>([]);
+    const loadRequestRef = useRef(0);
+
+    useEffect(() => {
+        itemsRef.current = items;
+    }, [items]);
 
     const load = useCallback(async () => {
-        setLoading(true);
+        const requestId = loadRequestRef.current + 1;
+        loadRequestRef.current = requestId;
+        const hasLocalData = itemsRef.current.length > 0;
+        if (!hasLocalData) {
+            setLoading(true);
+        }
         setError('');
         try {
             const next = await window.ipcRenderer.work.list({ limit: 300 });
+            if (requestId !== loadRequestRef.current) return;
             setItems(next || []);
             setLastUpdatedAt(new Date().toISOString());
             setSelectedId((prev) => prev && next.some((item) => item.id === prev) ? prev : '');
         } catch (loadError) {
+            if (requestId !== loadRequestRef.current) return;
             setError(loadError instanceof Error ? loadError.message : String(loadError));
         } finally {
-            setLoading(false);
+            if (requestId === loadRequestRef.current) {
+                setLoading(false);
+            }
         }
     }, []);
 
     useEffect(() => {
+        if (!isActive) return;
         void load();
-    }, [load]);
+    }, [isActive, load]);
 
     const grouped = useMemo(() => {
         const map = new Map<WorkColumnKey, WorkItem[]>();
@@ -156,7 +173,7 @@ export function Workboard() {
             await window.ipcRenderer.work.update({ id: item.id, status });
             await load();
         } catch (updateError) {
-            alert(updateError instanceof Error ? updateError.message : String(updateError));
+            void appAlert(updateError instanceof Error ? updateError.message : String(updateError));
         } finally {
             setUpdatingStatusId('');
         }
@@ -300,7 +317,7 @@ export function Workboard() {
                                                         await triggerWorkItemNow(selectedItem);
                                                         await load();
                                                     } catch (runError) {
-                                                        alert(runError instanceof Error ? runError.message : String(runError));
+                                                        void appAlert(runError instanceof Error ? runError.message : String(runError));
                                                     } finally {
                                                         setRunningNowId('');
                                                     }
