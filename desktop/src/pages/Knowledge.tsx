@@ -53,7 +53,7 @@ interface YouTubeVideo {
     folderPath?: string;
 }
 
-type KnowledgeTypeFilter = 'all' | 'xhs-image' | 'xhs-video' | 'douyin-video' | 'link-article' | 'wechat-article' | 'youtube' | 'docs';
+type KnowledgeTypeFilter = 'all' | 'xhs-image' | 'xhs-video' | 'douyin-video' | 'link-article' | 'wechat-article' | 'youtube' | 'docs' | 'all-image' | 'all-video';
 
 interface DocumentKnowledgeSource {
     id: string;
@@ -713,10 +713,11 @@ export function Knowledge({ onNavigateToChat, onNavigateToRedClaw, isEmbedded = 
         void loadAllKnowledge();
     }, [loadAllKnowledge]);
 
+    // 搜索输入防抖：避免打字过程中频繁触发搜索
     useEffect(() => {
         const timeout = window.setTimeout(() => {
             void loadAllKnowledge();
-        }, 180);
+        }, 500);
         return () => window.clearTimeout(timeout);
     }, [searchQuery, selectedTypeFilter, loadAllKnowledge]);
 
@@ -843,7 +844,7 @@ export function Knowledge({ onNavigateToChat, onNavigateToRedClaw, isEmbedded = 
                     : 'link-article'
                 : note.captureKind === 'douyin-video'
                     ? 'douyin-video'
-                    : (note.captureKind === 'xhs-video' || note.video)
+                    : (note.captureKind === 'xhs-video' || note.video || note.hasVideo)
                     ? 'xhs-video'
                     : 'xhs-image';
 
@@ -909,8 +910,11 @@ export function Knowledge({ onNavigateToChat, onNavigateToRedClaw, isEmbedded = 
             }
             counts[item.kind] += 1;
         });
-        return [
-            { key: 'all' as const, label: '全部', count: Number(kindCounts['redbook-note'] || 0) + counts.youtube + counts.docs },
+        // 聚合类型数量
+        const allImageCount = (counts['xhs-image'] || 0) + (counts['link-article'] || 0) + (counts['wechat-article'] || 0);
+        const allVideoCount = (counts['xhs-video'] || 0) + (counts['douyin-video'] || 0) + (counts['youtube'] || 0);
+        const platformFilters = [
+            { key: 'all' as const, label: '全部', count: knowledgeItems.length + youtubeVideos.length + documentSources.length },
             { key: 'xhs-image' as const, label: '小红书图文', count: counts['xhs-image'] },
             { key: 'xhs-video' as const, label: '小红书视频', count: counts['xhs-video'] },
             { key: 'douyin-video' as const, label: '抖音视频', count: counts['douyin-video'] },
@@ -919,15 +923,29 @@ export function Knowledge({ onNavigateToChat, onNavigateToRedClaw, isEmbedded = 
             { key: 'youtube' as const, label: 'YouTube', count: counts.youtube },
             { key: 'docs' as const, label: '文档', count: counts.docs },
         ].filter((item) => item.key === 'all' || item.count > 0);
+        // 聚合快捷筛选器置于末尾
+        const aggFilters = [
+            ...(allImageCount > 0 ? [{ key: 'all-image' as const, label: '图文' }] : []),
+            ...(allVideoCount > 0 ? [{ key: 'all-video' as const, label: '视频' }] : []),
+        ];
+        return [...platformFilters, ...aggFilters];
     }, [kindCounts, knowledgeItems]);
 
     const youtubeSummaryPendingCount = useMemo(() => {
         return youtubeVideos.filter((video) => video.hasSubtitle && !String(video.summary || '').trim()).length;
     }, [youtubeVideos]);
 
+    // all-image: 图文笔记（跨平台纯图片/文字内容）
+    // all-video: 视频笔记（跨平台视频内容）
     const filteredKnowledgeItems = useMemo(() => {
+        const IMAGE_KINDS = new Set(['xhs-image', 'link-article', 'wechat-article']);
+        const VIDEO_KINDS = new Set(['xhs-video', 'douyin-video', 'youtube']);
         const filtered = knowledgeItems.filter((item) => {
-            if (selectedTypeFilter !== 'all' && item.kind !== selectedTypeFilter) {
+            if (selectedTypeFilter === 'all-image') {
+                if (!IMAGE_KINDS.has(item.kind)) return false;
+            } else if (selectedTypeFilter === 'all-video') {
+                if (!VIDEO_KINDS.has(item.kind)) return false;
+            } else if (selectedTypeFilter !== 'all' && item.kind !== selectedTypeFilter) {
                 return false;
             }
             if (selectedTag && !item.tags.includes(selectedTag)) {
